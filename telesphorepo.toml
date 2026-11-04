@@ -1,5 +1,7 @@
 server = "https://telesphorepo.com"
 repo = "ecc-server"
+dist = "stable"
+component = "main"
 
 [[when]]
 version = "*~*"
