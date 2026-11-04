@@ -5,6 +5,8 @@ written by the Module-ECC training pipeline (`uv run bundle`): it runs the bundl
 (llama.cpp) child process, keeps each conversation's prompt window, and returns each message's P(ban) to Module-ECC
 over HTTP on the loopback interface. Module-ECC talks only to this host, never to llama-server. With a W&B API key,
 the host fetches the bundle the pipeline promoted to `production` in Weights & Biases and switches to each new one.
+With an Amazon Bedrock API key, it makes the slow check's call to Kimi on Bedrock, with the system prompt from the
+served bundle, so neither the key nor the policy text is in Module-ECC.
 
 Each message is scored as the last line of its conversation's window. The prompt is built byte for byte as the
 pipeline builds it (Module-ECC `src/ecc/chat.py`), with token counts from llama-server's
@@ -30,7 +32,8 @@ pre-releases (versions containing `~`) are in `ecc-server-dev`. Then:
 sudo apt update
 sudo apt install ecc-server     # enables and starts the service
 sudo ecc-server wandb login     # paste the W&B API key at the hidden prompt
-ecc-server status               # the W&B check, and the download of the production bundle
+sudo ecc-server bedrock login   # paste the Amazon Bedrock API key at the hidden prompt
+ecc-server status               # the W&B check, the download of the production bundle, and Bedrock
 ```
 
 The host starts without a bundle and reports not ready until it has one. With the key set, it downloads the
@@ -39,10 +42,10 @@ copied onto the host instead: `sudo -u ecc-server ecc-server use /path/to/bundle
 `ecc-server`).
 
 Upgrade with `sudo apt update && sudo apt upgrade`. The service restarts, so conversation windows start anew; the
-installed bundle, the W&B key and your edited `config.toml` stay. Remove with `sudo apt remove ecc-server` (stops and
-disables the service, keeps `/etc/ecc-server`, the key and the data folder); `sudo apt purge ecc-server` also deletes
-`/var/lib/ecc-server`, including the bundles and the downloaded llama.cpp, the stored W&B key and the `ecc-server`
-user.
+installed bundle, the W&B and Bedrock keys and your edited `config.toml` stay. Remove with `sudo apt remove
+ecc-server` (stops and disables the service, keeps `/etc/ecc-server`, the keys and the data folder); `sudo apt purge
+ecc-server` also deletes `/var/lib/ecc-server`, including the bundles and the downloaded llama.cpp, the stored W&B and
+Bedrock keys and the `ecc-server` user.
 
 On first start with a bundle, the host downloads the llama.cpp release the bundle names (its Linux CPU build), checks
 the asset's SHA-256 against the bundle, and unpacks it under `<data>/llama/<release>/`.
@@ -96,6 +99,46 @@ another version, or until `ecc-server update`, which installs whatever productio
 earlier version in W&B also switches the host back, at its next check. With a key set, a bundle installed with `use`
 serves until the next check, which switches to production.
 
+## Slow check on Amazon Bedrock
+
+**The key.** `sudo ecc-server bedrock login` reads an Amazon Bedrock API key from a hidden prompt (or from standard
+input when piped) and checks it with a small Converse call (16 output tokens) to `bedrock_model` in `bedrock_region`,
+which proves both the key and its access to the model. A key Bedrock rejects, or any failed check, is not stored. A
+key that passes is stored the way the W&B key is: encrypted with `systemd-creds` into
+`/etc/credstore.encrypted/ecc-server.bedrock-api-key`, loaded by the unit's
+`LoadCredentialEncrypted=ecc-server.bedrock-api-key`, and the service is restarted if it is running. Without a stored
+key the service starts and scores, and slow checks fail with `no_key`. `sudo ecc-server bedrock logout` deletes the
+key and restarts the service. A stored key that no longer decrypts stops the service from starting, as with the W&B
+key: run `sudo ecc-server bedrock login` again, or `sudo ecc-server bedrock logout`. Bedrock API keys expire; when
+Bedrock refuses the key, the host logs it once, with the fix, until a call succeeds again.
+
+**The call.** The slow check sends one Converse request per check, `POST
+https://bedrock-runtime.<bedrock_region>.amazonaws.com/model/<bedrock_model>/converse` with
+`Authorization: Bearer <key>`:
+
+```json
+{"system": [{"text": "<the served bundle's slow_check.system>"}], "messages": [{"role": "user", "content": [{"text": "<user>"}]}], "inferenceConfig": {"maxTokens": 8000}}
+```
+
+Each call is one attempt with a 300-second timeout, and calls run alongside scoring without holding a llama-server
+slot. When Bedrock answers 200, the answer carries the bundle version whose system prompt was sent, the model,
+Bedrock's `stopReason`, the text of every output text block joined, and the token usage (input, output, cache read,
+cache write; 0 when Bedrock omits one). A refusal or a token cap is still an answer; the slow check judges the stop
+reason and the text. Otherwise the call fails with one of these reasons:
+
+| reason | when |
+| --- | --- |
+| `no_bundle` | no bundle is served, so there is no system prompt |
+| `no_key` | no Bedrock key is set |
+| `bedrock_auth` | Bedrock answered 401 or 403: the key is invalid or expired, or has no access to the model |
+| `bedrock_error` | any other answer than 200 (throttling, 5xx, validation), with Bedrock's status and message |
+| `bedrock_unreachable` | a network error or the timeout |
+
+The system prompt, the user text and the answer hold policy text and player chat, so the host never logs them, nor
+the key: each call's log line has its result, sizes, token counts and duration. `ecc-server status` shows whether a
+key is set, the region and model, and the last call's time and result (`ok`, or the reason with Bedrock's status and
+error type).
+
 ## Building the package
 
 `./package.sh [version]` (needs Go; nothing else is installed) builds the static binary and runs nfpm, pinned to a
@@ -123,9 +166,12 @@ A TOML file, `/etc/ecc-server/config.toml` unless `-config` names another. Unkno
 | `wandb_project` | `ecc` | W&B project holding the bundle artifact |
 | `wandb_artifact` | `classifier-bundle` | the artifact whose `production` alias names the bundle to serve |
 | `check_interval` | `"10m"` | time between W&B checks, at least `1m` |
+| `bedrock_region` | `us-east-1` | AWS region of the Bedrock endpoint the slow check calls |
+| `bedrock_model` | `us.moonshotai.kimi-k3` | Bedrock model or inference profile ID the slow check calls |
 
-The W&B API key is not a config key; see Updates from W&B. On a machine without systemd (development), the host reads
-it from the file `ecc-server.wandb-api-key` in the directory `$CREDENTIALS_DIRECTORY` names.
+The API keys are not config keys; see Updates from W&B and Slow check on Amazon Bedrock. On a machine without systemd
+(development), the host reads them from the files `ecc-server.wandb-api-key` and `ecc-server.bedrock-api-key` in the
+directory `$CREDENTIALS_DIRECTORY` names.
 
 ## Commands
 
@@ -142,11 +188,13 @@ Every command except `version` takes `-config FILE` before its arguments (defaul
   previous bundle and deletes older ones.
 - `ecc-server update`: have the running host check W&B now, and wait while it downloads and switches to a new
   production bundle. It also installs a production version a rollback skipped or one that failed before.
-- `ecc-server status`: print the bundle the running host serves and its health, and with a W&B key the last check's
-  time and result, the version W&B's `production` names, and any download in progress; exit status 1 when no host
-  is listening or the host is not ready.
+- `ecc-server status`: print the bundle the running host serves and its health; with a W&B key the last check's
+  time and result, the version W&B's `production` names, and any download in progress; and the Bedrock key, model
+  and last call. Exit status 1 when no host is listening or the host is not ready.
 - `ecc-server wandb login`, `ecc-server wandb logout`: store or delete the W&B API key (as root; see Updates from
   W&B).
+- `ecc-server bedrock login`, `ecc-server bedrock logout`: store or delete the Amazon Bedrock API key (as root; see
+  Slow check on Amazon Bedrock).
 - `ecc-server version`: print the package version.
 
 `use` and `rollback` refuse to run as root: run them as the service user (`sudo -u ecc-server ecc-server use ...`),
@@ -176,17 +224,19 @@ conversation's window and scores it as the window's last line:
   so retry it. `422`: neither answer token is among the top logprobs; the message was added to the window but has
   no score, so do not retry it. `400`: malformed request.
 
-`GET /bundle` returns the served bundle's version, decision parameters and slow-check prompt, as the bundle states them.
-A bundle without a non-empty `slow_check.system` does not load.
+`GET /bundle` returns the served bundle's version and decision parameters, as the bundle states them. The bundle's
+slow-check system prompt is not served: the host sends it to Bedrock itself. A bundle without a non-empty
+`slow_check.system` does not load.
 
 ```json
-{"version": "4b-282f3c43561f", "decision": {"window_rule": "single", "trigger": 0.9, "clearing": 0.5, "corroboration": 0.5}, "slow_check": {"system": "..."}}
+{"version": "4b-282f3c43561f", "decision": {"window_rule": "single", "trigger": 0.9, "clearing": 0.5, "corroboration": 0.5}}
 ```
 
 `GET /health` is `200 {"status": "ready", "version": ...}` when a bundle is loaded and its llama-server answers its
 own health check, otherwise `503` with the reason. Its `wandb` field is `null` without a key, otherwise the W&B
 state `status` prints: `artifact`, `last_check`, `result`, `production`, `production_digest`, and `download`
-(`file`, `done` and `total` bytes) while one runs.
+(`file`, `done` and `total` bytes) while one runs. Its `bedrock` field is `key_set`, `region`, `model`, and after the
+first slow-check call `last_call` and `result`.
 
 `POST /switch` with `{"version": "..."}` switches to an installed bundle; `use` and `rollback` call it.
 

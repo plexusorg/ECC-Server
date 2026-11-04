@@ -20,3 +20,8 @@ wandb_artifact = "classifier-bundle"
 
 # How often the host checks W&B's production alias (at least 1m).
 check_interval = "10m"
+
+# The Amazon Bedrock region and model (a model or inference profile ID) the slow check calls. The API key is not set
+# here: `sudo ecc-server bedrock login` stores it encrypted for the service.
+bedrock_region = "us-east-1"
+bedrock_model = "us.moonshotai.kimi-k3"

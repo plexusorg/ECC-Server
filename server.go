@@ -105,6 +105,7 @@ type server struct {
 	convs    map[string]*conversation
 	switchMu sync.Mutex
 	upd      *updater // nil without a W&B key
+	br       *bedrock
 }
 
 type scoreRequest struct {
@@ -132,7 +133,12 @@ func run(cfg Config) error {
 	ctx, stopped := context.WithCancel(context.Background())
 	defer stopped()
 	s := &server{cfg: cfg, ctx: ctx, convs: map[string]*conversation{}}
-	key, err := wandbKey()
+	brKey, err := credential(bedrockCredential)
+	if err != nil {
+		return fmt.Errorf("reading the Bedrock key credential: %w", err)
+	}
+	s.br = newBedrock(brKey, cfg.BedrockRegion, cfg.BedrockModel)
+	key, err := credential(wandbCredential)
 	if err != nil {
 		return fmt.Errorf("reading the W&B key credential: %w", err)
 	}
@@ -176,6 +182,11 @@ func run(cfg Config) error {
 		go s.upd.loop(ctx)
 	} else {
 		slog.Info("no W&B key is set; serving the bundle on disk (set one with sudo ecc-server wandb login)")
+	}
+	if brKey == "" {
+		slog.Warn("no Bedrock key is set; slow checks fail until one is set with sudo ecc-server bedrock login")
+	} else {
+		slog.Info("slow checks call Bedrock", "model", cfg.BedrockModel, "region", cfg.BedrockRegion)
 	}
 
 	died := make(chan struct{})
@@ -366,20 +377,21 @@ func (s *server) handleBundle(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, errors.New("no bundle is being served"))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"version": m.bundle.Version, "decision": m.bundle.Decision, "slow_check": m.bundle.SlowCheck})
+	writeJSON(w, http.StatusOK, map[string]any{"version": m.bundle.Version, "decision": m.bundle.Decision})
 }
 
 type health struct {
-	Status  string       `json:"status"`
-	Version string       `json:"version,omitempty"`
-	Wandb   *wandbStatus `json:"wandb"` // null when no W&B key is set
+	Status  string         `json:"status"`
+	Version string         `json:"version,omitempty"`
+	Wandb   *wandbStatus   `json:"wandb"` // null when no W&B key is set
+	Bedrock *bedrockStatus `json:"bedrock"`
 }
 
 func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	m := s.cur
 	s.mu.Unlock()
-	h := health{Status: "ready"}
+	h := health{Status: "ready", Bedrock: s.br.status()}
 	if s.upd != nil {
 		h.Wandb = s.upd.status()
 	}

@@ -18,27 +18,10 @@ import (
 	"time"
 )
 
-// The W&B API key reaches the service as a systemd credential (LoadCredentialEncrypted= in the unit), which
-// `ecc-server wandb login` encrypts into the credential store.
 const (
 	wandbCredential = "ecc-server.wandb-api-key"
-	wandbCredStore  = "/etc/credstore.encrypted"
-	wandbCredFile   = wandbCredStore + "/" + wandbCredential
 	wandbGraphQL    = "https://api.wandb.ai/graphql"
 )
-
-// wandbKey reads the W&B API key from the service's credentials; "" when none is set.
-func wandbKey() (string, error) {
-	dir := os.Getenv("CREDENTIALS_DIRECTORY")
-	if dir == "" {
-		return "", nil
-	}
-	data, err := os.ReadFile(filepath.Join(dir, wandbCredential))
-	if errors.Is(err, os.ErrNotExist) {
-		return "", nil
-	}
-	return strings.TrimSpace(string(data)), err
-}
 
 type wandb struct {
 	key    string

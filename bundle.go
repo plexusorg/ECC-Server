@@ -31,7 +31,8 @@ type Bundle struct {
 	} `json:"prompt"`
 	// Served to Module-ECC as written; the host does not interpret it.
 	Decision json.RawMessage `json:"decision"`
-	// The slow-check prompt, served to Module-ECC so the policy text stays out of its public code.
+	// The slow check's system prompt, which /converse sends to Bedrock, so the policy text stays out of Module-ECC's
+	// public code.
 	SlowCheck struct {
 		System string `json:"system"`
 	} `json:"slow_check"`

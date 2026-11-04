@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"regexp"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -30,11 +31,18 @@ type Config struct {
 	WandbProject  string        `toml:"wandb_project"`
 	WandbArtifact string        `toml:"wandb_artifact"`
 	CheckInterval time.Duration `toml:"check_interval"`
+	// The Bedrock region and model (a model or inference profile ID) the slow check calls.
+	BedrockRegion string `toml:"bedrock_region"`
+	BedrockModel  string `toml:"bedrock_model"`
 }
+
+// The region becomes part of the Bedrock endpoint's host name.
+var regionName = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
 
 func loadConfig(path string) (Config, error) {
 	cfg := Config{Listen: "127.0.0.1:8790", Data: "/var/lib/ecc-server", Threads: 6, WandbEntity: "telesphoreo-telesphoreo",
-		WandbProject: "ecc", WandbArtifact: "classifier-bundle", CheckInterval: 10 * time.Minute}
+		WandbProject: "ecc", WandbArtifact: "classifier-bundle", CheckInterval: 10 * time.Minute,
+		BedrockRegion: "us-east-1", BedrockModel: "us.moonshotai.kimi-k3"}
 	md, err := toml.DecodeFile(path, &cfg)
 	if err != nil {
 		return cfg, fmt.Errorf("config %s: %w", path, err)
@@ -62,6 +70,12 @@ func loadConfig(path string) (Config, error) {
 	if cfg.CheckInterval < time.Minute {
 		return cfg, fmt.Errorf("config %s: check_interval must be at least 1m", path)
 	}
+	if !regionName.MatchString(cfg.BedrockRegion) {
+		return cfg, fmt.Errorf("config %s: bedrock_region %q is not an AWS region name", path, cfg.BedrockRegion)
+	}
+	if cfg.BedrockModel == "" {
+		return cfg, fmt.Errorf("config %s: bedrock_model is empty", path)
+	}
 	return cfg, nil
 }
 
@@ -71,9 +85,11 @@ const usage = `ecc-server <command> [-config FILE] [FOLDER]
   use FOLDER       install a bundle folder (model.gguf, bundle.json, manifest.json) and switch to it
   rollback         switch back to the previous bundle
   update           have the running host check W&B for a new production bundle now
-  status           print the bundle the running host serves, its health and its W&B updates
+  status           print the bundle the running host serves, its health, its W&B updates and its Bedrock calls
   wandb login      store the W&B API key, encrypted for the service (run with sudo)
   wandb logout     remove the stored W&B API key (run with sudo)
+  bedrock login    check the Amazon Bedrock API key and store it, encrypted for the service (run with sudo)
+  bedrock logout   remove the stored Bedrock API key (run with sudo)
   version          print the ecc-server version
 
 The config file defaults to ` + defaultConfig + `.
@@ -114,7 +130,11 @@ func main() {
 	case cmd == "wandb" && fs.NArg() == 1 && fs.Arg(0) == "login":
 		err = wandbLogin()
 	case cmd == "wandb" && fs.NArg() == 1 && fs.Arg(0) == "logout":
-		err = wandbLogout()
+		err = removeCredential("wandb", wandbCredential, "W&B")
+	case cmd == "bedrock" && fs.NArg() == 1 && fs.Arg(0) == "login":
+		err = bedrockLogin(cfg)
+	case cmd == "bedrock" && fs.NArg() == 1 && fs.Arg(0) == "logout":
+		err = removeCredential("bedrock", bedrockCredential, "Bedrock")
 	default:
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)

@@ -7,9 +7,11 @@ Wants=network-online.target
 User=ecc-server
 Group=ecc-server
 ExecStart=/usr/bin/ecc-server run -config /etc/ecc-server/config.toml
-# The W&B API key `ecc-server wandb login` encrypted into /etc/credstore.encrypted. Named without a path, the
-# credential is searched for in the credential stores and skipped when missing, so the service starts without a key.
+# The W&B and Bedrock API keys `ecc-server wandb login` and `ecc-server bedrock login` encrypted into
+# /etc/credstore.encrypted. Named without a path, a credential is searched for in the credential stores and skipped
+# when missing, so the service starts without either key.
 LoadCredentialEncrypted=ecc-server.wandb-api-key
+LoadCredentialEncrypted=ecc-server.bedrock-api-key
 Restart=always
 RestartSec=5
 NoNewPrivileges=yes
