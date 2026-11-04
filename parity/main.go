@@ -1,7 +1,7 @@
 // parity replays Module-ECC's evaluation conversations through a running ECC-Server, in conversation order, and
 // compares each message's margin with the margin `uv run eval` recorded for it.
 //
-//	go run ./parity -ecc <Module-ECC checkout> -bundle <bundle folder> -out results.jsonl
+//	go run ./parity -ecc <Module-ECC checkout> -bundle <bundle folder> -token-file <file> -out results.jsonl
 package main
 
 import (

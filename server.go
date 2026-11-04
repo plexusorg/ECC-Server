@@ -151,7 +151,7 @@ func run(cfg Config) error {
 	if key != "" {
 		s.upd = newUpdater(s, key)
 	} else if err := pruneStaging(cfg, ""); err != nil {
-		// downloads from before the key was removed
+		// staged downloads a removed key left behind
 		return err
 	}
 	if s.rec, err = openRecord(ctx, cfg); err != nil {

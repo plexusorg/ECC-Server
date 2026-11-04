@@ -54,7 +54,7 @@ func stopChild(cmd *exec.Cmd, exited <-chan struct{}) {
 	<-exited
 }
 
-// readSecret is Linux only: `wandb login` stores the key with systemd-creds.
+// readSecret is Linux only: the login commands store the key with systemd-creds.
 func readSecret(string) (string, error) {
 	return "", errors.New("reading a secret is not supported on Windows")
 }

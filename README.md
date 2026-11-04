@@ -45,11 +45,10 @@ copied onto the host instead: `sudo -u ecc-server ecc-server use /path/to/bundle
 
 Upgrade with `sudo apt update && sudo apt upgrade`. The service restarts, so conversation windows start anew; the
 installed bundle, the token, the W&B and Bedrock keys, your edited `config.toml`, the pending players, the unacknowledged
-actions and the records stay. A `config.toml` you edited before chat safety moved to this host lacks the required
-`server` key, and the host does not start until you add it (see Configuration). Remove with `sudo apt remove
-ecc-server` (stops and disables the service, keeps `/etc/ecc-server`, the keys and the data folder); `sudo apt purge
-ecc-server` also deletes `/var/lib/ecc-server`, including the bundles, the downloaded llama.cpp, the chat-safety state
-the records, the token, the stored W&B and Bedrock keys and the `ecc-server` user.
+actions and the records stay. Remove with `sudo apt remove ecc-server` (stops and disables the service, keeps
+`/etc/ecc-server`, the keys and the data folder); `sudo apt purge ecc-server` also deletes `/var/lib/ecc-server`,
+including the bundles, the downloaded llama.cpp, the chat-safety state, the records and the token, the stored W&B and
+Bedrock keys, and the `ecc-server` user.
 
 On first start with a bundle, the host downloads the llama.cpp release the bundle names (its Linux CPU build), checks
 the asset's SHA-256 against the bundle, and unpacks it under `<data>/llama/<release>/`.
@@ -207,6 +206,7 @@ compressed to `YYYY-MM-DD.jsonl.zst`; compressed files older than `record_retent
 slow check it is), an `action` when one is made (type, player, uuid, id) and an `acknowledged` when Module-ECC answers
 (type, player, ok, id, and `known`: false for an id that is not, or no longer, unacknowledged). The journal never
 holds player text, prompts or model answers; the record has them.
+
 ## Building the package
 
 `./package.sh [version]` (needs Go; nothing else is installed) builds the static binary and runs nfpm, pinned to a
@@ -369,12 +369,12 @@ windows.
 
 `POST /update` runs a W&B check and answers when it is done: `200 {"result": "..."}`, `502` with the error, or `409`
 without a key; `update` calls it.
+
 ## Parity check
 
 `go run ./parity -ecc <Module-ECC checkout> -bundle <bundle folder> -attacks <attacks.json> -token-file <file>`
-replays the
-evaluation case sets, the attacks set and a sample of Total Freedom conversations through a running host (`-host` is its address, `http://127.0.0.1:8790` by default; `-token-file` names a file
-holding its token, for example a copy of the output of `sudo ecc-server token`), in
-conversation order, and compares each message's margin with the margin `uv run eval` recorded
-(`data/eval/classifier/*.jsonl`). The attacks set is built in the pipeline's code; `attacks.json` is
-`json.dumps(ecc.attacks.conversations())`.
+replays the evaluation case sets, the attacks set and a sample of Total Freedom conversations through a running host
+(`-host` is its address, `http://127.0.0.1:8790` by default; `-token-file` names a file holding its token, for example
+a copy of the output of `sudo ecc-server token`), in conversation order, and compares each message's margin with the
+margin `uv run eval` recorded (`data/eval/classifier/*.jsonl`). The attacks set is built in the pipeline's code;
+`attacks.json` is `json.dumps(ecc.attacks.conversations())`.
