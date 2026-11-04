@@ -135,7 +135,8 @@ func (u *updater) update(ctx context.Context, force bool) (string, error) {
 	}
 	switch {
 	case st.Current != "" && st.Digests[st.Current] == a.Digest:
-		return "serving production " + st.Current, nil
+		// A download of a production version that was replaced before it finished is no longer needed.
+		return "serving production " + st.Current, pruneStaging(u.s.cfg, "")
 	case st.Skip == a.Digest:
 		return fmt.Sprintf("serving %s: rolled back from production %s, which is skipped until W&B's production changes or ecc-server update", st.Current, a.label()), nil
 	case u.failed == a.Digest:
@@ -172,19 +173,10 @@ func (u *updater) clearSkip(digest string, force bool) (State, error) {
 // again.
 func (u *updater) fetch(ctx context.Context, a *wbArtifact) (string, error) {
 	cfg := u.s.cfg
-	staging := filepath.Join(cfg.Data, "staging")
-	dir := filepath.Join(staging, a.Digest)
+	dir := filepath.Join(cfg.Data, "staging", a.Digest)
 	// Only production's download is kept; one for an earlier production version is abandoned.
-	entries, err := os.ReadDir(staging)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := pruneStaging(cfg, a.Digest); err != nil {
 		return "", err
-	}
-	for _, e := range entries {
-		if e.Name() != a.Digest {
-			if err := os.RemoveAll(filepath.Join(staging, e.Name())); err != nil {
-				return "", err
-			}
-		}
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
@@ -217,6 +209,18 @@ func (u *updater) fetch(ctx context.Context, a *wbArtifact) (string, error) {
 
 	u.s.switchMu.Lock()
 	defer u.s.switchMu.Unlock()
+	// The bundle's llama.cpp release is fetched before the bundle is judged: failing to download it says nothing
+	// about the bundle, so the staged files stay for the next check. Under switchMu, because serve fetches it too.
+	b, err := loadBundle(dir)
+	if err != nil {
+		os.RemoveAll(dir)
+		return "", bad("%w", err)
+	}
+	if cfg.LlamaServer == "" {
+		if _, err := llamaRelease(cfg, b); err != nil {
+			return "", err
+		}
+	}
 	defer os.RemoveAll(dir)
 	version, added, err := installBundle(cfg, dir)
 	if err != nil {
@@ -237,6 +241,23 @@ func (u *updater) fetch(ctx context.Context, a *wbArtifact) (string, error) {
 	}
 	st.Digests[version] = a.Digest
 	return version, writeState(cfg, st)
+}
+
+// pruneStaging deletes every staged download except keep's.
+func pruneStaging(cfg Config, keep string) error {
+	staging := filepath.Join(cfg.Data, "staging")
+	entries, err := os.ReadDir(staging)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	for _, e := range entries {
+		if e.Name() != keep {
+			if err := os.RemoveAll(filepath.Join(staging, e.Name())); err != nil {
+				return err
+			}
+		}
+	}
+	return err
 }
 
 // download fetches one file of production into dir, with a download URL resolved just before it (they expire).

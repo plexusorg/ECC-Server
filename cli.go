@@ -102,7 +102,9 @@ func wandbLogin() error {
 	if err != nil {
 		return fmt.Errorf("checking the key with W&B: %w", err)
 	}
-	cmd := exec.Command("systemd-creds", "encrypt", "--name="+wandbCredential, "-", "-")
+	// No PCR policy: bound to PCR 7 (systemd-creds' default), the credential would stop decrypting after a firmware
+	// or Secure Boot change, and systemd would then refuse to start the service.
+	cmd := exec.Command("systemd-creds", "encrypt", "--name="+wandbCredential, "--tpm2-pcrs=", "-", "-")
 	cmd.Stdin = strings.NewReader(key)
 	cmd.Stderr = os.Stderr
 	encrypted, err := cmd.Output()

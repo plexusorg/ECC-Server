@@ -138,6 +138,9 @@ func run(cfg Config) error {
 	}
 	if key != "" {
 		s.upd = newUpdater(s, key)
+	} else if err := pruneStaging(cfg, ""); err != nil {
+		// downloads from before the key was removed
+		return err
 	}
 	st, err := readState(cfg)
 	if err != nil {

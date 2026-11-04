@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -145,15 +146,18 @@ func activate(cfg Config, version string, byOperator bool) error {
 	if err := writeState(cfg, st); err != nil {
 		return err
 	}
+	// The switch is made once state.json names the bundle, so a bundle that cannot be deleted is only reported; the
+	// next switch deletes it.
 	entries, err := os.ReadDir(filepath.Join(cfg.Data, "bundles"))
 	if err != nil {
-		return err
+		slog.Warn("could not list the installed bundles to delete old ones", "err", err)
+		return nil
 	}
 	for _, e := range entries {
 		// An install in progress (another process's `use`) keeps its .tmp folder; installBundle replaces a stale one.
 		if e.Name() != st.Current && e.Name() != st.Previous && !strings.HasSuffix(e.Name(), ".tmp") {
 			if err := os.RemoveAll(filepath.Join(cfg.Data, "bundles", e.Name())); err != nil {
-				return err
+				slog.Warn("could not delete an old bundle", "bundle", e.Name(), "err", err)
 			}
 		}
 	}

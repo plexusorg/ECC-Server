@@ -11,6 +11,7 @@ import (
 	"hash"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -51,7 +52,7 @@ func newWandb(key, entity, project string) *wandb {
 	return &wandb{
 		key:    key,
 		api:    &http.Client{Timeout: time.Minute},
-		files:  &http.Client{Transport: &http.Transport{Proxy: http.ProxyFromEnvironment, ResponseHeaderTimeout: time.Minute}},
+		files:  &http.Client{},
 		entity: entity,
 		proj:   project,
 	}
@@ -232,7 +233,14 @@ func (w *wandb) download(ctx context.Context, f wbFile, dir string, progress fun
 		if have > 0 {
 			req.Header.Set("Range", fmt.Sprintf("bytes=%d-", have))
 		}
+		// The stall timer covers connecting and the response headers as well as the body.
+		stall := time.AfterFunc(stallTimeout, cancel)
+		defer stall.Stop()
 		resp, err := w.files.Do(req)
+		var ue *url.Error
+		if errors.As(err, &ue) {
+			err = ue.Err // the URL's signature grants access to the file, so it stays out of logs and status
+		}
 		if err != nil {
 			return fmt.Errorf("download %s: %w", f.Name, err)
 		}
@@ -247,10 +255,8 @@ func (w *wandb) download(ctx context.Context, f wbFile, dir string, progress fun
 		default:
 			return fmt.Errorf("download %s: %s", f.Name, resp.Status)
 		}
-		body := &stallReader{r: resp.Body, timer: time.AfterFunc(stallTimeout, cancel)}
-		defer body.timer.Stop()
 		dst := &countWriter{w: io.MultiWriter(out, h), n: have, progress: progress}
-		if _, err := io.Copy(dst, body); err != nil {
+		if _, err := io.Copy(dst, &stallReader{r: resp.Body, timer: stall}); err != nil {
 			return fmt.Errorf("download %s: %w", f.Name, err)
 		}
 		have = dst.n

@@ -56,11 +56,17 @@ host picks it up within `check_interval` (10 minutes by default), or at once on 
 **The key.** `sudo ecc-server wandb login` reads the API key from a hidden prompt (or from standard input when
 piped), checks it with W&B, encrypts it with `systemd-creds encrypt` into
 `/etc/credstore.encrypted/ecc-server.wandb-api-key`, and restarts the service if it is running. The key is
-encrypted with the host's credential key, and also bound to the TPM2 chip when the machine has one, so it can be
-decrypted only on this machine, by root. The service unit's `LoadCredentialEncrypted=ecc-server.wandb-api-key` has
-systemd decrypt it into the service's private credential directory at each start; without a stored key the service
-starts and serves the bundle on disk. `sudo ecc-server wandb logout` deletes the key and restarts the service. The
-key is never written in plaintext, logged, or set in `config.toml`.
+encrypted with the host's credential key, and also bound to the TPM2 chip when the machine has one (with no PCR
+policy, so firmware and Secure Boot updates do not lock it), so it can be decrypted only on this machine, by root.
+The service unit's `LoadCredentialEncrypted=ecc-server.wandb-api-key` has systemd decrypt it into the service's
+private credential directory at each start; without a stored key the service starts and serves the bundle on disk.
+`sudo ecc-server wandb logout` deletes the key and restarts the service. The key is never written in plaintext,
+logged, or set in `config.toml`.
+
+A stored key that no longer decrypts (the TPM2 was cleared or replaced, or the OS reinstalled with a new
+`/var/lib/systemd/credential.secret`) keeps systemd from starting the service, and `systemctl status ecc-server`
+shows `status=243/CREDENTIALS`. Run `sudo ecc-server wandb login` again, or `sudo ecc-server wandb logout`, then
+`sudo systemctl restart ecc-server`.
 
 **Each check** asks W&B which artifact version carries `production`. When its digest is not the one the served
 bundle came from, the host:
@@ -69,14 +75,16 @@ bundle came from, the host:
    `<data>/staging/<digest>/`, checking each file's size and MD5 against W&B. A file is written as `<name>.part`
    and renamed when it is complete and matches; an interrupted download resumes from its `.part` on the next check
    or after a restart. A bundle version already in the store is not downloaded again.
-2. installs the folder into the store, checking every file against the manifest's SHA-256s, as `use` does;
-3. switches to it without a gap in scoring, as `use` does, and records which W&B digest it came from, so a restart
+2. downloads the llama.cpp release the bundle names, if it is new; when that download fails, the staged files stay
+   and the next check tries again;
+3. installs the folder into the store, checking every file against the manifest's SHA-256s, as `use` does;
+4. switches to it without a gap in scoring, as `use` does, and records which W&B digest it came from, so a restart
    does not download it again.
 
 A bundle that fails any of these checks, or whose llama-server fails its health check, is discarded and logged with
 the reason; the current bundle keeps serving, and the host does not fetch that production version again until
-production moves or an operator runs `ecc-server update`. A bundle version is installed once: a changed bundle needs
-a new version.
+production moves, an operator runs `ecc-server update`, or the service restarts. A bundle version is installed once:
+a changed bundle needs a new version.
 
 **Offline.** When W&B is unreachable or answers with an error, the host keeps serving the bundle on disk and tries
 again at the next check. It logs the first failed check of an outage and the first check that succeeds after it.
