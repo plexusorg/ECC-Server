@@ -244,13 +244,18 @@ func (s *server) handleScore(w http.ResponseWriter, r *http.Request) {
 	m.inflight.Add(1)
 	idle := time.Since(c.last) >= idleWindow
 	s.mu.Unlock()
-	res, err := s.score(m, c, idle, req)
-	m.inflight.Done()
-	s.mu.Lock()
-	c.pending--
-	c.last = time.Now()
-	s.mu.Unlock()
-	close(mine)
+	res, err := func() (*scoreResponse, error) {
+		// Released even if score panics, so the conversation's later messages and a bundle switch never wait on it.
+		defer func() {
+			m.inflight.Done()
+			s.mu.Lock()
+			c.pending--
+			c.last = time.Now()
+			s.mu.Unlock()
+			close(mine)
+		}()
+		return s.score(m, c, idle, req)
+	}()
 
 	switch {
 	case errors.Is(err, errNoAnswer):
@@ -284,6 +289,9 @@ func (s *server) score(m *model, c *conversation, idle bool, req scoreRequest) (
 	<-m.slots
 	if err != nil {
 		return nil, err
+	}
+	if len(out.Probs) == 0 {
+		return nil, errors.New("llama-server returned no probabilities")
 	}
 	earlier := len(c.win.lines)
 	c.win.add(line{speaker: req.Speaker, text: req.Text, cost: cost})
