@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bytes"
+	"encoding/base64"
 	"errors"
+	"regexp"
 	"strings"
 )
 
@@ -12,7 +15,40 @@ import (
 
 // promptLine is chat.prompt_line.
 func promptLine(speaker, text string) string {
-	return clean(speaker) + ": " + clean(text) + "\n"
+	return clean(speaker) + ": " + decodeBase64(clean(text)) + "\n"
+}
+
+// base64Run is chat.BASE64: a run of base64 characters with optional padding, ASCII only.
+var base64Run = regexp.MustCompile(`[A-Za-z0-9+/]+={0,2}`)
+
+const base64Min = 8
+
+// decodeBase64 is chat.decode_base64: a run of at least base64Min characters is replaced by its decoding when that
+// is printable ASCII words (a space, and at least 70% letters or spaces); anything else stays as typed.
+func decodeBase64(s string) string {
+	return base64Run.ReplaceAllStringFunc(s, func(token string) string {
+		body := strings.TrimRight(token, "=")
+		if len(body) < base64Min || len(body)%4 == 1 || (body != token && len(token)%4 != 0) {
+			return token
+		}
+		raw, err := base64.StdEncoding.DecodeString(body + strings.Repeat("=", (4-len(body)%4)%4))
+		if err != nil || !bytes.Contains(raw, []byte{' '}) {
+			return token
+		}
+		letters := 0
+		for _, b := range raw {
+			if b < 0x20 || b > 0x7E {
+				return token
+			}
+			if b >= 'A' && b <= 'Z' || b >= 'a' && b <= 'z' || b == ' ' {
+				letters++
+			}
+		}
+		if letters*10 < len(raw)*7 {
+			return token
+		}
+		return string(raw)
+	})
 }
 
 type line struct {
