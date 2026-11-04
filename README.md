@@ -112,7 +112,7 @@ key and restarts the service. A stored key that no longer decrypts stops the ser
 key: run `sudo ecc-server bedrock login` again, or `sudo ecc-server bedrock logout`. Bedrock API keys expire; when
 Bedrock refuses the key, the host logs it once, with the fix, until a call succeeds again.
 
-**The call.** The slow check sends one Converse request per check, `POST
+**The call.** Each slow-check call is one Converse request, `POST
 https://bedrock-runtime.<bedrock_region>.amazonaws.com/model/<bedrock_model>/converse` with
 `Authorization: Bearer <key>`:
 
@@ -131,13 +131,14 @@ reason and the text. Otherwise the call fails with one of these reasons:
 | `no_bundle` | no bundle is served, so there is no system prompt |
 | `no_key` | no Bedrock key is set |
 | `bedrock_auth` | Bedrock answered 401 or 403: the key is invalid or expired, or has no access to the model |
-| `bedrock_error` | any other answer than 200 (throttling, 5xx, validation), with Bedrock's status and message |
+| `bedrock_error` | any other answer than 200 (throttling, 5xx, validation), or a 200 that is not a Converse response, with Bedrock's status and message |
 | `bedrock_unreachable` | a network error or the timeout |
 
 The system prompt, the user text and the answer hold policy text and player chat, so the host never logs them, nor
-the key: each call's log line has its result, sizes, token counts and duration. `ecc-server status` shows whether a
-key is set, the region and model, and the last call's time and result (`ok`, or the reason with Bedrock's status and
-error type).
+the key: a successful call's log line has its stop reason, sizes, token counts and duration, a failed call's has its
+result, sizes and duration, and a refused key is logged once per outage. `ecc-server status` shows whether a key is
+set, the region and model, and the last call's time and result (`ok`, or the reason with Bedrock's status and error
+type).
 
 ## Building the package
 
