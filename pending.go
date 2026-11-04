@@ -30,6 +30,8 @@ type pendingState struct {
 	Later          []msgRecord    `json:"later"`
 	LaterDropped   int            `json:"later_dropped,omitempty"`
 	HeldMs         int64          `json:"held_ms,omitempty"`
+	// A verdict of the state's slow check was not sure yet, and staff were sent a notice for it.
+	Held bool `json:"held,omitempty"`
 }
 
 // decisionRecord is the decision parameters of the bundle that scored the trigger.
@@ -150,13 +152,18 @@ func (p *pendingStore) addLater(uuid string, line msgRecord) {
 	p.save(uuid)
 }
 
-func (p *pendingStore) setHeld(uuid string, held time.Duration) {
+// setHeld records a verdict that is not sure yet and the time held so far; true at the state's first such verdict.
+func (p *pendingStore) setHeld(uuid string, held time.Duration) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if st := p.entries[uuid]; st != nil {
-		st.HeldMs = held.Milliseconds()
-		p.save(uuid)
+	st := p.entries[uuid]
+	if st == nil {
+		return false
 	}
+	first := !st.Held
+	st.Held, st.HeldMs = true, held.Milliseconds()
+	p.save(uuid)
+	return first
 }
 
 // remove ends the player's pending state, which lifts their mute unless a ban holds it until the kick.

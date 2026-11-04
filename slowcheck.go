@@ -244,7 +244,8 @@ func (sl *slowChecker) lift(c *slowCase) {
 	delete(sl.cases, c.uuid)
 	sl.pend.remove(c.uuid)
 	if !sl.acts.awaitingKickOf(c.uuid) {
-		sl.acts.unmute(c.uuid, c.name, roleHeld, "cap", fmt.Sprintf("%d seconds not sure", int(c.heldTime.Seconds())))
+		sl.acts.unmute(c.uuid, c.name, unmuteHeldPastCap, roleHeld, "cap",
+			fmt.Sprintf("%d seconds not sure", int(c.heldTime.Seconds())))
 	}
 }
 
@@ -429,13 +430,16 @@ func (sl *slowChecker) apply(run *slowRun, decided []decidedSpeaker, outcomes ma
 		sl.mu.Lock()
 		held := run.c.heldTime
 		sl.mu.Unlock()
-		sl.pend.setHeld(run.c.uuid, held)
+		// Staff are told once per pending state, at its first verdict that is not sure yet.
+		if sl.pend.setHeld(run.c.uuid, held) {
+			sl.acts.notice(run.c.uuid, self)
+		}
 		return slowHeld
 	}
 	sl.pend.remove(run.c.uuid)
 	// A player awaiting a ban's kick stays muted until it; the kick time unmutes them.
 	if o.role == roleNotInvolved && !sl.acts.awaitingKickOf(run.c.uuid) {
-		sl.acts.unmute(run.c.uuid, self, o.role, o.cause, "")
+		sl.acts.unmute(run.c.uuid, self, unmuteNotInvolved, o.role, o.cause, "")
 	}
 	return slowDone
 }
@@ -592,6 +596,8 @@ func (sl *slowChecker) recordVerdict(run *slowRun, speaker string, trigger int, 
 		n := trigger + 1
 		triggerLine = &n
 	}
+	slog.Info("verdict", "player", speaker, "uuid", run.t.uuids[speaker], "outcome", o.role, "cause", o.cause,
+		"check_of", run.c.name)
 	sl.rec.append("slow_verdict", struct {
 		slowLineBase
 		Speaker     string                  `json:"speaker"`

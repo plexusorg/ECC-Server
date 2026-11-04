@@ -181,7 +181,7 @@ system prompt is the served bundle's. After a restart every pending player's che
 | --- | --- |
 | offender or at risk | `ban` with `role` and a `kick_at` a random time in `kick_delay_min` to `kick_delay_max` after the verdict; the player stays muted until then, and an `unmute` follows at `kick_at` |
 | not involved | `unmute`; the pending state ends |
-| not sure yet (held) | stays muted; checked again on each new line; after `held_cap` of such verdicts, not counting time while Bedrock fails, `unmute` with no ban |
+| not sure yet (held) | stays muted; a `notice` at the pending state's first such verdict; checked again on each new line; after `held_cap` of such verdicts, not counting time while Bedrock fails, `unmute` with no ban |
 
 A participant who never triggered is banned only with corroboration (an offending quote of their own line, and a
 P(ban) at or above the bundle's `corroboration` threshold on one of their quoted lines), with the same `ban` action.
@@ -200,8 +200,13 @@ config's `server`) and `ts`: every `message` (its text, channel, conversation, s
 Kimi call (`slow_call`: the trigger's bundle, the prompt's bundle, the view, attempts, errors, token usage and the
 answer), every verdict (`slow_verdict`: outcome, cause and the validated evidence per view), every `action` (with the
 verdict's role and cause) and every `ack`. Lines are flushed one at a time. Just after midnight UTC the day's file is
-compressed to `YYYY-MM-DD.jsonl.zst`; compressed files older than `record_retention_days` are deleted. The journal
-(`journalctl -u ecc-server`) never holds player text, prompts or model answers.
+compressed to `YYYY-MM-DD.jsonl.zst`; compressed files older than `record_retention_days` are deleted.
+
+**The journal.** Run `journalctl -u ecc-server -f` to watch decisions as they are made. Each is one info line: a
+`trigger` (player, uuid, channel), a `verdict` (player, uuid, outcome, cause, and `check_of`, the pending player whose
+slow check it is), an `action` when one is made (type, player, uuid, id) and an `acknowledged` when Module-ECC answers
+(type, player, ok, id, and `known`: false for an id that is not, or no longer, unacknowledged). The journal never
+holds player text, prompts or model answers; the record has them.
 ## Building the package
 
 `./package.sh [version]` (needs Go; nothing else is installed) builds the static binary and runs nfpm, pinned to a
@@ -313,11 +318,20 @@ malformed; `503` while the host is stopping (send it again). A message whose tex
 unacknowledged action, oldest first:
 
 ```json
-[{"id": "<uuid>", "type": "ban", "uuid": "<player uuid>", "name": "Name", "role": "offender", "kick_at": "2026-11-04T21:21:40.512Z"}]
+[{"id": "<uuid>", "type": "ban", "uuid": "<player uuid>", "name": "Name", "role": "offender", "kick_at": "2026-11-04T21:21:40.512Z", "why": {"cause": "kimi"}}]
 ```
 
-`type` is `mute`, `unmute` or `ban`; `role` (`offender` or `at_risk`) and `kick_at` are on `ban` only. A ban mutes
-the player until `kick_at`, and an `unmute` follows at `kick_at`.
+`type` is `mute`, `unmute`, `ban` or `notice`; `role` (`offender` or `at_risk`) and `kick_at` are on `ban` only. A ban
+mutes the player until `kick_at`, and an `unmute` follows at `kick_at`. Every action carries `why`, for staff:
+
+| type | `why` |
+| --- | --- |
+| `mute` | `{"channel", "text"}`: the triggering line's channel and its text as the player typed it |
+| `unmute` | `{"cause"}`: `not_involved` (the slow check found no violation), `held_past_cap` (not sure yet for `held_cap`) or `kicked` (the unmute at a ban's `kick_at`) |
+| `ban` | `{"cause"}`: `kimi` (Kimi's evidence) or `corroborated` (a participant who never triggered, with corroboration) |
+| `notice` | `{"kind": "held"}`: the slow check is not sure yet; sent once per pending state, at its first such verdict |
+
+A `notice` changes nothing: Module-ECC shows it to staff and acknowledges it like any other action.
 
 `POST /actions/ack` with `{"id": "...", "ok": true, "detail": "..."}` once an action is carried out: `200 {}`. Only
 `ok: true` ends an action; after `ok: false` it stays and is served again. Every acknowledgement is recorded; a

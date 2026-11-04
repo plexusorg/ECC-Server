@@ -4,6 +4,7 @@ import (
 	"container/list"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"slices"
 	"strings"
@@ -270,7 +271,8 @@ func (sf *safety) trigger(m *message, v verdict, context []*message) {
 	sf.rec.append("decision", decisionLine{TS: stamp(now), Decision: decisionTrigger, Speaker: m.speaker,
 		SpeakerUUID: m.speakerUUID, MessageID: m.id, PBan: v.score.pBan, Version: v.score.version,
 		TriggerThreshold: *d.Trigger})
-	sf.acts.mute(m.speakerUUID, m.speaker)
+	slog.Info("trigger", "player", m.speaker, "uuid", m.speakerUUID, "channel", m.channel)
+	sf.acts.mute(m.speakerUUID, m.speaker, m.channel, m.text)
 	sf.slow.check(m.speakerUUID, m.speaker)
 }
 

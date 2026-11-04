@@ -14,21 +14,32 @@ import (
 	"time"
 )
 
-// What Module-ECC is told to do, in the order the actions were made.
+// What Module-ECC is told to do, in the order the actions were made. A notice changes nothing; Module-ECC shows it
+// to staff.
 const (
 	actionMute   = "mute"
 	actionUnmute = "unmute"
 	actionBan    = "ban"
+	actionNotice = "notice"
 )
 
-// action is one action as GET /actions returns it. Role and KickAt are set on a ban only.
+// Why a player is unmuted, as an unmute's why.cause names it.
+const (
+	unmuteNotInvolved = "not_involved"
+	unmuteHeldPastCap = "held_past_cap"
+	unmuteKicked      = "kicked"
+)
+
+// action is one action as GET /actions returns it. Why tells staff why it was made: a mute's channel and text, an
+// unmute's or a ban's cause, a notice's kind. Role and KickAt are set on a ban only.
 type action struct {
-	ID     string `json:"id"`
-	Type   string `json:"type"`
-	UUID   string `json:"uuid"`
-	Name   string `json:"name"`
-	Role   string `json:"role,omitempty"`
-	KickAt string `json:"kick_at,omitempty"`
+	ID     string            `json:"id"`
+	Type   string            `json:"type"`
+	UUID   string            `json:"uuid"`
+	Name   string            `json:"name"`
+	Role   string            `json:"role,omitempty"`
+	KickAt string            `json:"kick_at,omitempty"`
+	Why    map[string]string `json:"why"`
 }
 
 // kick is a banned player who stays muted until kickAt, when they are unmuted.
@@ -93,7 +104,8 @@ func (a *actionStore) kicked() {
 	a.mu.Unlock()
 	for _, k := range due {
 		if !a.pending(k.UUID) {
-			a.emit(action{Type: actionUnmute, UUID: k.UUID, Name: k.Name}, "", "kicked", "")
+			a.emit(action{Type: actionUnmute, UUID: k.UUID, Name: k.Name, Why: map[string]string{"cause": unmuteKicked}},
+				"", "kicked", "")
 		}
 	}
 }
@@ -145,12 +157,21 @@ type actionLine struct {
 	Detail     string `json:"detail,omitempty"`
 }
 
-func (a *actionStore) mute(uuid, name string) {
-	a.emit(action{Type: actionMute, UUID: uuid, Name: name}, "", "", "")
+// mute mutes a player who triggered; channel and text are the triggering line's, as the player typed it.
+func (a *actionStore) mute(uuid, name, channel, text string) {
+	a.emit(action{Type: actionMute, UUID: uuid, Name: name, Why: map[string]string{"channel": channel, "text": text}},
+		"", "", "")
 }
 
-func (a *actionStore) unmute(uuid, name, role, cause, detail string) {
-	a.emit(action{Type: actionUnmute, UUID: uuid, Name: name}, role, cause, detail)
+// unmute unmutes a player; why is one of the unmute causes, and role, cause and detail are the record's.
+func (a *actionStore) unmute(uuid, name, why, role, cause, detail string) {
+	a.emit(action{Type: actionUnmute, UUID: uuid, Name: name, Why: map[string]string{"cause": why}}, role, cause, detail)
+}
+
+// notice tells staff that a pending player stays muted while their slow check is not sure yet.
+func (a *actionStore) notice(uuid, name string) {
+	a.emit(action{Type: actionNotice, UUID: uuid, Name: name, Why: map[string]string{"kind": roleHeld}}, roleHeld, "",
+		"")
 }
 
 // ban bans an offender or a player at risk: Module-ECC writes the ban entry and kicks them at a random time in the
@@ -171,7 +192,8 @@ func (a *actionStore) ban(uuid, name, role, cause string, said time.Time) {
 	a.banned[uuid] = now
 	a.mu.Unlock()
 	time.AfterFunc(time.Until(at), a.kicked)
-	a.emit(action{Type: actionBan, UUID: uuid, Name: name, Role: role, KickAt: stamp(at)}, role, cause, "")
+	a.emit(action{Type: actionBan, UUID: uuid, Name: name, Role: role, KickAt: stamp(at),
+		Why: map[string]string{"cause": cause}}, role, cause, "")
 }
 
 func (a *actionStore) emit(act action, role, cause, detail string) {
@@ -184,6 +206,7 @@ func (a *actionStore) emit(act action, role, cause, detail string) {
 	a.mu.Unlock()
 	a.rec.append("action", actionLine{TS: stamp(time.Now()), ID: act.ID, Action: act.Type, Player: act.Name,
 		PlayerUUID: act.UUID, Role: role, Cause: cause, KickAt: act.KickAt, Detail: detail})
+	slog.Info("action", "type", act.Type, "player", act.Name, "uuid", act.UUID, "id", act.ID)
 }
 
 type ackLine struct {
@@ -200,9 +223,11 @@ type ackLine struct {
 // stays and is served again, and Module-ECC retries it. A repeated or unknown id is recorded and changes nothing.
 func (a *actionStore) ack(id string, ok bool, detail string) {
 	line := ackLine{TS: stamp(time.Now()), ID: id, OK: ok, Detail: detail}
+	name := ""
 	a.mu.Lock()
 	if i := slices.IndexFunc(a.actions, func(act action) bool { return act.ID == id }); i >= 0 {
 		line.Known, line.Action, line.PlayerUUID = true, a.actions[i].Type, a.actions[i].UUID
+		name = a.actions[i].Name
 		if ok {
 			a.actions = slices.Delete(a.actions, i, i+1)
 			a.save()
@@ -210,6 +235,7 @@ func (a *actionStore) ack(id string, ok bool, detail string) {
 	}
 	a.mu.Unlock()
 	a.rec.append("ack", line)
+	slog.Info("acknowledged", "type", line.Action, "player", name, "ok", ok, "id", id, "known", line.Known)
 }
 
 // flush retries a write that failed.
