@@ -376,5 +376,7 @@ without a key; `update` calls it.
 replays the evaluation case sets, the attacks set and a sample of Total Freedom conversations through a running host
 (`-host` is its address, `http://127.0.0.1:8790` by default; `-token-file` names a file holding its token, for example
 a copy of the output of `sudo ecc-server token`), in conversation order, and compares each message's margin with the
-margin `uv run eval` recorded (`data/eval/classifier/*.jsonl`). The attacks set is built in the pipeline's code;
-`attacks.json` is `json.dumps(ecc.attacks.conversations())`.
+margin `uv run eval` recorded (`<work>/eval/classifier/*.jsonl`; `<work>` is `[paths] work` in the checkout's `data/local.toml`, which the tool
+reads). Case sets are the folders of `.txt` case files in `ecc.toml`'s `[eval.sets]`, read in name order. The attacks
+set is built by the code in the pipeline's `data/cases/attacks/`; write `attacks.json` from the checkout with
+`uv run python -c "import json; from ecc.core import Config; from ecc.evaluate import attack_conversations; print(json.dumps(attack_conversations(Config())))" > attacks.json`.

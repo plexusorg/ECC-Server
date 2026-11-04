@@ -59,11 +59,11 @@ func main() {
 	bundle := flag.String("bundle", "", "bundle folder (for its Platt parameters)")
 	host := flag.String("host", "http://127.0.0.1:8790", "ECC-Server address")
 	tokenFile := flag.String("token-file", "", "file holding ECC-Server's token (`sudo ecc-server token`, or <data>/token)")
-	model := flag.String("model", "classifier", "eval model folder under data/eval")
+	model := flag.String("model", "classifier", "eval model folder under <work>/eval")
 	tfConvs := flag.Int("tf", 200, "Total Freedom conversations to replay")
 	seed := flag.Uint64("seed", 1, "seed of the Total Freedom sample")
 	sets := flag.String("sets", "cases,redteam,heldout,injection,attacks", "case sets to replay")
-	attacks := flag.String("attacks", "", "the attacks set's conversations as JSON (ecc.attacks.conversations())")
+	attacks := flag.String("attacks", "", "the attacks set's conversations as JSON (ecc.evaluate.attack_conversations)")
 	workers := flag.Int("workers", 4, "conversations replayed at once")
 	out := flag.String("out", "parity.jsonl", "per-message results")
 	flag.Parse()
@@ -81,7 +81,8 @@ func main() {
 	check(err)
 	check(json.Unmarshal(raw, &b))
 
-	evalDir := filepath.Join(*ecc, "data", "eval", *model)
+	paths := eccPaths(*ecc)
+	evalDir := filepath.Join(paths["work"], "eval", *model)
 	var convs []conversation
 	evalMargins := map[string]float64{}
 	for _, set := range strings.Split(*sets, ",") {
@@ -92,7 +93,7 @@ func main() {
 		if set == "attacks" {
 			c = loadAttacks(*attacks)
 		} else {
-			c = loadCases(set, caseFiles(*ecc, set))
+			c = loadCases(set, caseFiles(*ecc, paths, set))
 		}
 		readEval(filepath.Join(evalDir, set+".jsonl"), func(k string, m float64) { evalMargins[set+"|"+k] = m })
 		convs = append(convs, c...)
@@ -176,7 +177,24 @@ func check(err error) {
 
 // ---------------------------------------------------------------- inputs
 
-func caseFiles(ecc, set string) []string {
+// eccPaths is Module-ECC's Config.paths: the [paths] table of data/local.toml, which holds the work folder that
+// `uv run eval` writes its scores to.
+func eccPaths(ecc string) map[string]string {
+	var local struct {
+		Paths map[string]string `toml:"paths"`
+	}
+	_, err := toml.DecodeFile(filepath.Join(ecc, "data", "local.toml"), &local)
+	check(err)
+	if local.Paths["work"] == "" {
+		check(errors.New("data/local.toml has no [paths] work"))
+	}
+	return local.Paths
+}
+
+// caseFiles is chat.files_in over an [eval.sets] entry: each path is a case file or a folder whose .txt files are
+// taken in name order (the folder's .json roles are not cases). Paths resolve as Config.path does: {data}, {repo}
+// and [paths] keys are substituted, and a relative path is under the repository.
+func caseFiles(ecc string, paths map[string]string, set string) []string {
 	var cfg struct {
 		Eval struct {
 			Sets map[string][]string `toml:"sets"`
@@ -184,16 +202,29 @@ func caseFiles(ecc, set string) []string {
 	}
 	_, err := toml.DecodeFile(filepath.Join(ecc, "ecc.toml"), &cfg)
 	check(err)
+	pairs := []string{"{data}", filepath.Join(ecc, "data"), "{repo}", ecc}
+	for k, v := range paths {
+		pairs = append(pairs, "{"+k+"}", v)
+	}
 	var files []string
-	for _, f := range cfg.Eval.Sets[set] {
-		f = strings.ReplaceAll(f, "{data}", filepath.Join(ecc, "data"))
-		if !filepath.IsAbs(f) {
-			f = filepath.Join(ecc, f)
+	for _, p := range cfg.Eval.Sets[set] {
+		p = strings.NewReplacer(pairs...).Replace(p)
+		if !filepath.IsAbs(p) {
+			p = filepath.Join(ecc, p)
 		}
-		files = append(files, f)
+		info, err := os.Stat(p)
+		check(err)
+		if !info.IsDir() {
+			files = append(files, p)
+			continue
+		}
+		found, err := filepath.Glob(filepath.Join(p, "*.txt"))
+		check(err)
+		sort.Strings(found)
+		files = append(files, found...)
 	}
 	if len(files) == 0 {
-		check(fmt.Errorf("ecc.toml has no [eval.sets] %s", set))
+		check(fmt.Errorf("ecc.toml has no case files for [eval.sets] %s", set))
 	}
 	return files
 }
