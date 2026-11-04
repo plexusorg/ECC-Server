@@ -115,10 +115,10 @@ func bedrockLogin(cfg Config) error {
 	return restartService()
 }
 
-// status prints the bundle a running host serves, its health, its W&B updates and its Bedrock calls.
+// status prints the bundle a running host serves, its health, its W&B updates, its Bedrock calls and chat safety.
 func status(cfg Config) error {
 	client := http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get("http://" + cfg.Listen + "/health")
+	resp, err := client.Get("http://" + cfg.Listen + "/status")
 	var dial *net.OpError
 	if errors.As(err, &dial) && dial.Op == "dial" {
 		return fmt.Errorf("no host is listening on %s", cfg.Listen)
@@ -127,7 +127,7 @@ func status(cfg Config) error {
 		return err
 	}
 	defer resp.Body.Close()
-	var h health
+	var h hostStatus
 	if err := json.NewDecoder(resp.Body).Decode(&h); err != nil {
 		return fmt.Errorf("unexpected answer from %s: %w", cfg.Listen, err)
 	}
@@ -165,10 +165,30 @@ func status(cfg Config) error {
 				time.Since(b.LastCall).Round(time.Second), b.Result)
 		}
 	}
+	sf := h.Safety
+	if sf.Paused != "" {
+		fmt.Printf("scoring: paused (%s); %d messages wait\n", sf.Paused, sf.Backlog)
+	} else {
+		fmt.Printf("scoring: %d messages wait\n", sf.Backlog)
+	}
+	fmt.Printf("pending players: %d%s\n", len(sf.Pending), names(sf.Pending))
+	if sc := sf.SlowCheck; sc.Answering != nil && !*sc.Answering {
+		fmt.Printf("slow check: Bedrock failing since %s: %s\n", sc.Since.Format(time.DateTime), sc.Failure)
+	}
+	fmt.Printf("checking: %d%s; held (not sure yet): %d%s\n", len(sf.SlowCheck.Checking), names(sf.SlowCheck.Checking),
+		len(sf.SlowCheck.Held), names(sf.SlowCheck.Held))
+	fmt.Printf("unacknowledged actions: %d\n", sf.Unacknowledged)
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("the host is not ready")
 	}
 	return nil
+}
+
+func names(list []string) string {
+	if len(list) == 0 {
+		return ""
+	}
+	return " (" + strings.Join(list, ", ") + ")"
 }
 
 // update has the running host check W&B now and install production if it is not served, waiting for the result.

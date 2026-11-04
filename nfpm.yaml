@@ -8,10 +8,11 @@ section: net
 priority: optional
 maintainer: Telesphoreo <me@telesphoreo.me>
 description: |
-  Model host for Module-ECC's chat-safety classifier.
-  Serves a classifier bundle through a llama-server child process over loopback HTTP,
-  fetches the bundle promoted to production from Weights & Biases,
-  and calls Amazon Bedrock for the slow check.
+  Chat-safety decisions for Module-ECC.
+  Scores chat with a classifier bundle served by a llama-server child process,
+  runs the slow check on Amazon Bedrock, keeps the daily record, and tells
+  Module-ECC over loopback HTTP whom to mute, unmute and ban. Fetches the
+  bundle promoted to production from Weights & Biases.
 depends:
   - libgomp1
   - ca-certificates

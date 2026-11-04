@@ -106,6 +106,8 @@ type server struct {
 	switchMu sync.Mutex
 	upd      *updater // nil without a W&B key
 	br       *bedrock
+	rec      *recordLog
+	safety   *safety
 }
 
 type scoreRequest struct {
@@ -148,6 +150,13 @@ func run(cfg Config) error {
 		// downloads from before the key was removed
 		return err
 	}
+	if s.rec, err = openRecord(ctx, cfg); err != nil {
+		return fmt.Errorf("opening the record: %w", err)
+	}
+	defer s.rec.close()
+	if s.safety, err = openSafety(s, cfg, s.rec); err != nil {
+		return err
+	}
 	st, err := readState(cfg)
 	if err != nil {
 		return err
@@ -170,9 +179,12 @@ func run(cfg Config) error {
 	}
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("POST /messages", s.handleMessages)
+	mux.HandleFunc("GET /actions", s.handleActions)
+	mux.HandleFunc("POST /actions/ack", s.handleAck)
+	mux.HandleFunc("GET /muted", s.handleMuted)
+	mux.HandleFunc("GET /status", s.handleStatus)
 	mux.HandleFunc("POST /score", s.handleScore)
-	mux.HandleFunc("GET /bundle", s.handleBundle)
-	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("POST /switch", s.handleSwitch)
 	mux.HandleFunc("POST /update", s.handleUpdate)
 	srv := &http.Server{Addr: cfg.Listen, Handler: mux}
@@ -207,6 +219,7 @@ func run(cfg Config) error {
 	shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(shutdown)
+	s.safety.close()
 	s.mu.Lock()
 	m := s.cur
 	s.mu.Unlock()
@@ -260,23 +273,18 @@ func writeError(w http.ResponseWriter, status int, err error) {
 	writeJSON(w, status, map[string]string{"error": err.Error()})
 }
 
-func (s *server) handleScore(w http.ResponseWriter, r *http.Request) {
-	var req scoreRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Conversation == "" {
-		writeError(w, http.StatusBadRequest, errors.New("expected {\"conversation\", \"speaker\", \"text\"}"))
-		return
-	}
+// errNoBundle: no bundle is served yet, so nothing can be scored.
+var errNoBundle = errors.New("no bundle is being served")
+
+// inTurn runs fn as the conversation's next line, once the lines before it are done, with the served model. at is
+// the line's time: a conversation idle for idleWindow before it starts a new window.
+func (s *server) inTurn(id string, at time.Time, fn func(m *model, c *conversation, idle bool) error) error {
 	s.mu.Lock()
-	if s.cur == nil {
-		s.mu.Unlock()
-		writeError(w, http.StatusServiceUnavailable, errors.New("no bundle is being served"))
-		return
-	}
-	c := s.convs[req.Conversation]
+	c := s.convs[id]
 	if c == nil {
 		c = &conversation{tail: make(chan struct{})}
 		close(c.tail)
-		s.convs[req.Conversation] = c
+		s.convs[id] = c
 	}
 	prev, mine := c.tail, make(chan struct{})
 	c.tail = mine
@@ -286,23 +294,46 @@ func (s *server) handleScore(w http.ResponseWriter, r *http.Request) {
 	<-prev
 	s.mu.Lock()
 	m := s.cur
-	m.inflight.Add(1)
-	idle := time.Since(c.last) >= idleWindow
+	if m != nil {
+		m.inflight.Add(1)
+	}
+	idle := at.Sub(c.last) >= idleWindow
 	s.mu.Unlock()
-	res, err := func() (*scoreResponse, error) {
-		// Released even if score panics, so the conversation's later messages and a bundle switch never wait on it.
-		defer func() {
+	// Released even if fn panics, so the conversation's later lines and a bundle switch never wait on it.
+	defer func() {
+		if m != nil {
 			m.inflight.Done()
-			s.mu.Lock()
-			c.pending--
-			c.last = time.Now()
-			s.mu.Unlock()
-			close(mine)
-		}()
-		return s.score(m, c, idle, req)
+		}
+		s.mu.Lock()
+		c.pending--
+		if at.After(c.last) {
+			c.last = at
+		}
+		s.mu.Unlock()
+		close(mine)
 	}()
+	if m == nil {
+		return errNoBundle
+	}
+	return fn(m, c, idle)
+}
 
+// handleScore scores a line outside chat safety, with no record and no decision: the parity tool's interface.
+func (s *server) handleScore(w http.ResponseWriter, r *http.Request) {
+	var req scoreRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Conversation == "" {
+		writeError(w, http.StatusBadRequest, errors.New("expected {\"conversation\", \"speaker\", \"text\"}"))
+		return
+	}
+	var res *scoreResponse
+	err := s.inTurn(req.Conversation, time.Now(), func(m *model, c *conversation, idle bool) error {
+		var err error
+		res, err = s.score(m, c, idle, req)
+		return err
+	})
 	switch {
+	case errors.Is(err, errNoBundle):
+		writeError(w, http.StatusServiceUnavailable, err)
 	case errors.Is(err, errNoAnswer):
 		writeError(w, http.StatusUnprocessableEntity, err)
 	case err != nil:
@@ -313,13 +344,30 @@ func (s *server) handleScore(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// score scores the message as its conversation's next line and appends it to the window. A message that fails to
-// score is not appended, so Module-ECC's retry of it takes its place in the conversation.
-func (s *server) score(m *model, c *conversation, idle bool, req scoreRequest) (*scoreResponse, error) {
-	b := m.bundle
+// resetWindow starts a new window for the served model, or after the conversation was idle.
+func resetWindow(m *model, c *conversation, idle bool) {
 	if c.gen != m || idle {
 		c.gen, c.win = m, window{used: m.header}
 	}
+}
+
+// appendLine adds a line to the conversation's window without scoring it, with its token cost, as scoring it would.
+func (s *server) appendLine(m *model, c *conversation, idle bool, speaker, text string) error {
+	resetWindow(m, c, idle)
+	cost, err := m.count(promptLine(speaker, text))
+	if err != nil {
+		return err
+	}
+	c.win.fit(m.bundle, m.header, cost)
+	c.win.add(line{speaker: speaker, text: text, cost: cost})
+	return nil
+}
+
+// score scores the message as its conversation's next line and appends it to the window. A message that fails to
+// score is not appended, so a retry of it takes its place in the conversation.
+func (s *server) score(m *model, c *conversation, idle bool, req scoreRequest) (*scoreResponse, error) {
+	b := m.bundle
+	resetWindow(m, c, idle)
 	cost, err := m.count(promptLine(req.Speaker, req.Text))
 	if err != nil {
 		return nil, err
@@ -369,32 +417,44 @@ func (s *server) score(m *model, c *conversation, idle bool, req scoreRequest) (
 	}, nil
 }
 
-func (s *server) handleBundle(w http.ResponseWriter, r *http.Request) {
-	s.mu.Lock()
-	m := s.cur
-	s.mu.Unlock()
-	if m == nil {
-		writeError(w, http.StatusServiceUnavailable, errors.New("no bundle is being served"))
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"version": m.bundle.Version, "decision": m.bundle.Decision})
-}
-
-type health struct {
+type hostStatus struct {
 	Status  string         `json:"status"`
 	Version string         `json:"version,omitempty"`
 	Wandb   *wandbStatus   `json:"wandb"` // null when no W&B key is set
 	Bedrock *bedrockStatus `json:"bedrock"`
+	Safety  safetyStatus   `json:"safety"`
 }
 
-func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
+// safetyStatus is chat safety's state: Backlog counts the messages waiting to be scored, Paused says why scoring
+// waits ("" while it runs), Pending lists the muted players awaiting a verdict, and Unacknowledged counts the
+// actions Module-ECC has not confirmed.
+type safetyStatus struct {
+	Backlog        int        `json:"backlog"`
+	Paused         string     `json:"paused,omitempty"`
+	Pending        []string   `json:"pending"`
+	SlowCheck      slowStatus `json:"slow_check"`
+	Unacknowledged int        `json:"unacknowledged_actions"`
+}
+
+// handleStatus is 200 when a bundle is served and its llama-server answers its own health check, otherwise 503,
+// with the same body.
+func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	m := s.cur
 	s.mu.Unlock()
-	h := health{Status: "ready", Bedrock: s.br.status()}
+	h := hostStatus{Status: "ready", Bedrock: s.br.status()}
 	if s.upd != nil {
 		h.Wandb = s.upd.status()
 	}
+	sf := s.safety
+	h.Safety.Backlog, h.Safety.Paused = sf.sc.state()
+	h.Safety.Pending = []string{}
+	for _, p := range sf.pend.players() {
+		h.Safety.Pending = append(h.Safety.Pending, p.Name)
+	}
+	sortNames(h.Safety.Pending)
+	h.Safety.SlowCheck = sf.slow.status()
+	h.Safety.Unacknowledged = sf.acts.count()
 	code := http.StatusServiceUnavailable
 	switch {
 	case m == nil:
@@ -406,7 +466,6 @@ func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, code, h)
 }
-
 func (s *server) handleSwitch(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Version string `json:"version"`

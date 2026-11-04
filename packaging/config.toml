@@ -3,7 +3,7 @@
 # HTTP address; must be a loopback address.
 listen = "127.0.0.1:8790"
 
-# Bundle store, state and the downloaded llama.cpp release.
+# Bundle store, state, chat-safety state and records, and the downloaded llama.cpp release.
 data = "/var/lib/ecc-server"
 
 # llama-server's -t.
@@ -25,3 +25,20 @@ check_interval = "10m"
 # here: `sudo ecc-server bedrock login` stores it encrypted for the service.
 bedrock_region = "us-east-1"
 bedrock_model = "us.moonshotai.kimi-k3"
+
+# This game server's name, written in every record line: 1 to 32 of a-z, 0-9, - and _.
+server = "tf"
+
+# How many of a player's messages can wait to be scored; past this, their oldest waiting message is not scored.
+queue_size = 20
+
+# A banned player is kicked at a random time in this range after the verdict, and stays muted until then.
+kick_delay_min = "2m"
+kick_delay_max = "10m"
+
+# After this long of "not sure yet" verdicts, not counting time while Bedrock fails, a player is unmuted with no ban
+# (at least 1m).
+held_cap = "10m"
+
+# How many days the daily records in <data>/record are kept.
+record_retention_days = 180

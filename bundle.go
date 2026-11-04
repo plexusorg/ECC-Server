@@ -29,8 +29,7 @@ type Bundle struct {
 		Answers      []string `json:"answers"`
 		TopLogprobs  int      `json:"top_logprobs"`
 	} `json:"prompt"`
-	// Served to Module-ECC as written; the host does not interpret it.
-	Decision json.RawMessage `json:"decision"`
+	Decision Decision `json:"decision"`
 	// The slow check's system prompt, which the host sends to Bedrock (slowCheck), so the policy text stays out of
 	// Module-ECC's public code.
 	SlowCheck struct {
@@ -45,6 +44,25 @@ type Bundle struct {
 	LlamaServerArgs []string `json:"llama_server_args"`
 
 	dir string
+}
+
+// Decision holds the bundle's decision parameters: a message whose P(ban) is at or above trigger triggers its
+// speaker (the "single" window rule, the only one there is); clearing and corroboration are the slow check's
+// thresholds.
+type Decision struct {
+	WindowRule    string   `json:"window_rule"`
+	Trigger       *float64 `json:"trigger"`
+	Clearing      *float64 `json:"clearing"`
+	Corroboration *float64 `json:"corroboration"`
+}
+
+func (d Decision) valid() bool {
+	for _, p := range []*float64{d.Trigger, d.Clearing, d.Corroboration} {
+		if p == nil || *p < 0 || *p > 1 {
+			return false
+		}
+	}
+	return d.WindowRule == "single"
 }
 
 type Manifest struct {
@@ -79,8 +97,8 @@ func loadBundle(dir string) (*Bundle, error) {
 		return nil, fmt.Errorf("bundle %s: invalid window bounds", b.Version)
 	case b.GGUF == "" || filepath.Base(b.GGUF) != b.GGUF:
 		return nil, fmt.Errorf("bundle %s: gguf must be a file name in the bundle", b.Version)
-	case len(b.Decision) == 0:
-		return nil, fmt.Errorf("bundle %s has no decision parameters", b.Version)
+	case !b.Decision.valid():
+		return nil, fmt.Errorf("bundle %s: decision needs window_rule \"single\" and trigger, clearing and corroboration from 0 to 1", b.Version)
 	case b.SlowCheck.System == "":
 		return nil, fmt.Errorf("bundle %s: slow_check.system is missing or empty", b.Version)
 	}

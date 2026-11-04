@@ -1,5 +1,6 @@
-// ECC-Server hosts Module-ECC's chat-safety classifier: it serves a classifier bundle through a llama-server child
-// process and scores chat messages for Module-ECC over loopback HTTP.
+// ECC-Server makes Module-ECC's chat-safety decisions: it scores chat messages with a classifier bundle served by a
+// llama-server child process, runs the slow check on Amazon Bedrock, keeps the record, and tells Module-ECC whom to
+// mute, unmute and ban, over loopback HTTP.
 package main
 
 import (
@@ -34,7 +35,20 @@ type Config struct {
 	// The Bedrock region and model (a model or inference profile ID) the slow check calls.
 	BedrockRegion string `toml:"bedrock_region"`
 	BedrockModel  string `toml:"bedrock_model"`
+	// This game server's name, written in every record line.
+	Server string `toml:"server"`
+	// How many of a player's messages can wait to be scored; past this, their oldest waiting message is not scored.
+	QueueSize int `toml:"queue_size"`
+	// A banned player is kicked at a random time this long after the verdict.
+	KickDelayMin time.Duration `toml:"kick_delay_min"`
+	KickDelayMax time.Duration `toml:"kick_delay_max"`
+	// How long "not sure yet" verdicts may hold a player muted, not counting time while Bedrock fails.
+	HeldCap time.Duration `toml:"held_cap"`
+	// How many days the daily records are kept.
+	RecordRetentionDays int `toml:"record_retention_days"`
 }
+
+var serverName = regexp.MustCompile(`^[a-z0-9_-]{1,32}$`)
 
 // The region becomes part of the Bedrock endpoint's host name.
 var regionName = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
@@ -42,7 +56,8 @@ var regionName = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
 func loadConfig(path string) (Config, error) {
 	cfg := Config{Listen: "127.0.0.1:8790", Data: "/var/lib/ecc-server", Threads: 6, WandbEntity: "telesphoreo-telesphoreo",
 		WandbProject: "ecc", WandbArtifact: "classifier-bundle", CheckInterval: 10 * time.Minute,
-		BedrockRegion: "us-east-1", BedrockModel: "us.moonshotai.kimi-k3"}
+		BedrockRegion: "us-east-1", BedrockModel: "us.moonshotai.kimi-k3", QueueSize: 20, KickDelayMin: 2 * time.Minute,
+		KickDelayMax: 10 * time.Minute, HeldCap: 10 * time.Minute, RecordRetentionDays: 180}
 	md, err := toml.DecodeFile(path, &cfg)
 	if err != nil {
 		return cfg, fmt.Errorf("config %s: %w", path, err)
@@ -76,6 +91,18 @@ func loadConfig(path string) (Config, error) {
 	if cfg.BedrockModel == "" {
 		return cfg, fmt.Errorf("config %s: bedrock_model is empty", path)
 	}
+	if !serverName.MatchString(cfg.Server) {
+		return cfg, fmt.Errorf("config %s: server %q must be 1 to 32 lowercase letters, digits, - or _", path, cfg.Server)
+	}
+	if cfg.QueueSize < 1 || cfg.RecordRetentionDays < 1 {
+		return cfg, fmt.Errorf("config %s: queue_size and record_retention_days must be at least 1", path)
+	}
+	if cfg.KickDelayMin < time.Second || cfg.KickDelayMax < cfg.KickDelayMin {
+		return cfg, fmt.Errorf("config %s: kick_delay_min must be at least 1s and kick_delay_max at least kick_delay_min", path)
+	}
+	if cfg.HeldCap < time.Minute {
+		return cfg, fmt.Errorf("config %s: held_cap must be at least 1m", path)
+	}
 	return cfg, nil
 }
 
@@ -85,7 +112,7 @@ const usage = `ecc-server <command> [-config FILE] [FOLDER]
   use FOLDER       install a bundle folder (model.gguf, bundle.json, manifest.json) and switch to it
   rollback         switch back to the previous bundle
   update           have the running host check W&B for a new production bundle now
-  status           print the bundle the running host serves, its health, its W&B updates and its Bedrock calls
+  status           print the running host's bundle, health, W&B updates, Bedrock calls, backlog, pending players and actions
   wandb login      store the W&B API key, encrypted for the service (run with sudo)
   wandb logout     remove the stored W&B API key (run with sudo)
   bedrock login    check the Amazon Bedrock API key and store it, encrypted for the service (run with sudo)

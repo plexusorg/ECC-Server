@@ -1,12 +1,13 @@
 # ECC-Server
 
-The model host for Module-ECC's chat-safety classifier. It is one static Go binary. It serves a classifier bundle
-written by the Module-ECC training pipeline (`uv run bundle`): it runs the bundle's GGUF in a `llama-server`
-(llama.cpp) child process, keeps each conversation's prompt window, and returns each message's P(ban) to Module-ECC
-over HTTP on the loopback interface. Module-ECC talks only to this host, never to llama-server. With a W&B API key,
-the host fetches the bundle the pipeline promoted to `production` in Weights & Biases and switches to each new one.
-With an Amazon Bedrock API key, it makes the slow check's call to Kimi on Bedrock, with the system prompt from the
-served bundle, so neither the key nor the policy text is in Module-ECC.
+The chat-safety decision maker for Module-ECC. It is one static Go binary beside the game server. Module-ECC
+forwards every message players send and carries out the actions this host gives it; every decision is made here:
+the flood and duplicate rule, the per-player queues, the fast check (a classifier bundle written by the Module-ECC
+training pipeline's `uv run bundle`, run in a `llama-server` (llama.cpp) child process), the trigger, the pending
+state, the slow check (Kimi on Amazon Bedrock, verified by code), who is muted, unmuted and banned and when a banned
+player is kicked, and the daily record. Thresholds and prompts come only from the bundle. With a W&B API key, the
+host fetches the bundle the pipeline promoted to `production` in Weights & Biases and switches to each new one; the
+Bedrock key and the policy text in the bundle never reach Module-ECC.
 
 Each message is scored as the last line of its conversation's window. The prompt is built byte for byte as the
 pipeline builds it (Module-ECC `src/ecc/chat.py`), with token counts from llama-server's
@@ -33,7 +34,7 @@ sudo apt update
 sudo apt install ecc-server     # enables and starts the service
 sudo ecc-server wandb login     # paste the W&B API key at the hidden prompt
 sudo ecc-server bedrock login   # paste the Amazon Bedrock API key at the hidden prompt
-ecc-server status               # the W&B check, the download of the production bundle, and Bedrock
+ecc-server status               # the W&B check, the bundle download, Bedrock and chat safety
 ```
 
 The host starts without a bundle and reports not ready until it has one. With the key set, it downloads the
@@ -42,10 +43,11 @@ copied onto the host instead: `sudo -u ecc-server ecc-server use /path/to/bundle
 `ecc-server`).
 
 Upgrade with `sudo apt update && sudo apt upgrade`. The service restarts, so conversation windows start anew; the
-installed bundle, the W&B and Bedrock keys and your edited `config.toml` stay. Remove with `sudo apt remove
+installed bundle, the W&B and Bedrock keys, your edited `config.toml`, the pending players, the unacknowledged
+actions and the records stay. Remove with `sudo apt remove
 ecc-server` (stops and disables the service, keeps `/etc/ecc-server`, the keys and the data folder); `sudo apt purge
-ecc-server` also deletes `/var/lib/ecc-server`, including the bundles and the downloaded llama.cpp, the stored W&B and
-Bedrock keys and the `ecc-server` user.
+ecc-server` also deletes `/var/lib/ecc-server`, including the bundles, the downloaded llama.cpp, the chat-safety state
+and the records, the stored W&B and Bedrock keys and the `ecc-server` user.
 
 On first start with a bundle, the host downloads the llama.cpp release the bundle names (its Linux CPU build), checks
 the asset's SHA-256 against the bundle, and unpacks it under `<data>/llama/<release>/`.
@@ -140,6 +142,62 @@ result, sizes and duration, and a refused key is logged once per outage. `ecc-se
 set, the region and model, and the last call's time and result (`ok`, or the reason with Bedrock's status and error
 type).
 
+## Chat safety
+
+**The path of a message.** A message from Module-ECC (`POST /messages`) is one of three kinds:
+
+- `shadowed`: only its author saw it (a muted player, or NUSH quarantine). It is recorded and never scored, and enters
+  no window and no shared transcript. A pending player's shadowed lines are kept as later evidence for their slow
+  check, which runs again on each one: later lines can add evidence, never clear.
+- `bypass` (staff): it enters its conversation's window, with its token cost, and the transcripts, and is recorded
+  unscored. Staff are never judged.
+- every other message goes through the duplicate rule. A player's exact repeat within 60 seconds of their previous
+  copy reuses that copy's verdict; when three or more players send the same normalized text (case, colour codes,
+  lookalike letters, repeated letters and random-looking tokens ignored) within 60 seconds of its first copy, later
+  copies reuse the first copy's verdict. A reused copy still enters its conversation's window, unscored. Every other
+  message waits in its player's queue (`queue_size`, oldest dropped from scoring when full; a dropped line still enters
+  the window) and is scored. Players are served in turn, and each conversation's lines reach its window in the order
+  they were said. While no bundle is served or llama-server fails, scoring pauses and the queues wait; the log warns
+  once when scoring pauses and once when it resumes.
+
+So a conversation's window holds every line other players saw. A message whose P(ban) is at or above the bundle's
+`trigger` threshold triggers its speaker.
+
+**Trigger.** The player is muted (a `mute` action) and becomes pending. The pending state holds the conversation up to
+and including the trigger, the player's recent messages, and their lines said after it; it is written to
+`<data>/safety/pending/<uuid>.json` (written to a temporary file, fsynced, renamed) on every change.
+
+**Slow check.** Each pending player's check asks Kimi, through the Bedrock call below, for evidence on the whole
+transcript and on the transcript cut at each judged player's trigger, and code decides every participant (the port of
+the pipeline's `src/ecc/redteam.py`, matched against its cached red-team answers with no mismatch). Kimi's call is
+retried as the pipeline retries it (three retries, 2, 4 and 8 seconds apart; an API failure, a refusal, the token cap
+and an unparseable answer are retried); a call that still fails is retried with backoff from 30 seconds to 10 minutes
+until Bedrock answers, and the player stays muted. The thresholds are those of the bundle that scored the trigger; the
+system prompt is the served bundle's. After a restart every pending player's check resumes.
+
+| verdict | action |
+| --- | --- |
+| offender or at risk | `ban` with `role` and a `kick_at` a random time in `kick_delay_min` to `kick_delay_max` after the verdict; the player stays muted until then, and an `unmute` follows at `kick_at` |
+| not involved | `unmute`; the pending state ends |
+| not sure yet (held) | stays muted; checked again on each new line; after `held_cap` of such verdicts, not counting time while Bedrock fails, `unmute` with no ban |
+
+A participant who never triggered is banned only with corroboration (an offending quote of their own line, and a
+P(ban) at or above the bundle's `corroboration` threshold on one of their quoted lines), with the same `ban` action.
+A participant who is pending is left to their own check; one banned already and not yet kicked is not banned again.
+
+**Actions** wait in `<data>/safety/actions.json` (written atomically) until Module-ECC acknowledges each with
+`ok: true`; after `ok: false` the action stays and is served again. A restart of either program resends what was not
+acknowledged.
+
+**The record.** `<data>/record/YYYY-MM-DD.jsonl` (UTC days), one JSON line per event, each with `type`, `server` (the
+config's `server`) and `ts`: every `message` (its text, channel, conversation, speaker, target, `shadowed` and
+`bypass` flags, `decision` (`ok`, `trigger`, `shadowed`, `bypass`, `dropped`, `unscored`, `no_score`), `p_ban`,
+`margin`, the bundle `version`, and for a reused verdict `rule` and `reused_from`), every trigger (`decision`), every
+Kimi call (`slow_call`: the trigger's bundle, the prompt's bundle, the view, attempts, errors, token usage and the
+answer), every verdict (`slow_verdict`: outcome, cause and the validated evidence per view), every `action` (with the
+verdict's role and cause) and every `ack`. Lines are flushed one at a time. Just after midnight UTC the day's file is
+compressed to `YYYY-MM-DD.jsonl.zst`; compressed files older than `record_retention_days` are deleted. The journal
+(`journalctl -u ecc-server`) never holds player text, prompts or model answers.
 ## Building the package
 
 `./package.sh [version]` (needs Go; nothing else is installed) builds the static binary and runs nfpm, pinned to a
@@ -160,7 +218,7 @@ A TOML file, `/etc/ecc-server/config.toml` unless `-config` names another. Unkno
 | key | default | meaning |
 | --- | --- | --- |
 | `listen` | `127.0.0.1:8790` | HTTP address; must be a loopback address |
-| `data` | `/var/lib/ecc-server` | bundle store, state and the downloaded llama.cpp release |
+| `data` | `/var/lib/ecc-server` | bundle store, state, chat-safety state (`safety/`), records (`record/`) and the downloaded llama.cpp release |
 | `threads` | `6` | llama-server's `-t` |
 | `llama_server` | (none) | run this llama-server binary instead of downloading the bundle's release; required on Windows |
 | `wandb_entity` | `telesphoreo-telesphoreo` | W&B entity of the project |
@@ -169,6 +227,11 @@ A TOML file, `/etc/ecc-server/config.toml` unless `-config` names another. Unkno
 | `check_interval` | `"10m"` | time between W&B checks, at least `1m` |
 | `bedrock_region` | `us-east-1` | AWS region of the Bedrock endpoint the slow check calls |
 | `bedrock_model` | `us.moonshotai.kimi-k3` | Bedrock model or inference profile ID the slow check calls |
+| `server` | (required) | this game server's name in every record line: 1 to 32 of `a-z`, `0-9`, `-` and `_` |
+| `queue_size` | `20` | messages a player can have waiting to be scored; past this their oldest waiting one is not scored |
+| `kick_delay_min`, `kick_delay_max` | `"2m"`, `"10m"` | a banned player is kicked at a random time in this range after the verdict |
+| `held_cap` | `"10m"` | how long "not sure yet" verdicts hold a player muted, not counting time while Bedrock fails; at least `1m` |
+| `record_retention_days` | `180` | days the compressed daily records are kept |
 
 The API keys are not config keys; see Updates from W&B and Slow check on Amazon Bedrock. On a machine without systemd
 (development), the host reads them from the files `ecc-server.wandb-api-key` and `ecc-server.bedrock-api-key` in the
@@ -190,8 +253,10 @@ Every command except `version` takes `-config FILE` before its arguments (defaul
 - `ecc-server update`: have the running host check W&B now, and wait while it downloads and switches to a new
   production bundle. It also installs a production version a rollback skipped or one that failed before.
 - `ecc-server status`: print the bundle the running host serves and its health; with a W&B key the last check's
-  time and result, the version W&B's `production` names, and any download in progress; and the Bedrock key, model
-  and last call. Exit status 1 when no host is listening or the host is not ready.
+  time and result, the version W&B's `production` names, and any download in progress; the Bedrock key, model
+  and last call; and chat safety: the messages waiting to be scored and why scoring is paused, the pending players
+  (those being checked and those held), whether Bedrock is failing, and the unacknowledged actions. Exit status 1
+  when no host is listening or the host is not ready.
 - `ecc-server wandb login`, `ecc-server wandb logout`: store or delete the W&B API key (as root; see Updates from
   W&B).
 - `ecc-server bedrock login`, `ecc-server bedrock logout`: store or delete the Amazon Bedrock API key (as root; see
@@ -203,47 +268,63 @@ which owns the data folder the running host also writes.
 
 ## HTTP interface
 
-All bodies are JSON.
+All bodies are JSON. Module-ECC uses the first five; there is no authentication, since the address is loopback.
 
-`POST /score` with `{"conversation": "...", "speaker": "...", "text": "..."}` appends the message to its
-conversation's window and scores it as the window's last line:
+`POST /messages` with one message:
+
+```json
+{"id": "<uuid>", "time": "2026-11-04T21:15:03.120Z", "channel": "chat", "conversation": "chat", "speaker_uuid": "<uuid>", "speaker": "Name", "target_uuid": null, "target": null, "text": "...", "shadowed": false, "bypass": false}
+```
+
+`id` is a UUID Module-ECC makes, `time` RFC 3339; `target_uuid` and `target` are set for private messages and mail.
+`202` once the message is queued; an `id` already queued is the same message and changes nothing. `400` names what is
+malformed; `503` while the host is stopping (send it again). A message whose text is only whitespace is ignored.
+
+`GET /actions` long-polls: it answers as soon as there is an unacknowledged action, or after 30 seconds, with every
+unacknowledged action, oldest first:
+
+```json
+[{"id": "<uuid>", "type": "ban", "uuid": "<player uuid>", "name": "Name", "role": "offender", "kick_at": "2026-11-04T21:21:40.512Z"}]
+```
+
+`type` is `mute`, `unmute` or `ban`; `role` (`offender` or `at_risk`) and `kick_at` are on `ban` only. A ban mutes
+the player until `kick_at`, and an `unmute` follows at `kick_at`.
+
+`POST /actions/ack` with `{"id": "...", "ok": true, "detail": "..."}` once an action is carried out: `200 {}`. Only
+`ok: true` ends an action; after `ok: false` it stays and is served again. Every acknowledgement is recorded; a
+repeated or unknown id changes nothing.
+
+`GET /muted` is the mute set, `[{"uuid": "...", "name": "..."}]`: every pending player and every banned player whose
+`kick_at` has not passed.
+
+`GET /status` is `200` when a bundle is loaded and its llama-server answers its own health check, otherwise `503`
+with the reason in `status`; the body is the same either way: `status`, `version` (the bundle), `wandb` (`null`
+without a key, otherwise `artifact`, `last_check`, `result`, `production`, `production_digest`, and `download` with
+`file`, `done` and `total` bytes while one runs), `bedrock` (`key_set`, `region`, `model`, and after the first call
+`last_call` and `result`), and `safety`: `backlog` (messages waiting to be scored), `paused` (why scoring waits,
+absent while it runs), `pending` (names), `slow_check` (`answering`, `failure`, `since`, `checking`, `held`) and
+`unacknowledged_actions`.
+
+`POST /score` with `{"conversation": "...", "speaker": "...", "text": "..."}` scores a line outside chat safety (no
+record, no trigger) for the parity check below, appending it to that conversation's window:
 
 ```json
 {"p_ban": 0.013, "margin": -2.98, "version": "4b-282f3c43561f", "earlier": 17, "tokens": 233, "evaluated": 12}
 ```
 
-- `p_ban` is `sigmoid(a * margin + b)` with the bundle's Platt parameters; `margin` is
-  `log P(" ban") - log P(" ok")` at the answer position.
-- `version` is the bundle that produced the score. When it changes, read `/bundle` again.
-- `earlier` is the number of earlier lines in the prompt, `tokens` the prompt's length, `evaluated` how many of them
-  llama-server decoded (the rest came from its cache).
-- A conversation's messages are scored one at a time, in the order they arrive; send a conversation's next message
-  after the previous answer. Different conversations are scored in parallel up to llama-server's slot count.
-- A conversation idle for 30 minutes drops its window; its next message starts a new one. A bundle switch also
-  starts new windows.
-- `503`: no bundle is served yet; retry later. `502`: llama-server failed; the message was not added to the window,
-  so retry it. `422`: neither answer token is among the top logprobs; the message was added to the window but has
-  no score, so do not retry it. `400`: malformed request.
+`p_ban` is `sigmoid(a * margin + b)` with the bundle's Platt parameters; `margin` is `log P(" ban") - log P(" ok")` at
+the answer position; `earlier` is the number of earlier lines in the prompt, `tokens` the prompt's length,
+`evaluated` how many of them llama-server decoded. `503`: no bundle is served. `502`: llama-server failed and the line
+was not added. `422`: neither answer token is among the top logprobs; the line was added but has no score.
 
-`GET /bundle` returns the served bundle's version and decision parameters, as the bundle states them. The bundle's
-slow-check system prompt is not served: the host sends it to Bedrock itself. A bundle without a non-empty
-`slow_check.system` does not load.
-
-```json
-{"version": "4b-282f3c43561f", "decision": {"window_rule": "single", "trigger": 0.9, "clearing": 0.5, "corroboration": 0.5}}
-```
-
-`GET /health` is `200 {"status": "ready", "version": ...}` when a bundle is loaded and its llama-server answers its
-own health check, otherwise `503` with the reason. Its `wandb` field is `null` without a key, otherwise the W&B
-state `status` prints: `artifact`, `last_check`, `result`, `production`, `production_digest`, and `download`
-(`file`, `done` and `total` bytes) while one runs. Its `bedrock` field is `key_set`, `region`, `model`, and after the
-first slow-check call `last_call` and `result`.
+Every conversation's lines are scored one at a time, in order; different conversations run in parallel up to
+llama-server's slot count. A conversation idle for 30 minutes drops its window; its next line starts a new one. A
+bundle switch also starts new windows.
 
 `POST /switch` with `{"version": "..."}` switches to an installed bundle; `use` and `rollback` call it.
 
 `POST /update` runs a W&B check and answers when it is done: `200 {"result": "..."}`, `502` with the error, or `409`
 without a key; `update` calls it.
-
 ## Parity check
 
 `go run ./parity -ecc <Module-ECC checkout> -bundle <bundle folder> -attacks <attacks.json>` replays the
