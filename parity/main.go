@@ -60,7 +60,8 @@ func main() {
 	model := flag.String("model", "classifier", "eval model folder under data/eval")
 	tfConvs := flag.Int("tf", 200, "Total Freedom conversations to replay")
 	seed := flag.Uint64("seed", 1, "seed of the Total Freedom sample")
-	sets := flag.String("sets", "cases,redteam,heldout", "case sets to replay")
+	sets := flag.String("sets", "cases,redteam,heldout,injection,attacks", "case sets to replay")
+	attacks := flag.String("attacks", "", "the attacks set's conversations as JSON (ecc.attacks.conversations())")
 	workers := flag.Int("workers", 4, "conversations replayed at once")
 	out := flag.String("out", "parity.jsonl", "per-message results")
 	flag.Parse()
@@ -79,8 +80,12 @@ func main() {
 		if set == "" {
 			continue
 		}
-		files := caseFiles(*ecc, set)
-		c := loadCases(set, files)
+		var c []conversation
+		if set == "attacks" {
+			c = loadAttacks(*attacks)
+		} else {
+			c = loadCases(set, caseFiles(*ecc, set))
+		}
 		readEval(filepath.Join(evalDir, set+".jsonl"), func(k string, m float64) { evalMargins[set+"|"+k] = m })
 		convs = append(convs, c...)
 	}
@@ -234,6 +239,34 @@ func loadCases(set string, files []string) []conversation {
 			seen[[2]string{id, parts[2]}]++
 			convs[cur].messages = append(convs[cur].messages, message{speaker: parts[1], text: parts[2], key: string(key)})
 		}
+	}
+	return convs
+}
+
+// loadAttacks reads [[conv, [[label, speaker, text], ...]], ...]; its conversation ids are unique, so each message's
+// key is [conv, text, occurrence] as for case files.
+func loadAttacks(path string) []conversation {
+	if path == "" {
+		check(fmt.Errorf("the attacks set needs -attacks"))
+	}
+	raw, err := os.ReadFile(path)
+	check(err)
+	var rows [][2]json.RawMessage
+	check(json.Unmarshal(raw, &rows))
+	var convs []conversation
+	for _, r := range rows {
+		var id string
+		var lines [][3]string
+		check(json.Unmarshal(r[0], &id))
+		check(json.Unmarshal(r[1], &lines))
+		c := conversation{set: "attacks", id: "attacks/" + id}
+		seen := map[string]int{}
+		for _, l := range lines {
+			key, _ := json.Marshal([]any{id, l[2], seen[l[2]]})
+			seen[l[2]]++
+			c.messages = append(c.messages, message{speaker: l[1], text: l[2], key: string(key)})
+		}
+		convs = append(convs, c)
 	}
 	return convs
 }
