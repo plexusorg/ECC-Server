@@ -293,7 +293,7 @@ func (sf *safety) saidAfter(trigger *message) []*message {
 // muted is every pending player and every banned player not yet kicked.
 func (sf *safety) muted() []player {
 	seen := map[string]bool{}
-	var out []player
+	out := []player{} // the wire format is an array also when nobody is muted; a nil slice encodes as null
 	for _, p := range append(sf.pend.players(), sf.acts.awaitingKick()...) {
 		if !seen[p.UUID] {
 			seen[p.UUID] = true
