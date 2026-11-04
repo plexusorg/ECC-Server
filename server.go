@@ -75,6 +75,13 @@ func parallelSlots(args []string) int {
 	return 1
 }
 
+// complete holds one llama-server slot for the call, released even if it panics.
+func (m *model) complete(prompt string, topLogprobs int) (*completion, error) {
+	m.slots <- struct{}{}
+	defer func() { <-m.slots }()
+	return m.llama.complete(prompt, topLogprobs)
+}
+
 func (m *model) count(text string) (int, error) {
 	t, err := m.llama.tokenize(text)
 	return len(t), err
@@ -284,9 +291,7 @@ func (s *server) score(m *model, c *conversation, idle bool, req scoreRequest) (
 	if err != nil {
 		return nil, err
 	}
-	m.slots <- struct{}{}
-	out, err := m.llama.complete(prompt, b.Prompt.TopLogprobs)
-	<-m.slots
+	out, err := m.complete(prompt, b.Prompt.TopLogprobs)
 	if err != nil {
 		return nil, err
 	}
