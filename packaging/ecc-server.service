@@ -1,6 +1,7 @@
 [Unit]
 Description=ECC-Server, the chat-safety classifier host for Module-ECC
-After=network-online.target
+# docker.service: when `listen` is a Docker bridge address, the bridge exists once Docker has started.
+After=network-online.target docker.service
 Wants=network-online.target
 
 [Service]

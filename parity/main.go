@@ -58,6 +58,7 @@ func main() {
 	ecc := flag.String("ecc", `C:\Users\telesphoreo\PycharmProjects\Module-ECC`, "Module-ECC checkout")
 	bundle := flag.String("bundle", "", "bundle folder (for its Platt parameters)")
 	host := flag.String("host", "http://127.0.0.1:8790", "ECC-Server address")
+	tokenFile := flag.String("token-file", "", "file holding ECC-Server's token (`sudo ecc-server token`, or <data>/token)")
 	model := flag.String("model", "classifier", "eval model folder under data/eval")
 	tfConvs := flag.Int("tf", 200, "Total Freedom conversations to replay")
 	seed := flag.Uint64("seed", 1, "seed of the Total Freedom sample")
@@ -67,6 +68,12 @@ func main() {
 	out := flag.String("out", "parity.jsonl", "per-message results")
 	flag.Parse()
 
+	tokenRaw, err := os.ReadFile(*tokenFile)
+	check(err)
+	token := strings.TrimSpace(string(tokenRaw))
+	if token == "" {
+		check(errors.New("-token-file is empty or not set"))
+	}
 	var b struct {
 		Platt struct{ A, B float64 } `json:"platt"`
 	}
@@ -109,7 +116,7 @@ func main() {
 	for range *workers {
 		wg.Go(func() {
 			for i := range jobs {
-				results[i] = replay(client, *host, convs[i], evalMargins)
+				results[i] = replay(client, *host, token, convs[i], evalMargins)
 				done.Lock()
 				n += len(convs[i].messages)
 				if (n*20)/total != ((n-len(convs[i].messages))*20)/total {
@@ -362,12 +369,16 @@ func loadTF(path string, n int, seed uint64, margins map[string]float64) []conve
 
 // ---------------------------------------------------------------- replay
 
-func replay(client *http.Client, host string, c conversation, evalMargins map[string]float64) []result {
+func replay(client *http.Client, host, token string, c conversation, evalMargins map[string]float64) []result {
 	var rs []result
 	for _, m := range c.messages {
 		body, _ := json.Marshal(map[string]string{"conversation": c.id, "speaker": m.speaker, "text": m.text})
 		t0 := time.Now()
-		resp, err := client.Post(host+"/score", "application/json", bytes.NewReader(body))
+		req, err := http.NewRequest(http.MethodPost, host+"/score", bytes.NewReader(body))
+		check(err)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := client.Do(req)
 		r := result{Set: c.set, Conv: c.id, Speaker: m.speaker, Text: m.text}
 		if err == nil {
 			var buf bytes.Buffer

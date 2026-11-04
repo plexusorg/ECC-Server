@@ -134,6 +134,10 @@ func run(cfg Config) error {
 	}
 	ctx, stopped := context.WithCancel(context.Background())
 	defer stopped()
+	token, err := loadOrCreateToken(cfg)
+	if err != nil {
+		return fmt.Errorf("the token: %w", err)
+	}
 	s := &server{cfg: cfg, ctx: ctx, convs: map[string]*conversation{}}
 	brKey, err := credential(bedrockCredential)
 	if err != nil {
@@ -187,7 +191,7 @@ func run(cfg Config) error {
 	mux.HandleFunc("POST /score", s.handleScore)
 	mux.HandleFunc("POST /switch", s.handleSwitch)
 	mux.HandleFunc("POST /update", s.handleUpdate)
-	srv := &http.Server{Addr: cfg.Listen, Handler: mux}
+	srv := &http.Server{Addr: cfg.Listen, Handler: requireToken(token, mux)}
 	go s.dropIdle()
 	if s.upd != nil {
 		slog.Info("checking W&B for the production bundle", "artifact", s.upd.name(), "every", cfg.CheckInterval.String())

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -58,10 +57,15 @@ func rollback(cfg Config) error {
 // switchTo has a running host switch to an installed bundle, which it activates once the bundle's llama-server is
 // healthy; with no host running it activates the bundle for the next start.
 func switchTo(cfg Config, version string) error {
-	body, _ := json.Marshal(map[string]string{"version": version})
-	resp, err := http.Post("http://"+cfg.Listen+"/switch", "application/json", bytes.NewReader(body))
+	token, err := readToken(cfg)
+	var resp *http.Response
+	if err == nil {
+		body, _ := json.Marshal(map[string]string{"version": version})
+		resp, err = hostRequest(cfg, token, http.MethodPost, "/switch", body, http.DefaultClient)
+	}
 	var dial *net.OpError
-	if errors.As(err, &dial) && dial.Op == "dial" {
+	// no token file: the host has never started
+	if errors.Is(err, os.ErrNotExist) || (errors.As(err, &dial) && dial.Op == "dial") {
 		fmt.Println("no host is running; the bundle is served from its next start")
 		return activate(cfg, version, true)
 	}
@@ -69,6 +73,9 @@ func switchTo(cfg Config, version string) error {
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		return errRejected
+	}
 	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("the host did not switch to %s: %s", version, strings.TrimSpace(string(raw)))
@@ -117,19 +124,25 @@ func bedrockLogin(cfg Config) error {
 
 // status prints the bundle a running host serves, its health, its W&B updates, its Bedrock calls and chat safety.
 func status(cfg Config) error {
-	client := http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get("http://" + cfg.Listen + "/status")
+	token, err := readToken(cfg)
+	if err != nil {
+		return err
+	}
+	resp, err := hostRequest(cfg, token, http.MethodGet, "/status", nil, &http.Client{Timeout: 5 * time.Second})
 	var dial *net.OpError
 	if errors.As(err, &dial) && dial.Op == "dial" {
-		return fmt.Errorf("no host is listening on %s", cfg.Listen)
+		return fmt.Errorf("no host is listening on %s", hostAddr(cfg))
 	}
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		return errRejected
+	}
 	var h hostStatus
 	if err := json.NewDecoder(resp.Body).Decode(&h); err != nil {
-		return fmt.Errorf("unexpected answer from %s: %w", cfg.Listen, err)
+		return fmt.Errorf("unexpected answer from %s: %w", hostAddr(cfg), err)
 	}
 	if h.Version != "" {
 		fmt.Printf("bundle: %s\n", h.Version)
@@ -193,22 +206,29 @@ func names(list []string) string {
 
 // update has the running host check W&B now and install production if it is not served, waiting for the result.
 func update(cfg Config) error {
+	token, err := readToken(cfg)
+	if err != nil {
+		return err
+	}
 	fmt.Println("checking W&B; a new production bundle is downloaded and started before this returns")
-	resp, err := http.Post("http://"+cfg.Listen+"/update", "application/json", nil)
+	resp, err := hostRequest(cfg, token, http.MethodPost, "/update", nil, http.DefaultClient)
 	var dial *net.OpError
 	if errors.As(err, &dial) && dial.Op == "dial" {
-		return fmt.Errorf("no host is listening on %s", cfg.Listen)
+		return fmt.Errorf("no host is listening on %s", hostAddr(cfg))
 	}
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		return errRejected
+	}
 	var out struct {
 		Result string `json:"result"`
 		Error  string `json:"error"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return fmt.Errorf("unexpected answer from %s: %w", cfg.Listen, err)
+		return fmt.Errorf("unexpected answer from %s: %w", hostAddr(cfg), err)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return errors.New(out.Error)

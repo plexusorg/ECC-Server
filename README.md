@@ -34,7 +34,8 @@ sudo apt update
 sudo apt install ecc-server     # enables and starts the service
 sudo ecc-server wandb login     # paste the W&B API key at the hidden prompt
 sudo ecc-server bedrock login   # paste the Amazon Bedrock API key at the hidden prompt
-ecc-server status               # the W&B check, the bundle download, Bedrock and chat safety
+sudo ecc-server status          # the W&B check, the bundle download, Bedrock and chat safety
+sudo ecc-server token           # the token to paste into Module-ECC's config (see Connecting Module-ECC)
 ```
 
 The host starts without a bundle and reports not ready until it has one. With the key set, it downloads the
@@ -43,12 +44,12 @@ copied onto the host instead: `sudo -u ecc-server ecc-server use /path/to/bundle
 `ecc-server`).
 
 Upgrade with `sudo apt update && sudo apt upgrade`. The service restarts, so conversation windows start anew; the
-installed bundle, the W&B and Bedrock keys, your edited `config.toml`, the pending players, the unacknowledged
+installed bundle, the token, the W&B and Bedrock keys, your edited `config.toml`, the pending players, the unacknowledged
 actions and the records stay. A `config.toml` you edited before chat safety moved to this host lacks the required
 `server` key, and the host does not start until you add it (see Configuration). Remove with `sudo apt remove
 ecc-server` (stops and disables the service, keeps `/etc/ecc-server`, the keys and the data folder); `sudo apt purge
 ecc-server` also deletes `/var/lib/ecc-server`, including the bundles, the downloaded llama.cpp, the chat-safety state
-and the records, the stored W&B and Bedrock keys and the `ecc-server` user.
+the records, the token, the stored W&B and Bedrock keys and the `ecc-server` user.
 
 On first start with a bundle, the host downloads the llama.cpp release the bundle names (its Linux CPU build), checks
 the asset's SHA-256 against the bundle, and unpacks it under `<data>/llama/<release>/`.
@@ -57,7 +58,7 @@ the asset's SHA-256 against the bundle, and unpacks it under `<data>/llama/<rele
 
 The pipeline uploads each bundle to W&B as a version of the `classifier-bundle` artifact (files `model.gguf`,
 `bundle.json`, `manifest.json`). Promoting a bundle is moving the artifact's `production` alias to it in W&B; the
-host picks it up within `check_interval` (10 minutes by default), or at once on `ecc-server update`.
+host picks it up within `check_interval` (10 minutes by default), or at once on `sudo ecc-server update`.
 
 **The key.** `sudo ecc-server wandb login` reads the API key from a hidden prompt (or from standard input when
 piped), checks it with W&B, encrypts it with `systemd-creds encrypt` into
@@ -89,7 +90,7 @@ bundle came from, the host:
 
 A bundle that fails any of these checks, or whose llama-server fails its health check, is discarded and logged with
 the reason; the current bundle keeps serving, and the host does not fetch that production version again until
-production moves, an operator runs `ecc-server update`, or the service restarts. A bundle version is installed once:
+production moves, an operator runs `sudo ecc-server update`, or the service restarts. A bundle version is installed once:
 a changed bundle needs a new version.
 
 **Offline.** When W&B is unreachable or answers with an error, the host keeps serving the bundle on disk and tries
@@ -98,7 +99,7 @@ Before any bundle is installed, the host reports not ready.
 
 **Rollback.** `ecc-server rollback` needs no W&B: the store keeps the previous bundle. When the bundle rolled back
 from came from W&B, the host does not install that production version again until W&B's `production` moves to
-another version, or until `ecc-server update`, which installs whatever production is. Moving `production` back to the
+another version, or until `sudo ecc-server update`, which installs whatever production is. Moving `production` back to the
 earlier version in W&B also switches the host back, at its next check. With a key set, a bundle installed with `use`
 serves until the next check, which switches to production.
 
@@ -139,7 +140,7 @@ reason and the text. Otherwise the call fails with one of these reasons:
 
 The system prompt, the user text and the answer hold policy text and player chat, so the host never logs them, nor
 the key: a successful call's log line has its stop reason, sizes, token counts and duration, a failed call's has its
-result, sizes and duration, and a refused key is logged once per outage. `ecc-server status` shows whether a key is
+result, sizes and duration, and a refused key is logged once per outage. `sudo ecc-server status` shows whether a key is
 set, the region and model, and the last call's time and result (`ok`, or the reason with Bedrock's status and error
 type).
 
@@ -220,7 +221,7 @@ A TOML file, `/etc/ecc-server/config.toml` unless `-config` names another. Unkno
 
 | key | default | meaning |
 | --- | --- | --- |
-| `listen` | `127.0.0.1:8790` | HTTP address; must be a loopback address |
+| `listen` | `127.0.0.1:8790` | HTTP address, `host:port`; see Connecting Module-ECC |
 | `data` | `/var/lib/ecc-server` | bundle store, state, chat-safety state (`safety/`), records (`record/`) and the downloaded llama.cpp release |
 | `threads` | `6` | llama-server's `-t` |
 | `llama_server` | (none) | run this llama-server binary instead of downloading the bundle's release; required on Windows |
@@ -240,6 +241,26 @@ The API keys are not config keys; see Updates from W&B and Slow check on Amazon 
 (development), the host reads them from the files `ecc-server.wandb-api-key` and `ecc-server.bedrock-api-key` in the
 directory `$CREDENTIALS_DIRECTORY` names.
 
+## Connecting Module-ECC
+
+Every HTTP request needs the host's token, sent as `Authorization: Bearer <token>`; without it, or with a wrong one,
+the answer is `401` with no body. The host creates the token on its first start: 32 random bytes, hex, written
+atomically to `<data>/token` (mode 0600, owned by the service user), and never logs it. `sudo ecc-server token` prints
+it. To replace it, delete the file and restart the service, then paste the new one into Module-ECC's config.
+
+In Module-ECC's `config.yml`, under `chat_safety`:
+
+- `model_host`: ECC-Server's address as the game server reaches it, `http://host:port`.
+- `token`: the output of `sudo ecc-server token`. Chat safety stays off while it is empty.
+
+On the same machine, the default `listen` (`127.0.0.1:8790`) and `http://127.0.0.1:8790` work. When the Minecraft
+server runs in a Docker container, the container reaches the host on the Docker network: set `listen` in
+`/etc/ecc-server/config.toml` to the host's address on that network, for example the bridge gateway
+`172.17.0.1:8790`, set `model_host` to `http://172.17.0.1:8790`, and restart the service (`sudo systemctl restart
+ecc-server`). The unit is ordered after `docker.service` so the bridge exists when the host binds. A wildcard address
+(`0.0.0.0` or `[::]`) listens on every interface; prefer the one address, and do not expose the port beyond the
+networks that need it. The token is sent in plain HTTP, so keep it on a network you trust.
+
 ## Commands
 
 Every command except `version` takes `-config FILE` before its arguments (default `/etc/ecc-server/config.toml`).
@@ -253,13 +274,14 @@ Every command except `version` takes `-config FILE` before its arguments (defaul
   serving and the new one is discarded. Without a running host, the bundle is served from the next start.
 - `ecc-server rollback`: switch back to the previous bundle, the same way. The store keeps the current and the
   previous bundle and deletes older ones.
-- `ecc-server update`: have the running host check W&B now, and wait while it downloads and switches to a new
+- `sudo ecc-server update`: have the running host check W&B now, and wait while it downloads and switches to a new
   production bundle. It also installs a production version a rollback skipped or one that failed before.
-- `ecc-server status`: print the bundle the running host serves and its health; with a W&B key the last check's
+- `sudo ecc-server status`: print the bundle the running host serves and its health; with a W&B key the last check's
   time and result, the version W&B's `production` names, and any download in progress; the Bedrock key, model
   and last call; and chat safety: the messages waiting to be scored and why scoring is paused, the pending players
   (those being checked and those held), whether Bedrock is failing, and the unacknowledged actions. Exit status 1
   when no host is listening or the host is not ready.
+- `sudo ecc-server token`: print the token (see Connecting Module-ECC).
 - `ecc-server wandb login`, `ecc-server wandb logout`: store or delete the W&B API key (as root; see Updates from
   W&B).
 - `ecc-server bedrock login`, `ecc-server bedrock logout`: store or delete the Amazon Bedrock API key (as root; see
@@ -269,9 +291,13 @@ Every command except `version` takes `-config FILE` before its arguments (defaul
 `use` and `rollback` refuse to run as root: run them as the service user (`sudo -u ecc-server ecc-server use ...`),
 which owns the data folder the running host also writes.
 
+`status`, `update` and the switch done by `use` and `rollback` read `<data>/token` and send it to the running host, so
+they run as root or the service user, and fail with a clear error when the token file cannot be read. They connect to
+`listen`; when `listen` is a wildcard address they connect to loopback on its port.
+
 ## HTTP interface
 
-All bodies are JSON. Module-ECC uses the first five; there is no authentication, since the address is loopback.
+All bodies are JSON. Module-ECC uses the first five; every endpoint needs the token (see Connecting Module-ECC).
 
 `POST /messages` with one message:
 
@@ -331,8 +357,10 @@ windows.
 without a key; `update` calls it.
 ## Parity check
 
-`go run ./parity -ecc <Module-ECC checkout> -bundle <bundle folder> -attacks <attacks.json>` replays the
-evaluation case sets, the attacks set and a sample of Total Freedom conversations through a running host, in
+`go run ./parity -ecc <Module-ECC checkout> -bundle <bundle folder> -attacks <attacks.json> -token-file <file>`
+replays the
+evaluation case sets, the attacks set and a sample of Total Freedom conversations through a running host (`-host` is its address, `http://127.0.0.1:8790` by default; `-token-file` names a file
+holding its token, for example a copy of the output of `sudo ecc-server token`), in
 conversation order, and compares each message's margin with the margin `uv run eval` recorded
 (`data/eval/classifier/*.jsonl`). The attacks set is built in the pipeline's code; `attacks.json` is
 `json.dumps(ecc.attacks.conversations())`.

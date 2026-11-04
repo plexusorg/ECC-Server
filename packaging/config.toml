@@ -1,6 +1,8 @@
 # ECC-Server configuration. Unknown keys are rejected.
 
-# HTTP address; must be a loopback address.
+# HTTP address, host:port. Every request needs the token from `sudo ecc-server token`. The default serves Module-ECC
+# on the same machine. To serve a game server in a Docker container, set the host's address on that Docker network,
+# for example the bridge gateway, "172.17.0.1:8790". Do not expose it beyond the networks that need it.
 listen = "127.0.0.1:8790"
 
 # Bundle store, state, chat-safety state and records, and the downloaded llama.cpp release.

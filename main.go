@@ -1,6 +1,6 @@
 // ECC-Server makes Module-ECC's chat-safety decisions: it scores chat messages with a classifier bundle served by a
 // llama-server child process, runs the slow check on Amazon Bedrock, keeps the record, and tells Module-ECC whom to
-// mute, unmute and ban, over loopback HTTP.
+// mute, unmute and ban, over HTTP with a shared token.
 package main
 
 import (
@@ -65,13 +65,8 @@ func loadConfig(path string) (Config, error) {
 	if keys := md.Undecoded(); len(keys) > 0 {
 		return cfg, fmt.Errorf("config %s: unknown keys %v", path, keys)
 	}
-	// The interface has no authentication: Module-ECC reaches it on the same machine only.
-	host, _, err := net.SplitHostPort(cfg.Listen)
-	if err != nil {
+	if _, _, err := net.SplitHostPort(cfg.Listen); err != nil {
 		return cfg, fmt.Errorf("config %s: listen: %w", path, err)
-	}
-	if ip := net.ParseIP(host); host != "localhost" && (ip == nil || !ip.IsLoopback()) {
-		return cfg, fmt.Errorf("config %s: listen must be a loopback address, not %q", path, cfg.Listen)
 	}
 	if cfg.Threads < 1 {
 		return cfg, fmt.Errorf("config %s: threads must be at least 1", path)
@@ -108,11 +103,12 @@ func loadConfig(path string) (Config, error) {
 
 const usage = `ecc-server <command> [-config FILE] [FOLDER]
 
-  run              serve the current bundle on the configured loopback address
+  run              serve the current bundle on the configured address
   use FOLDER       install a bundle folder (model.gguf, bundle.json, manifest.json) and switch to it
   rollback         switch back to the previous bundle
-  update           have the running host check W&B for a new production bundle now
-  status           print the running host's bundle, health, W&B updates, Bedrock calls, backlog, pending players and actions
+  update           have the running host check W&B for a new production bundle now (run with sudo)
+  status           (run with sudo) print the running host's bundle, health, W&B updates, Bedrock calls, backlog, pending players and actions
+  token            print the token Module-ECC needs (run with sudo)
   wandb login      store the W&B API key, encrypted for the service (run with sudo)
   wandb logout     remove the stored W&B API key (run with sudo)
   bedrock login    check the Amazon Bedrock API key and store it, encrypted for the service (run with sudo)
@@ -154,6 +150,8 @@ func main() {
 		err = status(cfg)
 	case cmd == "update" && fs.NArg() == 0:
 		err = update(cfg)
+	case cmd == "token" && fs.NArg() == 0:
+		err = printToken(cfg)
 	case cmd == "wandb" && fs.NArg() == 1 && fs.Arg(0) == "login":
 		err = wandbLogin()
 	case cmd == "wandb" && fs.NArg() == 1 && fs.Arg(0) == "logout":

@@ -11,7 +11,7 @@ description: |
   Chat-safety decisions for Module-ECC.
   Scores chat with a classifier bundle served by a llama-server child process,
   runs the slow check on Amazon Bedrock, keeps the daily record, and tells
-  Module-ECC over loopback HTTP whom to mute, unmute and ban. Fetches the
+  Module-ECC over token-protected HTTP whom to mute, unmute and ban. Fetches the
   bundle promoted to production from Weights & Biases.
 depends:
   - libgomp1
