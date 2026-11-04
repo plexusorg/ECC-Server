@@ -82,10 +82,11 @@ conversation's window and scores it as the window's last line:
   so retry it. `422`: neither answer token is among the top logprobs; the message was added to the window but has
   no score, so do not retry it. `400`: malformed request.
 
-`GET /bundle` returns the served bundle's version and decision parameters, as the bundle states them:
+`GET /bundle` returns the served bundle's version, decision parameters and slow-check prompt, as the bundle states them.
+A bundle without a non-empty `slow_check.system` does not load.
 
 ```json
-{"version": "4b-282f3c43561f", "decision": {"window_rule": "single", "trigger": 0.9, "clearing": 0.5, "corroboration": 0.5}}
+{"version": "4b-282f3c43561f", "decision": {"window_rule": "single", "trigger": 0.9, "clearing": 0.5, "corroboration": 0.5}, "slow_check": {"system": "..."}}
 ```
 
 `GET /health` is `200 {"status": "ready", "version": ...}` when a bundle is loaded and its llama-server answers its

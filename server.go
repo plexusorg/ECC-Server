@@ -334,7 +334,7 @@ func (s *server) handleBundle(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, errors.New("no bundle is being served"))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"version": m.bundle.Version, "decision": m.bundle.Decision})
+	writeJSON(w, http.StatusOK, map[string]any{"version": m.bundle.Version, "decision": m.bundle.Decision, "slow_check": m.bundle.SlowCheck})
 }
 
 func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {

@@ -29,6 +29,10 @@ type Bundle struct {
 	} `json:"prompt"`
 	// Served to Module-ECC as written; the host does not interpret it.
 	Decision json.RawMessage `json:"decision"`
+	// The slow-check prompt, served to Module-ECC so the policy text stays out of its public code.
+	SlowCheck struct {
+		System string `json:"system"`
+	} `json:"slow_check"`
 	LlamaCpp struct {
 		Release string `json:"release"`
 		Asset   string `json:"asset"`
@@ -74,6 +78,8 @@ func loadBundle(dir string) (*Bundle, error) {
 		return nil, fmt.Errorf("bundle %s: gguf must be a file name in the bundle", b.Version)
 	case len(b.Decision) == 0:
 		return nil, fmt.Errorf("bundle %s has no decision parameters", b.Version)
+	case b.SlowCheck.System == "":
+		return nil, fmt.Errorf("bundle %s: slow_check.system is missing or empty", b.Version)
 	}
 	b.dir = dir
 	return &b, nil
