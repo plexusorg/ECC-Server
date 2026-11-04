@@ -36,8 +36,7 @@ jobs:
             echo "PACKAGE_VERSION=${base}~dev.${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
           fi
       - name: Package
-        shell: pwsh
-        run: ./package.ps1 -Version $env:PACKAGE_VERSION
+        run: ./package.sh "$PACKAGE_VERSION"
       - uses: actions/upload-artifact@v4
         with:
           name: ecc-server-deb

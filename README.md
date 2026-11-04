@@ -44,11 +44,17 @@ the asset's SHA-256 against the bundle, and unpacks it under `<data>/llama/<rele
 
 ## Building the package
 
-`package.ps1` (needs Go; nothing else is installed) builds the static binary and runs nfpm, pinned to a version, into
-`dist/ecc-server_<version>_amd64.deb`, then prints the `telesphorepo publish` command for it. The version comes from
-the `VERSION` file alone, which `ecc-server version` prints too. Write a Debian version: `0.1.0` is a release,
-`0.1.0~dev.3` a pre-release that sorts before it. `telesphorepo.toml` sends versions containing `~` to
+`./package.sh [version]` (needs Go; nothing else is installed) builds the static binary and runs nfpm, pinned to a
+version, into `dist/ecc-server_<version>_amd64.deb`, then prints the `telesphorepo publish` command for it. The version
+is the argument, or else the `VERSION` file; `ecc-server version` prints it. Write a Debian version: `0.1.0` is a
+release, `0.1.0~dev.3` a pre-release that sorts before it. `telesphorepo.toml` sends versions containing `~` to
 `ecc-server-dev` and the rest to `ecc-server`.
+
+GitHub Actions (`.github/workflows/publish.yml`) builds the package on every push and pull request. Each push to
+master publishes `<VERSION>~dev.<run number>` to `ecc-server-dev`. To publish a release, run the workflow on master
+from the Actions tab with "release" checked: it publishes `VERSION` as it is to `ecc-server`. Bump `VERSION` after a
+release. Telesphorepo's CI pipeline trusts this workflow file on master, so no secret is stored.
+
 ## Configuration
 
 A TOML file, `/etc/ecc-server/config.toml` unless `-config` names another. Unknown keys are rejected.
