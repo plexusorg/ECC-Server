@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"math"
@@ -273,6 +274,10 @@ func loadAttacks(path string) []conversation {
 
 func readEval(path string, add func(string, float64)) {
 	f, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		fmt.Printf("%s does not exist; its messages are replayed without eval margins\n", path)
+		return
+	}
 	check(err)
 	defer f.Close()
 	sc := bufio.NewScanner(f)
