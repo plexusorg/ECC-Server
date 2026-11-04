@@ -9,7 +9,8 @@ priority: optional
 maintainer: Telesphoreo <me@telesphoreo.me>
 description: |
   Model host for Module-ECC's chat-safety classifier.
-  Serves a classifier bundle through a llama-server child process over loopback HTTP.
+  Serves a classifier bundle through a llama-server child process over loopback HTTP,
+  and fetches the bundle promoted to production from Weights & Biases.
 depends:
   - libgomp1
   - ca-certificates

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os/exec"
 	"syscall"
@@ -51,4 +52,9 @@ func ownChildren() error {
 func stopChild(cmd *exec.Cmd, exited <-chan struct{}) {
 	_ = cmd.Process.Kill()
 	<-exited
+}
+
+// readSecret is Linux only: `wandb login` stores the key with systemd-creds.
+func readSecret(string) (string, error) {
+	return "", errors.New("reading a secret is not supported on Windows")
 }

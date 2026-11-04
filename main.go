@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"time"
 
 	"github.com/BurntSushi/toml"
 )
@@ -24,10 +25,16 @@ type Config struct {
 	// A local llama-server binary to run instead of the bundle's llama.cpp release (development, or a host
 	// without a release build).
 	LlamaServer string `toml:"llama_server"`
+	// The W&B artifact whose `production` alias names the bundle to serve, and how often to check it.
+	WandbEntity   string        `toml:"wandb_entity"`
+	WandbProject  string        `toml:"wandb_project"`
+	WandbArtifact string        `toml:"wandb_artifact"`
+	CheckInterval time.Duration `toml:"check_interval"`
 }
 
 func loadConfig(path string) (Config, error) {
-	cfg := Config{Listen: "127.0.0.1:8790", Data: "/var/lib/ecc-server", Threads: 6}
+	cfg := Config{Listen: "127.0.0.1:8790", Data: "/var/lib/ecc-server", Threads: 6, WandbEntity: "telesphoreo-telesphoreo",
+		WandbProject: "ecc", WandbArtifact: "classifier-bundle", CheckInterval: 10 * time.Minute}
 	md, err := toml.DecodeFile(path, &cfg)
 	if err != nil {
 		return cfg, fmt.Errorf("config %s: %w", path, err)
@@ -49,6 +56,12 @@ func loadConfig(path string) (Config, error) {
 	if cfg.Data == "" {
 		return cfg, fmt.Errorf("config %s: data is empty", path)
 	}
+	if cfg.WandbEntity == "" || cfg.WandbProject == "" || cfg.WandbArtifact == "" {
+		return cfg, fmt.Errorf("config %s: wandb_entity, wandb_project and wandb_artifact must not be empty", path)
+	}
+	if cfg.CheckInterval < time.Minute {
+		return cfg, fmt.Errorf("config %s: check_interval must be at least 1m", path)
+	}
 	return cfg, nil
 }
 
@@ -57,7 +70,10 @@ const usage = `ecc-server <command> [-config FILE] [FOLDER]
   run              serve the current bundle on the configured loopback address
   use FOLDER       install a bundle folder (model.gguf, bundle.json, manifest.json) and switch to it
   rollback         switch back to the previous bundle
-  status           print the bundle the running host serves and its health
+  update           have the running host check W&B for a new production bundle now
+  status           print the bundle the running host serves, its health and its W&B updates
+  wandb login      store the W&B API key, encrypted for the service (run with sudo)
+  wandb logout     remove the stored W&B API key (run with sudo)
   version          print the ecc-server version
 
 The config file defaults to ` + defaultConfig + `.
@@ -93,6 +109,12 @@ func main() {
 		err = rollback(cfg)
 	case cmd == "status" && fs.NArg() == 0:
 		err = status(cfg)
+	case cmd == "update" && fs.NArg() == 0:
+		err = update(cfg)
+	case cmd == "wandb" && fs.NArg() == 1 && fs.Arg(0) == "login":
+		err = wandbLogin()
+	case cmd == "wandb" && fs.NArg() == 1 && fs.Arg(0) == "logout":
+		err = wandbLogout()
 	default:
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)

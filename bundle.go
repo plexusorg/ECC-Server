@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // Bundle is bundle.json, written by the pipeline's `uv run bundle`.
@@ -88,11 +89,17 @@ func loadBundle(dir string) (*Bundle, error) {
 // ---------------------------------------------------------------- the bundle store
 //
 // <data>/bundles/<version>/ holds each installed bundle; <data>/state.json names the current and the previous one.
-// Only those two are kept.
+// Only those two are kept. An install is assembled in <data>/bundles/<version>.tmp/ and renamed into place once
+// every file matches the manifest.
 
 type State struct {
 	Current  string `json:"current"`
 	Previous string `json:"previous"`
+	// The W&B artifact digest each installed bundle came from.
+	Digests map[string]string `json:"digests,omitempty"`
+	// A W&B production digest the updater does not install: the bundle an operator switched away from by going back
+	// to the previous one. It is cleared when W&B's production digest changes, or by `ecc-server update`.
+	Skip string `json:"skip,omitempty"`
 }
 
 func bundleDir(cfg Config, version string) string {
@@ -108,21 +115,34 @@ func readState(cfg Config) (State, error) {
 	return st, err
 }
 
-// activate makes version current, the current one previous, and deletes every other installed bundle.
-func activate(cfg Config, version string) error {
-	st, err := readState(cfg)
-	if err != nil {
-		return err
-	}
-	if st.Current != version {
-		st = State{Current: version, Previous: st.Current}
-	}
+func writeState(cfg Config, st State) error {
 	data, _ := json.MarshalIndent(st, "", " ")
 	path := filepath.Join(cfg.Data, "state.json")
 	if err := os.WriteFile(path+".tmp", append(data, '\n'), 0o644); err != nil {
 		return err
 	}
-	if err := os.Rename(path+".tmp", path); err != nil {
+	return os.Rename(path+".tmp", path)
+}
+
+// activate makes version current, the current one previous, and deletes every other installed bundle. When an
+// operator switches back to the previous bundle, the W&B digest of the bundle left becomes the skipped one.
+func activate(cfg Config, version string, byOperator bool) error {
+	st, err := readState(cfg)
+	if err != nil {
+		return err
+	}
+	if st.Current != version {
+		if byOperator && version == st.Previous && st.Digests[st.Current] != "" {
+			st.Skip = st.Digests[st.Current]
+		}
+		st.Current, st.Previous = version, st.Current
+	}
+	for v := range st.Digests {
+		if v != st.Current && v != st.Previous {
+			delete(st.Digests, v)
+		}
+	}
+	if err := writeState(cfg, st); err != nil {
 		return err
 	}
 	entries, err := os.ReadDir(filepath.Join(cfg.Data, "bundles"))
@@ -130,13 +150,25 @@ func activate(cfg Config, version string) error {
 		return err
 	}
 	for _, e := range entries {
-		if e.Name() != st.Current && e.Name() != st.Previous {
+		// An install in progress (another process's `use`) keeps its .tmp folder; installBundle replaces a stale one.
+		if e.Name() != st.Current && e.Name() != st.Previous && !strings.HasSuffix(e.Name(), ".tmp") {
 			if err := os.RemoveAll(filepath.Join(cfg.Data, "bundles", e.Name())); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+// removeStaleInstalls deletes the .tmp folders of installs a stopped process left unfinished.
+func removeStaleInstalls(cfg Config) error {
+	stale, err := filepath.Glob(filepath.Join(cfg.Data, "bundles", "*.tmp"))
+	for _, dir := range stale {
+		if err := os.RemoveAll(dir); err != nil {
+			return err
+		}
+	}
+	return err
 }
 
 // installBundle copies (or hardlinks) a bundle folder into the store and checks every file against its manifest.

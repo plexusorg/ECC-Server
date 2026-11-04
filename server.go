@@ -99,10 +99,12 @@ type conversation struct {
 
 type server struct {
 	cfg      Config
+	ctx      context.Context // cancelled when the host stops
 	mu       sync.Mutex
 	cur      *model
 	convs    map[string]*conversation
 	switchMu sync.Mutex
+	upd      *updater // nil without a W&B key
 }
 
 type scoreRequest struct {
@@ -127,9 +129,21 @@ func run(cfg Config) error {
 	if err := ownChildren(); err != nil {
 		return err
 	}
-	s := &server{cfg: cfg, convs: map[string]*conversation{}}
+	ctx, stopped := context.WithCancel(context.Background())
+	defer stopped()
+	s := &server{cfg: cfg, ctx: ctx, convs: map[string]*conversation{}}
+	key, err := wandbKey()
+	if err != nil {
+		return fmt.Errorf("reading the W&B key credential: %w", err)
+	}
+	if key != "" {
+		s.upd = newUpdater(s, key)
+	}
 	st, err := readState(cfg)
 	if err != nil {
+		return err
+	}
+	if err := removeStaleInstalls(cfg); err != nil {
 		return err
 	}
 	if st.Current != "" {
@@ -140,6 +154,8 @@ func run(cfg Config) error {
 		if s.cur, err = startModel(cfg, b); err != nil {
 			return err
 		}
+	} else if s.upd != nil {
+		slog.Warn("no bundle installed; not ready until one is fetched from W&B")
 	} else {
 		slog.Warn("no bundle installed; not ready until `ecc-server use` installs one")
 	}
@@ -149,8 +165,15 @@ func run(cfg Config) error {
 	mux.HandleFunc("GET /bundle", s.handleBundle)
 	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("POST /switch", s.handleSwitch)
+	mux.HandleFunc("POST /update", s.handleUpdate)
 	srv := &http.Server{Addr: cfg.Listen, Handler: mux}
 	go s.dropIdle()
+	if s.upd != nil {
+		slog.Info("checking W&B for the production bundle", "artifact", s.upd.name(), "every", cfg.CheckInterval.String())
+		go s.upd.loop(ctx)
+	} else {
+		slog.Info("no W&B key is set; serving the bundle on disk (set one with sudo ecc-server wandb login)")
+	}
 
 	died := make(chan struct{})
 	go s.watchLlama(died)
@@ -166,9 +189,10 @@ func run(cfg Config) error {
 	case sig := <-stop:
 		slog.Info("stopping", "signal", sig.String())
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	stopped()
+	shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_ = srv.Shutdown(ctx)
+	_ = srv.Shutdown(shutdown)
 	s.mu.Lock()
 	m := s.cur
 	s.mu.Unlock()
@@ -342,23 +366,32 @@ func (s *server) handleBundle(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"version": m.bundle.Version, "decision": m.bundle.Decision, "slow_check": m.bundle.SlowCheck})
 }
 
+type health struct {
+	Status  string       `json:"status"`
+	Version string       `json:"version,omitempty"`
+	Wandb   *wandbStatus `json:"wandb"` // null when no W&B key is set
+}
+
 func (s *server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	m := s.cur
 	s.mu.Unlock()
+	h := health{Status: "ready"}
+	if s.upd != nil {
+		h.Wandb = s.upd.status()
+	}
+	code := http.StatusServiceUnavailable
 	switch {
 	case m == nil:
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "no bundle"})
+		h.Status = "no bundle"
 	case !m.llama.healthy():
-		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "llama-server unhealthy", "version": m.bundle.Version})
+		h.Status, h.Version = "llama-server unhealthy", m.bundle.Version
 	default:
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ready", "version": m.bundle.Version})
+		h.Version, code = m.bundle.Version, http.StatusOK
 	}
+	writeJSON(w, code, h)
 }
 
-// handleSwitch serves an installed bundle without a gap in scoring: it starts and health-checks the new
-// llama-server, switches scoring and the served decision parameters over together, then stops the old one once its
-// in-flight messages finish. A bundle that fails to start is not activated and the current one keeps serving.
 func (s *server) handleSwitch(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Version string `json:"version"`
@@ -369,28 +402,36 @@ func (s *server) handleSwitch(w http.ResponseWriter, r *http.Request) {
 	}
 	s.switchMu.Lock()
 	defer s.switchMu.Unlock()
+	if err := s.serve(req.Version, true); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"version": req.Version})
+}
+
+// serve switches to an installed bundle without a gap in scoring: it starts and health-checks the new llama-server,
+// switches scoring and the served decision parameters over together, then stops the old one once its in-flight
+// messages finish. A bundle that fails to start is not activated and the current one keeps serving. The caller holds
+// switchMu.
+func (s *server) serve(version string, byOperator bool) error {
 	s.mu.Lock()
 	old := s.cur
 	s.mu.Unlock()
-	if old != nil && old.bundle.Version == req.Version {
-		writeJSON(w, http.StatusOK, map[string]string{"version": req.Version})
-		return
+	if old != nil && old.bundle.Version == version {
+		return nil
 	}
-	b, err := loadBundle(bundleDir(s.cfg, req.Version))
+	b, err := loadBundle(bundleDir(s.cfg, version))
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
+		return err
 	}
 	m, err := startModel(s.cfg, b)
 	if err != nil {
-		slog.Error("bundle failed to start; keeping the current one", "version", req.Version, "err", err)
-		writeError(w, http.StatusInternalServerError, err)
-		return
+		slog.Error("bundle failed to start; keeping the current one", "version", version, "err", err)
+		return err
 	}
-	if err := activate(s.cfg, req.Version); err != nil {
+	if err := activate(s.cfg, version, byOperator); err != nil {
 		m.llama.stop()
-		writeError(w, http.StatusInternalServerError, err)
-		return
+		return err
 	}
 	s.mu.Lock()
 	s.cur = m
@@ -400,5 +441,19 @@ func (s *server) handleSwitch(w http.ResponseWriter, r *http.Request) {
 		old.llama.stop()
 		slog.Info("stopped the previous bundle's llama-server", "version", old.bundle.Version)
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"version": req.Version})
+	return nil
+}
+
+func (s *server) handleUpdate(w http.ResponseWriter, r *http.Request) {
+	if s.upd == nil {
+		writeError(w, http.StatusConflict, errors.New("no W&B key is set; set one with sudo ecc-server wandb login"))
+		return
+	}
+	// The host's context, not the request's: an operator who stops waiting does not abort a download.
+	res, err := s.upd.check(s.ctx, true)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"result": res})
 }

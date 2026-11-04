@@ -3,7 +3,8 @@
 The model host for Module-ECC's chat-safety classifier. It is one static Go binary. It serves a classifier bundle
 written by the Module-ECC training pipeline (`uv run bundle`): it runs the bundle's GGUF in a `llama-server`
 (llama.cpp) child process, keeps each conversation's prompt window, and returns each message's P(ban) to Module-ECC
-over HTTP on the loopback interface. Module-ECC talks only to this host, never to llama-server.
+over HTTP on the loopback interface. Module-ECC talks only to this host, never to llama-server. With a W&B API key,
+the host fetches the bundle the pipeline promoted to `production` in Weights & Biases and switches to each new one.
 
 Each message is scored as the last line of its conversation's window. The prompt is built byte for byte as the
 pipeline builds it (Module-ECC `src/ecc/chat.py`), with token counts from llama-server's
@@ -27,20 +28,65 @@ pre-releases (versions containing `~`) are in `ecc-server-dev`. Then:
 
 ```sh
 sudo apt update
-sudo apt install ecc-server                        # enables and starts the service
-sudo -u ecc-server ecc-server use /path/to/bundle  # the folder must be readable by ecc-server
-ecc-server status
+sudo apt install ecc-server     # enables and starts the service
+sudo ecc-server wandb login     # paste the W&B API key at the hidden prompt
+ecc-server status               # the W&B check, and the download of the production bundle
 ```
 
-The host starts without a bundle and reports not ready until `use` installs one.
+The host starts without a bundle and reports not ready until it has one. With the key set, it downloads the
+production bundle on its first check (the GGUF is about 3 GB) and serves it. Without W&B, install a bundle folder
+copied onto the host instead: `sudo -u ecc-server ecc-server use /path/to/bundle` (the folder must be readable by
+`ecc-server`).
 
 Upgrade with `sudo apt update && sudo apt upgrade`. The service restarts, so conversation windows start anew; the
-installed bundle and your edited `config.toml` stay. Remove with `sudo apt remove ecc-server` (stops and disables
-the service, keeps `/etc/ecc-server` and the data folder); `sudo apt purge ecc-server` also deletes
-`/var/lib/ecc-server`, including the bundles and the downloaded llama.cpp, and the `ecc-server` user.
+installed bundle, the W&B key and your edited `config.toml` stay. Remove with `sudo apt remove ecc-server` (stops and
+disables the service, keeps `/etc/ecc-server`, the key and the data folder); `sudo apt purge ecc-server` also deletes
+`/var/lib/ecc-server`, including the bundles and the downloaded llama.cpp, the stored W&B key and the `ecc-server`
+user.
 
 On first start with a bundle, the host downloads the llama.cpp release the bundle names (its Linux CPU build), checks
 the asset's SHA-256 against the bundle, and unpacks it under `<data>/llama/<release>/`.
+
+## Updates from W&B
+
+The pipeline uploads each bundle to W&B as a version of the `classifier-bundle` artifact (files `model.gguf`,
+`bundle.json`, `manifest.json`). Promoting a bundle is moving the artifact's `production` alias to it in W&B; the
+host picks it up within `check_interval` (10 minutes by default), or at once on `ecc-server update`.
+
+**The key.** `sudo ecc-server wandb login` reads the API key from a hidden prompt (or from standard input when
+piped), checks it with W&B, encrypts it with `systemd-creds encrypt` into
+`/etc/credstore.encrypted/ecc-server.wandb-api-key`, and restarts the service if it is running. The key is
+encrypted with the host's credential key, and also bound to the TPM2 chip when the machine has one, so it can be
+decrypted only on this machine, by root. The service unit's `LoadCredentialEncrypted=ecc-server.wandb-api-key` has
+systemd decrypt it into the service's private credential directory at each start; without a stored key the service
+starts and serves the bundle on disk. `sudo ecc-server wandb logout` deletes the key and restarts the service. The
+key is never written in plaintext, logged, or set in `config.toml`.
+
+**Each check** asks W&B which artifact version carries `production`. When its digest is not the one the served
+bundle came from, the host:
+
+1. downloads `manifest.json` and `bundle.json`, then the files the manifest lists, into
+   `<data>/staging/<digest>/`, checking each file's size and MD5 against W&B. A file is written as `<name>.part`
+   and renamed when it is complete and matches; an interrupted download resumes from its `.part` on the next check
+   or after a restart. A bundle version already in the store is not downloaded again.
+2. installs the folder into the store, checking every file against the manifest's SHA-256s, as `use` does;
+3. switches to it without a gap in scoring, as `use` does, and records which W&B digest it came from, so a restart
+   does not download it again.
+
+A bundle that fails any of these checks, or whose llama-server fails its health check, is discarded and logged with
+the reason; the current bundle keeps serving, and the host does not fetch that production version again until
+production moves or an operator runs `ecc-server update`. A bundle version is installed once: a changed bundle needs
+a new version.
+
+**Offline.** When W&B is unreachable or answers with an error, the host keeps serving the bundle on disk and tries
+again at the next check. It logs the first failed check of an outage and the first check that succeeds after it.
+Before any bundle is installed, the host reports not ready.
+
+**Rollback.** `ecc-server rollback` needs no W&B: the store keeps the previous bundle. When the bundle rolled back
+from came from W&B, the host does not install that production version again until W&B's `production` moves to
+another version, or until `ecc-server update`, which installs whatever production is. Moving `production` back to the
+earlier version in W&B also switches the host back, at its next check. With a key set, a bundle installed with `use`
+serves until the next check, which switches to production.
 
 ## Building the package
 
@@ -65,6 +111,13 @@ A TOML file, `/etc/ecc-server/config.toml` unless `-config` names another. Unkno
 | `data` | `/var/lib/ecc-server` | bundle store, state and the downloaded llama.cpp release |
 | `threads` | `6` | llama-server's `-t` |
 | `llama_server` | (none) | run this llama-server binary instead of downloading the bundle's release; required on Windows |
+| `wandb_entity` | `telesphoreo-telesphoreo` | W&B entity of the project |
+| `wandb_project` | `ecc` | W&B project holding the bundle artifact |
+| `wandb_artifact` | `classifier-bundle` | the artifact whose `production` alias names the bundle to serve |
+| `check_interval` | `"10m"` | time between W&B checks, at least `1m` |
+
+The W&B API key is not a config key; see Updates from W&B. On a machine without systemd (development), the host reads
+it from the file `ecc-server.wandb-api-key` in the directory `$CREDENTIALS_DIRECTORY` names.
 
 ## Commands
 
@@ -79,8 +132,13 @@ Every command except `version` takes `-config FILE` before its arguments (defaul
   serving and the new one is discarded. Without a running host, the bundle is served from the next start.
 - `ecc-server rollback`: switch back to the previous bundle, the same way. The store keeps the current and the
   previous bundle and deletes older ones.
-- `ecc-server status`: print the bundle the running host serves and its health, from `/health`; exit status 1 when
-  no host is listening or the host is not ready.
+- `ecc-server update`: have the running host check W&B now, and wait while it downloads and switches to a new
+  production bundle. It also installs a production version a rollback skipped or one that failed before.
+- `ecc-server status`: print the bundle the running host serves and its health, and with a W&B key the last check's
+  time and result, the version W&B's `production` names, and any download in progress; exit status 1 when no host
+  is listening or the host is not ready.
+- `ecc-server wandb login`, `ecc-server wandb logout`: store or delete the W&B API key (as root; see Updates from
+  W&B).
 - `ecc-server version`: print the package version.
 
 `use` and `rollback` refuse to run as root: run them as the service user (`sudo -u ecc-server ecc-server use ...`),
@@ -118,9 +176,14 @@ A bundle without a non-empty `slow_check.system` does not load.
 ```
 
 `GET /health` is `200 {"status": "ready", "version": ...}` when a bundle is loaded and its llama-server answers its
-own health check, otherwise `503` with the reason.
+own health check, otherwise `503` with the reason. Its `wandb` field is `null` without a key, otherwise the W&B
+state `status` prints: `artifact`, `last_check`, `result`, `production`, `production_digest`, and `download`
+(`file`, `done` and `total` bytes) while one runs.
 
 `POST /switch` with `{"version": "..."}` switches to an installed bundle; `use` and `rollback` call it.
+
+`POST /update` runs a W&B check and answers when it is done: `200 {"result": "..."}`, `502` with the error, or `409`
+without a key; `update` calls it.
 
 ## Parity check
 

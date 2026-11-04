@@ -11,3 +11,12 @@ threads = 6
 
 # Run this llama-server binary instead of downloading the bundle's llama.cpp release.
 # llama_server = "/opt/llama/llama-server"
+
+# The W&B artifact whose `production` alias names the bundle to serve. The API key is not set here:
+# `sudo ecc-server wandb login` stores it encrypted for the service.
+wandb_entity = "telesphoreo-telesphoreo"
+wandb_project = "ecc"
+wandb_artifact = "classifier-bundle"
+
+# How often the host checks W&B's production alias (at least 1m).
+check_interval = "10m"
