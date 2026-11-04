@@ -44,7 +44,8 @@ copied onto the host instead: `sudo -u ecc-server ecc-server use /path/to/bundle
 
 Upgrade with `sudo apt update && sudo apt upgrade`. The service restarts, so conversation windows start anew; the
 installed bundle, the W&B and Bedrock keys, your edited `config.toml`, the pending players, the unacknowledged
-actions and the records stay. Remove with `sudo apt remove
+actions and the records stay. A `config.toml` you edited before chat safety moved to this host lacks the required
+`server` key, and the host does not start until you add it (see Configuration). Remove with `sudo apt remove
 ecc-server` (stops and disables the service, keeps `/etc/ecc-server`, the keys and the data folder); `sudo apt purge
 ecc-server` also deletes `/var/lib/ecc-server`, including the bundles, the downloaded llama.cpp, the chat-safety state
 and the records, the stored W&B and Bedrock keys and the `ecc-server` user.
@@ -183,7 +184,9 @@ system prompt is the served bundle's. After a restart every pending player's che
 
 A participant who never triggered is banned only with corroboration (an offending quote of their own line, and a
 P(ban) at or above the bundle's `corroboration` threshold on one of their quoted lines), with the same `ban` action.
-A participant who is pending is left to their own check; one banned already and not yet kicked is not banned again.
+A participant who is pending is left to their own check. A player is not banned again for lines said before their
+last ban (another check of the same conversation reaches the same verdict on the same lines), and a player awaiting
+their kick stays muted until it: their lines do not trigger, and no verdict unmutes them before `kick_at`.
 
 **Actions** wait in `<data>/safety/actions.json` (written atomically) until Module-ECC acknowledges each with
 `ok: true`; after `ok: false` the action stays and is served again. A restart of either program resends what was not
@@ -317,9 +320,10 @@ the answer position; `earlier` is the number of earlier lines in the prompt, `to
 `evaluated` how many of them llama-server decoded. `503`: no bundle is served. `502`: llama-server failed and the line
 was not added. `422`: neither answer token is among the top logprobs; the line was added but has no score.
 
-Every conversation's lines are scored one at a time, in order; different conversations run in parallel up to
-llama-server's slot count. A conversation idle for 30 minutes drops its window; its next line starts a new one. A
-bundle switch also starts new windows.
+Every conversation's lines reach its window one at a time, in order. Chat safety scores one line at a time across
+all conversations; `/score` calls for different conversations run in parallel up to llama-server's slot count. A
+conversation idle for 30 minutes drops its window; its next line starts a new one. A bundle switch also starts new
+windows.
 
 `POST /switch` with `{"version": "..."}` switches to an installed bundle; `use` and `rollback` call it.
 

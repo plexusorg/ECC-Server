@@ -185,7 +185,9 @@ func (p *pendingStore) save(uuid string) {
 	if st := p.entries[uuid]; st != nil {
 		data, _ := json.Marshal(st)
 		err = writeAtomic(path, data)
-	} else if err = os.Remove(path); errors.Is(err, os.ErrNotExist) {
+	} else if err = os.Remove(path); err == nil {
+		syncDir(p.dir)
+	} else if errors.Is(err, os.ErrNotExist) {
 		err = nil
 	}
 	if err != nil {

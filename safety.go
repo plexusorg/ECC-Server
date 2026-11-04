@@ -126,6 +126,12 @@ func (sf *safety) accept(m *message) error {
 	default:
 		sf.admit(m)
 	}
+	// A pending player's line, shadowed or said before their mute took effect, in the order said: it can add
+	// evidence, never clear.
+	if m.shadowed || m.pendingAtCapture {
+		sf.pend.addLater(m.speakerUUID, m.record())
+		sf.slow.check(m.speakerUUID, m.speaker)
+	}
 	return nil
 }
 
@@ -219,7 +225,7 @@ type decisionLine struct {
 	TriggerThreshold float64 `json:"trigger_threshold"`
 }
 
-// finish records the message with its verdict, triggers on it, and keeps a pending player's line as later evidence.
+// finish records the message with its verdict and triggers on it.
 func (sf *safety) finish(m *message, v verdict) {
 	waiters, ok := m.complete(v)
 	if !ok {
@@ -233,11 +239,6 @@ func (sf *safety) finish(m *message, v verdict) {
 		}
 		sf.trigger(m, v, context)
 	}
-	// A pending player's line, shadowed or said before their mute took effect: it can add evidence, never clear.
-	if m.shadowed || m.pendingAtCapture {
-		sf.pend.addLater(m.speakerUUID, m.record())
-		sf.slow.check(m.speakerUUID, m.speaker)
-	}
 	for _, w := range waiters {
 		w(v)
 	}
@@ -249,7 +250,8 @@ func (sf *safety) trigger(m *message, v verdict, context []*message) {
 	sf.mu.Lock()
 	closed := sf.closed
 	sf.mu.Unlock()
-	if closed || v.score == nil || sf.pend.contains(m.speakerUUID) {
+	// A player awaiting a ban's kick is muted and banned already.
+	if closed || v.score == nil || sf.pend.contains(m.speakerUUID) || sf.acts.awaitingKickOf(m.speakerUUID) {
 		return
 	}
 	now := time.Now()

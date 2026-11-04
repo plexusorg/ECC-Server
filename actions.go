@@ -38,9 +38,9 @@ type kick struct {
 	KickAt time.Time `json:"kick_at"`
 }
 
-// actionStore holds every action Module-ECC has not acknowledged, and the banned players awaiting their kick, in
-// <data>/safety/actions.json, rewritten atomically on every change, so a restart of either program resends what was
-// not done.
+// actionStore holds every action Module-ECC has not acknowledged, the banned players awaiting their kick, and when
+// each player was last banned, in <data>/safety/actions.json, rewritten atomically on every change, so a restart of
+// either program resends what was not done.
 type actionStore struct {
 	path             string
 	rec              *recordLog
@@ -50,25 +50,32 @@ type actionStore struct {
 	mu      sync.Mutex
 	actions []action
 	kicks   []kick
-	wake    chan struct{} // closed and replaced when an action is added
+	banned  map[string]time.Time // when each player was last banned, by UUID
+	wake    chan struct{}        // closed and replaced when an action is added
 	unsaved bool
 }
 
 func openActions(cfg Config, rec *recordLog, pending func(uuid string) bool) (*actionStore, error) {
 	a := &actionStore{path: filepath.Join(cfg.Data, "safety", "actions.json"), rec: rec, kickMin: cfg.KickDelayMin,
 		kickMax: cfg.KickDelayMax, pending: pending, wake: make(chan struct{})}
-	var saved struct {
-		Actions []action `json:"actions"`
-		Kicks   []kick   `json:"kicks"`
-	}
+	var saved savedActions
 	if err := readJSON(a.path, &saved); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("actions: %w", err)
 	}
-	a.actions, a.kicks = saved.Actions, saved.Kicks
+	a.actions, a.kicks, a.banned = saved.Actions, saved.Kicks, saved.Banned
+	if a.banned == nil {
+		a.banned = map[string]time.Time{}
+	}
 	for _, k := range a.kicks {
 		time.AfterFunc(time.Until(k.KickAt), a.kicked)
 	}
 	return a, nil
+}
+
+type savedActions struct {
+	Actions []action             `json:"actions"`
+	Kicks   []kick               `json:"kicks"`
+	Banned  map[string]time.Time `json:"banned"`
 }
 
 // kicked unmutes every banned player whose kick time has come.
@@ -117,6 +124,13 @@ func (a *actionStore) awaitingKick() []player {
 	return out
 }
 
+// awaitingKickOf reports a banned player whose kick time has not passed: they stay muted until then.
+func (a *actionStore) awaitingKickOf(uuid string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return slices.ContainsFunc(a.kicks, func(k kick) bool { return k.UUID == uuid && time.Now().Before(k.KickAt) })
+}
+
 // actionLine is an action's record line. Cause and Detail say why: the verdict's cause, or for an unmute after the
 // held cap how long the player was held.
 type actionLine struct {
@@ -140,20 +154,21 @@ func (a *actionStore) unmute(uuid, name, role, cause, detail string) {
 }
 
 // ban bans an offender or a player at risk: Module-ECC writes the ban entry and kicks them at a random time in the
-// kick delay range; they stay muted until then. A player banned already and not yet kicked is not banned again.
-func (a *actionStore) ban(uuid, name, role, cause string) {
+// kick delay range; they stay muted until then. said is the time of the player's last line in the evidence: a player
+// banned since then is not banned again for it (another check of the same conversation, or a re-check, reaches the
+// same verdict on the same lines).
+func (a *actionStore) ban(uuid, name, role, cause string, said time.Time) {
 	now := time.Now()
 	a.mu.Lock()
-	for _, k := range a.kicks {
-		if k.UUID == uuid && now.Before(k.KickAt) {
-			a.mu.Unlock()
-			a.rec.append("action", actionLine{TS: stamp(now), Action: "already_banned", Player: name, PlayerUUID: uuid,
-				Role: role, Cause: cause})
-			return
-		}
+	if last, ok := a.banned[uuid]; ok && !last.Before(said) {
+		a.mu.Unlock()
+		a.rec.append("action", actionLine{TS: stamp(now), Action: "already_banned", Player: name, PlayerUUID: uuid,
+			Role: role, Cause: cause, Detail: "banned " + stamp(last)})
+		return
 	}
 	at := now.Add(a.kickMin + rand.N(a.kickMax-a.kickMin+time.Millisecond)).Truncate(time.Millisecond)
 	a.kicks = append(a.kicks, kick{uuid, name, at})
+	a.banned[uuid] = now
 	a.mu.Unlock()
 	time.AfterFunc(time.Until(at), a.kicked)
 	a.emit(action{Type: actionBan, UUID: uuid, Name: name, Role: role, KickAt: stamp(at)}, role, cause, "")
@@ -209,10 +224,7 @@ func (a *actionStore) flush() {
 // save writes the actions and kicks. A failed write keeps them in memory, where GET /actions still serves them,
 // and is retried every 15 seconds. The caller holds mu.
 func (a *actionStore) save() {
-	data, _ := json.Marshal(struct {
-		Actions []action `json:"actions"`
-		Kicks   []kick   `json:"kicks"`
-	}{a.actions, a.kicks})
+	data, _ := json.Marshal(savedActions{a.actions, a.kicks, a.banned})
 	if err := writeAtomic(a.path, data); err != nil {
 		if !a.unsaved {
 			slog.Error("could not save the actions; retrying every 15 seconds", "err", err)

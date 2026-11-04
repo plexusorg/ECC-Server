@@ -105,6 +105,7 @@ func newSlowChecker(s *server, pend *pendingStore, acts *actionStore, rec *recor
 				sl.tick()
 				pend.flush()
 				acts.flush()
+				acts.kicked()
 			}
 		}
 	}()
@@ -171,6 +172,12 @@ func (sl *slowChecker) run(c *slowCase) {
 	switch result {
 	case slowDone:
 		delete(sl.cases, c.uuid)
+		// The player triggered again after this check ended their pending state: a new check for the new state.
+		if c.rerun && sl.pend.contains(c.uuid) {
+			n := &slowCase{uuid: c.uuid, name: c.name, answers: map[string]*kimiCall{}, retry: slowFirstRetry, running: true}
+			sl.cases[c.uuid] = n
+			sl.submit(n, 0)
+		}
 	case slowWait:
 		c.runTime = 0
 		sl.submit(c, slowPromptWait)
@@ -236,7 +243,9 @@ func (sl *slowChecker) tick() {
 func (sl *slowChecker) lift(c *slowCase) {
 	delete(sl.cases, c.uuid)
 	sl.pend.remove(c.uuid)
-	sl.acts.unmute(c.uuid, c.name, roleHeld, "cap", fmt.Sprintf("%d seconds not sure", int(c.heldTime.Seconds())))
+	if !sl.acts.awaitingKickOf(c.uuid) {
+		sl.acts.unmute(c.uuid, c.name, roleHeld, "cap", fmt.Sprintf("%d seconds not sure", int(c.heldTime.Seconds())))
+	}
 }
 
 // transcript is a pending state's transcript: the conversation up to and including the trigger, then the player's
@@ -246,6 +255,7 @@ type transcript struct {
 	uuids     map[string]string
 	bypass    map[string]bool
 	triggerOf map[string]int
+	lastSaid  map[string]time.Time // each speaker's last line
 	trigger   int
 	channel   string
 }
@@ -262,7 +272,7 @@ func transcriptOf(st *pendingState) transcript {
 		msgs = append(msgs, st.Trigger)
 	}
 	t := transcript{trigger: len(msgs) - 1, uuids: map[string]string{}, bypass: map[string]bool{},
-		triggerOf: map[string]int{}, channel: channelName(st.Trigger.Channel)}
+		triggerOf: map[string]int{}, lastSaid: map[string]time.Time{}, channel: channelName(st.Trigger.Channel)}
 	msgs = append(msgs, st.Later...)
 	for i, m := range msgs {
 		t.lines = append(t.lines, evLine{speaker: m.Speaker, text: m.Text, pBan: m.PBan})
@@ -271,6 +281,9 @@ func transcriptOf(st *pendingState) transcript {
 		}
 		if m.Decision == decisionBypass {
 			t.bypass[m.Speaker] = true
+		}
+		if at, err := time.Parse(time.RFC3339Nano, m.TS); err == nil && at.After(t.lastSaid[m.Speaker]) {
+			t.lastSaid[m.Speaker] = at
 		}
 		if _, ok := t.triggerOf[m.Speaker]; !ok && m.Decision == decisionTrigger {
 			t.triggerOf[m.Speaker] = i
@@ -405,12 +418,12 @@ func (sl *slowChecker) apply(run *slowRun, decided []decidedSpeaker, outcomes ma
 		if uuid == run.c.uuid {
 			self = d.speaker
 		} else if bans(o) && !sl.pend.contains(uuid) {
-			sl.acts.ban(uuid, d.speaker, o.role, o.cause)
+			sl.acts.ban(uuid, d.speaker, o.role, o.cause, run.t.lastSaid[d.speaker])
 		}
 	}
 	o := outcomes[self]
 	if bans(o) {
-		sl.acts.ban(run.c.uuid, self, o.role, o.cause)
+		sl.acts.ban(run.c.uuid, self, o.role, o.cause, run.t.lastSaid[self])
 	}
 	if o.role == roleHeld {
 		sl.mu.Lock()
@@ -420,7 +433,8 @@ func (sl *slowChecker) apply(run *slowRun, decided []decidedSpeaker, outcomes ma
 		return slowHeld
 	}
 	sl.pend.remove(run.c.uuid)
-	if o.role == roleNotInvolved {
+	// A player awaiting a ban's kick stays muted until it; the kick time unmutes them.
+	if o.role == roleNotInvolved && !sl.acts.awaitingKickOf(run.c.uuid) {
 		sl.acts.unmute(run.c.uuid, self, o.role, o.cause, "")
 	}
 	return slowDone
