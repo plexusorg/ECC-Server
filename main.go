@@ -49,7 +49,7 @@ func loadConfig(path string) (Config, error) {
 	return cfg, nil
 }
 
-const usage = `ecc-server <command> [-config FILE]
+const usage = `ecc-server <command> [-config FILE] [FOLDER]
 
   run              serve the current bundle on the configured loopback address
   use FOLDER       install a bundle folder (model.gguf, bundle.json, manifest.json) and switch to it

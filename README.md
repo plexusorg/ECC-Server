@@ -95,6 +95,8 @@ own health check, otherwise `503` with the reason.
 
 ## Parity check
 
-`go run ./parity -ecc <Module-ECC checkout> -bundle <bundle folder>` replays the evaluation case sets and a sample
-of Total Freedom conversations through a running host, in conversation order, and compares each message's margin
-with the margin `uv run eval` recorded (`data/eval/classifier/*.jsonl`).
+`go run ./parity -ecc <Module-ECC checkout> -bundle <bundle folder> -attacks <attacks.json>` replays the
+evaluation case sets, the attacks set and a sample of Total Freedom conversations through a running host, in
+conversation order, and compares each message's margin with the margin `uv run eval` recorded
+(`data/eval/classifier/*.jsonl`). The attacks set is built in the pipeline's code; `attacks.json` is
+`json.dumps(ecc.attacks.conversations())`.
