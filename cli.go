@@ -63,9 +63,8 @@ func switchTo(cfg Config, version string) error {
 		body, _ := json.Marshal(map[string]string{"version": version})
 		resp, err = hostRequest(cfg, token, http.MethodPost, "/switch", body, http.DefaultClient)
 	}
-	var dial *net.OpError
 	// no token file: the host has never started
-	if errors.Is(err, os.ErrNotExist) || (errors.As(err, &dial) && dial.Op == "dial") {
+	if errors.Is(err, os.ErrNotExist) || noHost(err) {
 		fmt.Println("no host is running; the bundle is served from its next start")
 		return activate(cfg, version, true)
 	}
@@ -81,6 +80,12 @@ func switchTo(cfg Config, version string) error {
 		return fmt.Errorf("the host did not switch to %s: %s", version, strings.TrimSpace(string(raw)))
 	}
 	return nil
+}
+
+// noHost reports a request that failed because nothing listens on the host's address.
+func noHost(err error) bool {
+	var dial *net.OpError
+	return errors.As(err, &dial) && dial.Op == "dial"
 }
 
 // wandbLogin checks a W&B API key with W&B and stores it encrypted for the service.
@@ -129,8 +134,7 @@ func status(cfg Config) error {
 		return err
 	}
 	resp, err := hostRequest(cfg, token, http.MethodGet, "/status", nil, &http.Client{Timeout: 5 * time.Second})
-	var dial *net.OpError
-	if errors.As(err, &dial) && dial.Op == "dial" {
+	if noHost(err) {
 		return fmt.Errorf("no host is listening on %s", hostAddr(cfg))
 	}
 	if err != nil {
@@ -212,8 +216,7 @@ func update(cfg Config) error {
 	}
 	fmt.Println("checking W&B; a new production bundle is downloaded and started before this returns")
 	resp, err := hostRequest(cfg, token, http.MethodPost, "/update", nil, http.DefaultClient)
-	var dial *net.OpError
-	if errors.As(err, &dial) && dial.Op == "dial" {
+	if noHost(err) {
 		return fmt.Errorf("no host is listening on %s", hostAddr(cfg))
 	}
 	if err != nil {

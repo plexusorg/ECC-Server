@@ -194,11 +194,9 @@ const (
 	reasonUnreachable = "bedrock_unreachable" // a network error or the 300 s timeout
 )
 
-// converseError is a slow-check call without an answer. Status is Bedrock's HTTP status for bedrock_auth and
-// bedrock_error, otherwise 0.
+// converseError is a slow-check call without an answer; it wraps the *bedrockError when Bedrock answered.
 type converseError struct {
 	Reason string
-	Status int
 	err    error
 }
 
@@ -229,10 +227,10 @@ func (s *server) slowCheck(ctx context.Context, user string) (*converseAnswer, e
 	var be *bedrockError
 	switch {
 	case errors.As(err, &be) && be.auth():
-		ce = &converseError{Reason: reasonAuth, Status: be.Status,
+		ce = &converseError{Reason: reasonAuth,
 			err: fmt.Errorf("%w; set a valid key with access to %s with sudo ecc-server bedrock login", err, s.br.model)}
 	case errors.As(err, &be):
-		ce = &converseError{Reason: reasonError, Status: be.Status, err: err}
+		ce = &converseError{Reason: reasonError, err: err}
 	}
 	if ctx.Err() == nil { // a caller that gave up is not a Bedrock outage
 		s.br.record(ce, len(user), nil, time.Since(start))

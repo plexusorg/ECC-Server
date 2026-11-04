@@ -133,7 +133,6 @@ type completion struct {
 		} `json:"top_logprobs"`
 	} `json:"completion_probabilities"`
 	Timings struct {
-		CacheN  int `json:"cache_n"`
 		PromptN int `json:"prompt_n"`
 	} `json:"timings"`
 }
