@@ -12,6 +12,9 @@ line.
 
 ## Install (systemd)
 
+The llama.cpp Linux build links OpenMP's runtime, and the release download needs CA certificates. On Debian or
+Ubuntu, install both with `apt install libgomp1 ca-certificates`.
+
 ```sh
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o ecc-server .
 sudo install -m 755 ecc-server /usr/local/bin/ecc-server
