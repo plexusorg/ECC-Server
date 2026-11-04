@@ -1,7 +1,8 @@
-# Builds dist/ecc-server_<version>_amd64.deb. Needs Go.
+# Builds dist/ecc-server_<version>_amd64.deb. Needs Go. -Version overrides VERSION (CI passes <VERSION>~dev.<run>).
+param([string]$Version)
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
-$version = (Get-Content VERSION -Raw).Trim()
+$version = if ($Version) { $Version } else { (Get-Content VERSION -Raw).Trim() }
 New-Item -ItemType Directory -Force dist | Out-Null
 $env:CGO_ENABLED = '0'; $env:GOOS = 'linux'; $env:GOARCH = 'amd64'
 try {
