@@ -11,9 +11,6 @@ import (
 	"path/filepath"
 )
 
-// The prompt format this host builds (Module-ECC src/ecc/chat.py PROMPT_FORMAT version).
-const promptFormat = 1
-
 // Bundle is bundle.json, written by the pipeline's `uv run bundle`.
 type Bundle struct {
 	Version string `json:"version"`
@@ -23,13 +20,12 @@ type Bundle struct {
 		B float64 `json:"b"`
 	} `json:"platt"`
 	Prompt struct {
-		FormatVersion int      `json:"format_version"`
-		Header        string   `json:"header"`
-		WindowMin     int      `json:"window_min"`
-		WindowMax     int      `json:"window_max"`
-		WindowTokens  int      `json:"window_tokens"`
-		Answers       []string `json:"answers"`
-		TopLogprobs   int      `json:"top_logprobs"`
+		Header       string   `json:"header"`
+		WindowMin    int      `json:"window_min"`
+		WindowMax    int      `json:"window_max"`
+		WindowTokens int      `json:"window_tokens"`
+		Answers      []string `json:"answers"`
+		TopLogprobs  int      `json:"top_logprobs"`
 	} `json:"prompt"`
 	// Served to Module-ECC as written; the host does not interpret it.
 	Decision json.RawMessage `json:"decision"`
@@ -70,8 +66,6 @@ func loadBundle(dir string) (*Bundle, error) {
 	}
 	p := b.Prompt
 	switch {
-	case p.FormatVersion != promptFormat:
-		return nil, fmt.Errorf("bundle %s uses prompt format %d; this host builds format %d", b.Version, p.FormatVersion, promptFormat)
 	case len(p.Answers) != 2 || p.TopLogprobs < 2:
 		return nil, fmt.Errorf("bundle %s: prompt needs two answers and top_logprobs of at least 2", b.Version)
 	case p.WindowMin < 0 || p.WindowMax <= p.WindowMin || p.WindowTokens < 1:

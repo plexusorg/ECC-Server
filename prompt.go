@@ -5,17 +5,10 @@ import (
 	"strings"
 )
 
-// The classifier prompt, byte for byte as Module-ECC's training pipeline builds it (src/ecc/chat.py, prompt format
-// 1): the bundle's header, then one "speaker: text\n" line per message, the target last. The answer token follows the
+// The classifier prompt, byte for byte as Module-ECC's training pipeline builds it (src/ecc/chat.py): the bundle's
+// header, then one "speaker: text\n" line per message (clean.go), the target last. The answer token follows the
 // target's newline. A conversation's prompt grows by whole lines, so each prompt is a token prefix of the next and
 // llama-server decodes only the new line.
-
-var lineBreaks = strings.NewReplacer("\r\n", " ", "\r", " ", "\n", " ")
-
-// clean is chat.clean: NFC, then each line break inside a message becomes one space.
-func clean(s string) string {
-	return lineBreaks.Replace(nfc(s))
-}
 
 // promptLine is chat.prompt_line.
 func promptLine(speaker, text string) string {

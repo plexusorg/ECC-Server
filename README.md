@@ -6,7 +6,7 @@ written by the Module-ECC training pipeline (`uv run bundle`): it runs the bundl
 over HTTP on the loopback interface. Module-ECC talks only to this host, never to llama-server.
 
 Each message is scored as the last line of its conversation's window. The prompt is built byte for byte as the
-pipeline builds it (Module-ECC `src/ecc/chat.py`, prompt format 1), with token counts from llama-server's
+pipeline builds it (Module-ECC `src/ecc/chat.py`), with token counts from llama-server's
 `/tokenize`. Because a window grows one line at a time, llama-server reuses the cached prefix and decodes only the new
 line.
 
