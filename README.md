@@ -10,28 +10,45 @@ pipeline builds it (Module-ECC `src/ecc/chat.py`), with token counts from llama-
 `/tokenize`. Because a window grows one line at a time, llama-server reuses the cached prefix and decodes only the new
 line.
 
-## Install (systemd)
+## Install (Debian, Ubuntu)
 
-The llama.cpp Linux build links OpenMP's runtime, and the release download needs CA certificates. On Debian or
-Ubuntu, install both with `apt install libgomp1 ca-certificates`.
+ECC-Server is packaged as an amd64 `.deb` that depends on `libgomp1` (the llama.cpp Linux build links OpenMP's
+runtime) and `ca-certificates` (the llama.cpp release download). The package installs:
+
+- `/usr/bin/ecc-server`, the static binary
+- `/lib/systemd/system/ecc-server.service`, which runs `ecc-server run` as the `ecc-server` user with
+  `Restart=always`; if llama-server exits on its own, the host exits too and systemd restarts both
+- `/etc/ecc-server/config.toml`, a config file dpkg keeps across upgrades (see Configuration)
+- the `ecc-server` system user and `/var/lib/ecc-server`, the data folder it owns
+
+Add the apt source from the repository's "Use this repository" tab in the Telesphorepo web UI (it gives the apt
+line and the signing-key setup). The repository address is `https://telesphorepo.com/debian/ecc-server`;
+pre-releases (versions containing `~`) are in `ecc-server-dev`. Then:
 
 ```sh
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o ecc-server .
-sudo install -m 755 ecc-server /usr/local/bin/ecc-server
-sudo mkdir -p /etc/ecc-server
-sudo cp config.toml /etc/ecc-server/config.toml      # see Configuration
-sudo /usr/local/bin/ecc-server install                # creates the ecc-server user and data folder, writes the unit
-sudo chgrp ecc-server /etc/ecc-server/config.toml && sudo chmod 640 /etc/ecc-server/config.toml
-sudo -u ecc-server ecc-server use /path/to/bundle     # the folder must be readable by ecc-server
-sudo systemctl enable --now ecc-server
+sudo apt update
+sudo apt install ecc-server                        # enables and starts the service
+sudo -u ecc-server ecc-server use /path/to/bundle  # the folder must be readable by ecc-server
+ecc-server status
 ```
 
-`install` writes `/etc/systemd/system/ecc-server.service`, which runs the binary as the `ecc-server` user with
-`Restart=always`. If llama-server exits on its own, the host exits too and systemd restarts both.
+The host starts without a bundle and reports not ready until `use` installs one.
+
+Upgrade with `sudo apt update && sudo apt upgrade`. The service restarts, so conversation windows start anew; the
+installed bundle and your edited `config.toml` stay. Remove with `sudo apt remove ecc-server` (stops and disables
+the service, keeps `/etc/ecc-server` and the data folder); `sudo apt purge ecc-server` also deletes
+`/var/lib/ecc-server`, including the bundles and the downloaded llama.cpp, and the `ecc-server` user.
 
 On first start with a bundle, the host downloads the llama.cpp release the bundle names (its Linux CPU build), checks
 the asset's SHA-256 against the bundle, and unpacks it under `<data>/llama/<release>/`.
 
+## Building the package
+
+`package.ps1` (needs Go; nothing else is installed) builds the static binary and runs nfpm, pinned to a version, into
+`dist/ecc-server_<version>_amd64.deb`, then prints the `telesphorepo publish` command for it. The version comes from
+the `VERSION` file alone, which `ecc-server version` prints too. Write a Debian version: `0.1.0` is a release,
+`0.1.0~dev.3` a pre-release that sorts before it. `telesphorepo.toml` sends versions containing `~` to
+`ecc-server-dev` and the rest to `ecc-server`.
 ## Configuration
 
 A TOML file, `/etc/ecc-server/config.toml` unless `-config` names another. Unknown keys are rejected.
@@ -45,7 +62,7 @@ A TOML file, `/etc/ecc-server/config.toml` unless `-config` names another. Unkno
 
 ## Commands
 
-Every command takes `-config FILE` before its arguments.
+Every command except `version` takes `-config FILE` before its arguments (default `/etc/ecc-server/config.toml`).
 
 - `ecc-server run`: serve the current bundle. With none installed it reports not ready until `use` installs one.
 - `ecc-server use FOLDER`: install a bundle folder (`model.gguf`, `bundle.json`, `manifest.json`) into the store and
@@ -56,7 +73,12 @@ Every command takes `-config FILE` before its arguments.
   serving and the new one is discarded. Without a running host, the bundle is served from the next start.
 - `ecc-server rollback`: switch back to the previous bundle, the same way. The store keeps the current and the
   previous bundle and deletes older ones.
-- `ecc-server install`: write the systemd unit (Linux, as root).
+- `ecc-server status`: print the bundle the running host serves and its health, from `/health`; exit status 1 when
+  no host is listening or the host is not ready.
+- `ecc-server version`: print the package version.
+
+`use` and `rollback` refuse to run as root: run them as the service user (`sudo -u ecc-server ecc-server use ...`),
+which owns the data folder the running host also writes.
 
 ## HTTP interface
 

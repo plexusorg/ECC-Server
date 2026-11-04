@@ -12,6 +12,9 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
+// version is set at build time from the VERSION file (-ldflags -X main.version=...).
+var version = "dev"
+
 const defaultConfig = "/etc/ecc-server/config.toml"
 
 type Config struct {
@@ -54,7 +57,8 @@ const usage = `ecc-server <command> [-config FILE] [FOLDER]
   run              serve the current bundle on the configured loopback address
   use FOLDER       install a bundle folder (model.gguf, bundle.json, manifest.json) and switch to it
   rollback         switch back to the previous bundle
-  install          write the systemd unit (Linux, as root)
+  status           print the bundle the running host serves and its health
+  version          print the ecc-server version
 
 The config file defaults to ` + defaultConfig + `.
 `
@@ -65,6 +69,10 @@ func main() {
 		os.Exit(2)
 	}
 	cmd := os.Args[1]
+	if cmd == "version" && len(os.Args) == 2 {
+		fmt.Println(version)
+		return
+	}
 	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
 	configPath := fs.String("config", defaultConfig, "config file")
 	fs.Usage = func() { fmt.Fprint(os.Stderr, usage) }
@@ -73,6 +81,9 @@ func main() {
 	if err != nil {
 		fail(err)
 	}
+	if (cmd == "use" || cmd == "rollback") && os.Geteuid() == 0 {
+		fail(fmt.Errorf("run %s as the service user, which owns the data folder: sudo -u ecc-server ecc-server %s ...", cmd, cmd))
+	}
 	switch {
 	case cmd == "run" && fs.NArg() == 0:
 		err = run(cfg)
@@ -80,8 +91,8 @@ func main() {
 		err = useBundle(cfg, fs.Arg(0))
 	case cmd == "rollback" && fs.NArg() == 0:
 		err = rollback(cfg)
-	case cmd == "install" && fs.NArg() == 0:
-		err = install(*configPath, cfg)
+	case cmd == "status" && fs.NArg() == 0:
+		err = status(cfg)
 	default:
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)

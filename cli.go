@@ -9,11 +9,8 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
-	"os/user"
-	"path/filepath"
-	"runtime"
 	"strings"
+	"time"
 )
 
 func useBundle(cfg Config, folder string) error {
@@ -75,67 +72,31 @@ func switchTo(cfg Config, version string) error {
 	return nil
 }
 
-const unitPath = "/etc/systemd/system/ecc-server.service"
-
-const unitTemplate = `[Unit]
-Description=ECC-Server, the chat-safety classifier host for Module-ECC
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-User=ecc-server
-Group=ecc-server
-ExecStart=%s run -config %s
-Restart=always
-RestartSec=5
-NoNewPrivileges=yes
-PrivateTmp=yes
-ProtectSystem=strict
-ProtectHome=yes
-ReadWritePaths=%s
-
-[Install]
-WantedBy=multi-user.target
-`
-
-// install writes the systemd unit, creating the ecc-server system user and the data folder it owns.
-func install(configPath string, cfg Config) error {
-	if runtime.GOOS != "linux" {
-		return errors.New("install writes a systemd unit and runs on Linux only")
+// status prints the bundle a running host serves and its health.
+func status(cfg Config) error {
+	client := http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get("http://" + cfg.Listen + "/health")
+	var dial *net.OpError
+	if errors.As(err, &dial) && dial.Op == "dial" {
+		return fmt.Errorf("no host is listening on %s", cfg.Listen)
 	}
-	if os.Geteuid() != 0 {
-		return errors.New("install must run as root")
-	}
-	bin, err := os.Executable()
 	if err != nil {
 		return err
 	}
-	if configPath, err = filepath.Abs(configPath); err != nil {
-		return err
+	defer resp.Body.Close()
+	var h struct {
+		Status  string `json:"status"`
+		Version string `json:"version"`
 	}
-	data, err := filepath.Abs(cfg.Data)
-	if err != nil {
-		return err
+	if err := json.NewDecoder(resp.Body).Decode(&h); err != nil {
+		return fmt.Errorf("unexpected answer from %s: %w", cfg.Listen, err)
 	}
-	if _, err := user.Lookup("ecc-server"); err != nil {
-		cmd := exec.Command("useradd", "--system", "--home-dir", data, "--no-create-home", "--shell", "/usr/sbin/nologin", "ecc-server")
-		if out, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("useradd: %v: %s", err, out)
-		}
+	if h.Version != "" {
+		fmt.Printf("bundle: %s\n", h.Version)
 	}
-	if err := os.MkdirAll(data, 0o750); err != nil {
-		return err
+	fmt.Printf("health: %s\n", h.Status)
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("the host is not ready")
 	}
-	if out, err := exec.Command("chown", "ecc-server:ecc-server", data).CombinedOutput(); err != nil {
-		return fmt.Errorf("chown %s: %v: %s", data, err, out)
-	}
-	unit := fmt.Sprintf(unitTemplate, bin, configPath, data)
-	if err := os.WriteFile(unitPath, []byte(unit), 0o644); err != nil {
-		return err
-	}
-	if out, err := exec.Command("systemctl", "daemon-reload").CombinedOutput(); err != nil {
-		return fmt.Errorf("systemctl daemon-reload: %v: %s", err, out)
-	}
-	fmt.Printf("wrote %s\nnext: sudo -u ecc-server %s use -config %s <bundle folder>\n      systemctl enable --now ecc-server\n", unitPath, bin, configPath)
 	return nil
 }

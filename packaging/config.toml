@@ -1,0 +1,13 @@
+# ECC-Server configuration. Unknown keys are rejected.
+
+# HTTP address; must be a loopback address.
+listen = "127.0.0.1:8790"
+
+# Bundle store, state and the downloaded llama.cpp release.
+data = "/var/lib/ecc-server"
+
+# llama-server's -t.
+threads = 6
+
+# Run this llama-server binary instead of downloading the bundle's llama.cpp release.
+# llama_server = "/opt/llama/llama-server"

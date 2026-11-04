@@ -1,0 +1,6 @@
+server = "https://telesphorepo.com"
+repo = "ecc-server"
+
+[[when]]
+version = "*~*"
+repo = "ecc-server-dev"

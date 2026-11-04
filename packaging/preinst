@@ -1,0 +1,8 @@
+#!/bin/sh
+set -e
+if [ "$1" = install ] || [ "$1" = upgrade ]; then
+    if ! getent passwd ecc-server >/dev/null; then
+        useradd --system --user-group --home-dir /var/lib/ecc-server --no-create-home \
+            --shell /usr/sbin/nologin ecc-server
+    fi
+fi

@@ -1,0 +1,13 @@
+#!/bin/sh
+set -e
+if [ "$1" = configure ]; then
+    install -d -o ecc-server -g ecc-server -m 0750 /var/lib/ecc-server
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload
+        if [ -z "$2" ]; then
+            systemctl enable --now ecc-server.service
+        else
+            systemctl try-restart ecc-server.service
+        fi
+    fi
+fi

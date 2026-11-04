@@ -1,0 +1,11 @@
+#!/bin/sh
+set -e
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload || true
+fi
+if [ "$1" = purge ]; then
+    rm -rf /var/lib/ecc-server
+    if getent passwd ecc-server >/dev/null; then
+        userdel ecc-server || true
+    fi
+fi
