@@ -3,8 +3,6 @@ package main
 import (
 	"errors"
 	"strings"
-
-	"golang.org/x/text/unicode/norm"
 )
 
 // The classifier prompt, byte for byte as Module-ECC's training pipeline builds it (src/ecc/chat.py, prompt format
@@ -16,7 +14,7 @@ var lineBreaks = strings.NewReplacer("\r\n", " ", "\r", " ", "\n", " ")
 
 // clean is chat.clean: NFC, then each line break inside a message becomes one space.
 func clean(s string) string {
-	return lineBreaks.Replace(norm.NFC.String(s))
+	return lineBreaks.Replace(nfc(s))
 }
 
 // promptLine is chat.prompt_line.
