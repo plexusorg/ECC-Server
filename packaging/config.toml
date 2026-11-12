@@ -26,7 +26,7 @@ check_interval = "10m"
 # The Amazon Bedrock region and model (a model or inference profile ID) the slow check calls. The API key is not set
 # here: `sudo ecc-server bedrock login` stores it encrypted for the service.
 bedrock_region = "us-east-1"
-bedrock_model = "us.moonshotai.kimi-k3"
+bedrock_model = "us.moonshotai.kimi-k3.1"
 
 # This game server's name, written in every record line: 1 to 32 of a-z, 0-9, - and _.
 server = "tf"

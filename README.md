@@ -235,7 +235,7 @@ A TOML file, `/etc/ecc-server/config.toml` unless `-config` names another. Unkno
 | `wandb_artifact` | `classifier-bundle` | the artifact whose `production` alias names the bundle to serve |
 | `check_interval` | `"10m"` | time between W&B checks, at least `1m` |
 | `bedrock_region` | `us-east-1` | AWS region of the Bedrock endpoint the slow check calls |
-| `bedrock_model` | `us.moonshotai.kimi-k3` | Bedrock model or inference profile ID the slow check calls |
+| `bedrock_model` | `us.moonshotai.kimi-k3.1` | Bedrock model or inference profile ID the slow check calls |
 | `server` | (required) | this game server's name in every record line: 1 to 32 of `a-z`, `0-9`, `-` and `_` |
 | `queue_size` | `20` | messages a player can have waiting to be scored; past this their oldest waiting one is not scored |
 | `kick_delay_min`, `kick_delay_max` | `"2m"`, `"10m"` | a banned player is kicked at a random time in this range after the verdict |

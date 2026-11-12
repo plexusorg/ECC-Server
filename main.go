@@ -56,7 +56,7 @@ var regionName = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
 func loadConfig(path string) (Config, error) {
 	cfg := Config{Listen: "127.0.0.1:8790", Data: "/var/lib/ecc-server", Threads: 6, WandbEntity: "telesphoreo-telesphoreo",
 		WandbProject: "ecc", WandbArtifact: "classifier-bundle", CheckInterval: 10 * time.Minute,
-		BedrockRegion: "us-east-1", BedrockModel: "us.moonshotai.kimi-k3", QueueSize: 20, KickDelayMin: 2 * time.Minute,
+		BedrockRegion: "us-east-1", BedrockModel: "us.moonshotai.kimi-k3.1", QueueSize: 20, KickDelayMin: 2 * time.Minute,
 		KickDelayMax: 10 * time.Minute, HeldCap: 10 * time.Minute, RecordRetentionDays: 180}
 	md, err := toml.DecodeFile(path, &cfg)
 	if err != nil {
