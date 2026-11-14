@@ -126,8 +126,10 @@ with no speaker UUID (a Discord relay) or marked `trusted` (Module-ECC delivered
 the module's trusted groups or holds the bypass permission) is kept as context for other players' lines only: never
 scored, held or judged, and in no sitting. Every other line is scored by the fast model with its conversation's recent
 lines (the bundle's `context`); a line the scorer cannot score is held. In the text the scorer sees, the line's and
-its context's, each link on the allowlist Module-ECC sends with `start` is replaced by the bundle's `links.canonical`:
-a domain covers its subdomains and every path on them, an exact URL only itself. The record and the judge see the
+its context's, each link on the allowlist Module-ECC sends with `start` is replaced by the bundle's `links.canonical`,
+the whole link with its scheme, port, path and the punctuation after it, as the models were trained: a domain covers
+its subdomains and every path on them, an exact URL only itself (with or without a scheme, a last `/` or punctuation
+after it); hosts and paths compare without regard to case. The record and the judge see the
 original text. The host keeps the last allowlist in `<data>/links.json` for its next start; before any `start`, no link
 is replaced.
 
