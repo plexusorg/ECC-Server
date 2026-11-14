@@ -54,8 +54,8 @@ func rollback(cfg Config) error {
 	return nil
 }
 
-// switchTo has a running host switch to an installed bundle, which it activates once the bundle's llama-server is
-// healthy; with no host running it activates the bundle for the next start.
+// switchTo has a running host switch to an installed bundle, which it activates once the bundle loads; with no host
+// running it activates the bundle for the next start.
 func switchTo(cfg Config, version string) error {
 	token, err := readToken(cfg)
 	var resp *http.Response
@@ -114,20 +114,21 @@ func bedrockLogin(cfg Config) error {
 	if err != nil {
 		return err
 	}
-	b := newBedrock(key, cfg.BedrockRegion, cfg.BedrockModel)
+	b := newBedrock(key, cfg)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	if _, err := b.converse(ctx, "", "Hi", loginCheckMaxTokens); err != nil {
-		return fmt.Errorf("checking the key with a call to %s in %s: %w", cfg.BedrockModel, cfg.BedrockRegion, err)
+	if _, err := b.converse(ctx, "", "Hi", loginCheckMaxTokens, cfg.Judge.ServiceTier); err != nil {
+		return fmt.Errorf("checking the key with a call to %s in %s: %w", cfg.Judge.Model, cfg.Judge.Region, err)
 	}
 	if err := storeCredential(bedrockCredential, key); err != nil {
 		return err
 	}
-	fmt.Printf("the key can call %s in %s; stored it, encrypted, in %s\n", cfg.BedrockModel, cfg.BedrockRegion, credFile(bedrockCredential))
+	fmt.Printf("the key can call %s in %s; stored it, encrypted, in %s\n", cfg.Judge.Model, cfg.Judge.Region, credFile(bedrockCredential))
 	return restartService()
 }
 
-// status prints the bundle a running host serves, its health, its W&B updates, its Bedrock calls and chat safety.
+// status prints the bundle a running host serves, its health, its W&B updates, its judge calls, the judge's spend
+// and its sittings.
 func status(cfg Config) error {
 	token, err := readToken(cfg)
 	if err != nil {
@@ -152,6 +153,7 @@ func status(cfg Config) error {
 		fmt.Printf("bundle: %s\n", h.Version)
 	}
 	fmt.Printf("health: %s\n", h.Status)
+	fmt.Printf("scorer: %s\n", h.Scorer)
 	if w := h.Wandb; w == nil {
 		fmt.Println("W&B: no key set (sudo ecc-server wandb login)")
 	} else {
@@ -169,43 +171,33 @@ func status(cfg Config) error {
 			fmt.Printf("downloading: %s, %.1f of %.1f MB\n", d.File, float64(d.Done)/1e6, float64(d.Total)/1e6)
 		}
 	}
-	if b := h.Bedrock; b != nil {
-		if b.KeySet {
-			fmt.Printf("Bedrock: %s in %s, key set\n", b.Model, b.Region)
-		} else {
-			fmt.Printf("Bedrock: %s in %s, no key set (sudo ecc-server bedrock login)\n", b.Model, b.Region)
+	if b := h.Judge; b != nil {
+		key := "key set"
+		if !b.KeySet {
+			key = "no key set (sudo ecc-server bedrock login)"
 		}
+		fmt.Printf("judge: %s in %s, %s tier, %s\n", b.Model, b.Region, b.Tier, key)
 		if b.LastCall.IsZero() {
-			fmt.Println("last Bedrock call: none since the host started")
+			fmt.Println("last judge call: none since the host started")
 		} else {
-			fmt.Printf("last Bedrock call: %s (%s ago): %s\n", b.LastCall.Format(time.DateTime),
+			fmt.Printf("last judge call: %s (%s ago): %s\n", b.LastCall.Format(time.DateTime),
 				time.Since(b.LastCall).Round(time.Second), b.Result)
 		}
 	}
-	sf := h.Safety
-	if sf.Paused != "" {
-		fmt.Printf("scoring: paused (%s); %d messages wait\n", sf.Paused, sf.Backlog)
-	} else {
-		fmt.Printf("scoring: %d messages wait\n", sf.Backlog)
+	sp := h.Spend
+	fmt.Printf("spend: %s $%.4f of $%.2f (%d calls); %s $%.4f of $%.2f", sp.Day, sp.DayUSD, sp.DailyBudget, sp.Calls,
+		sp.Month, sp.MonthUSD, sp.MonthlyBudget)
+	if sp.ReservedUSD > 0 {
+		fmt.Printf("; $%.4f of it reserved for calls in flight", sp.ReservedUSD)
 	}
-	fmt.Printf("pending players: %d%s\n", len(sf.Pending), names(sf.Pending))
-	if sc := sf.SlowCheck; sc.Answering != nil && !*sc.Answering {
-		fmt.Printf("slow check: Bedrock failing since %s: %s\n", sc.Since.Format(time.DateTime), sc.Failure)
-	}
-	fmt.Printf("checking: %d%s; held (not sure yet): %d%s\n", len(sf.SlowCheck.Checking), names(sf.SlowCheck.Checking),
-		len(sf.SlowCheck.Held), names(sf.SlowCheck.Held))
-	fmt.Printf("unacknowledged actions: %d\n", sf.Unacknowledged)
+	fmt.Println()
+	st := h.Sittings
+	fmt.Printf("sittings: %d open, %d held lines unruled, %d judge calls in flight\n", st.Sittings, st.Unruled, st.InFlight)
+	fmt.Printf("unacknowledged actions: %d\n", h.Unacknowledged)
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("the host is not ready")
 	}
 	return nil
-}
-
-func names(list []string) string {
-	if len(list) == 0 {
-		return ""
-	}
-	return " (" + strings.Join(list, ", ") + ")"
 }
 
 // update has the running host check W&B now and install production if it is not served, waiting for the result.

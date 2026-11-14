@@ -19,6 +19,11 @@ type entry struct {
 	sitting string
 	held    bool
 	kinds   []string
+	// verdict is the line's verdict; released marks a held line a ruling delivered.
+	verdict  string
+	released bool
+	// refs is the driver's id of the line and of each of its repeats.
+	refs []string
 }
 
 // stream is every line since the game server started, in arrival order, numbered from 0. Lines no open sitting can
@@ -163,8 +168,15 @@ func hms(d time.Duration) string {
 	return fmt.Sprintf("%02d:%02d:%02d", s/3600, s%3600/60, s%60)
 }
 
-func (r Render) text(v view, keep []int, player string) string {
+// shown is the case's text and the ids of the player's lines in it.
+type shown struct {
+	text string
+	mine []string
+}
+
+func (r Render) text(v view, keep []int, player string) shown {
 	var b strings.Builder
+	var ids []string
 	b.WriteString("player: ")
 	b.WriteString(player)
 	b.WriteString(" · log ")
@@ -180,6 +192,7 @@ func (r Render) text(v view, keep []int, player string) string {
 		mine := e.sitting != "" && e.sitting == v.sitting
 		if mine {
 			b.WriteString(">> ")
+			ids = append(ids, e.line.ID)
 		}
 		l := e.line
 		b.WriteString(l.ID)
@@ -211,13 +224,13 @@ func (r Render) text(v view, keep []int, player string) string {
 			}
 		}
 	}
-	return b.String()
+	return shown{b.String(), ids}
 }
 
-func (r Render) fits(s string) bool { return utf8.RuneCountInString(s) <= r.MaxChars }
+func (r Render) fits(s shown) bool { return utf8.RuneCountInString(s.text) <= r.MaxChars }
 
 // render is the checkpoint's case: the windows around the player's marked lines, cut down to MaxChars.
-func (r Render) render(v view) (string, error) {
+func (r Render) render(v view) (shown, error) {
 	player := v.player()
 	var flagged []int
 	for _, p := range v.mine {
@@ -234,7 +247,7 @@ func (r Render) render(v view) (string, error) {
 		}
 	}
 	m := len(v.held)
-	lo, hi, best := 1, m, ""
+	lo, hi, best := 1, m, shown{}
 	for lo <= hi {
 		k := (lo + hi) / 2
 		var pick []int
@@ -257,28 +270,40 @@ func (r Render) render(v view) (string, error) {
 			hi = k - 1
 		}
 	}
-	if best == "" {
-		return "", errTooLong
+	if best.text == "" {
+		return shown{}, errTooLong
 	}
 	return best, nil
 }
 
+// The fixed strings of the judge's prompt: QuestionHead, the question, SepCases, the owner's cases joined by
+// BlockSep (each "## C<n>: ruling: <ruling>\n" and its text), SepNew, "## N1\n" and the case, SepFormat, the format.
+const (
+	QuestionHead  = "# Question\n\n"
+	SepCases      = "\n\n# The owner's cases\n\n"
+	BlockSep      = "\n\n"
+	SepNew        = "\n\n# New cases\n\n"
+	SepFormat     = "\n\n# Answer format\n\n"
+	ExampleHeader = "## C<n>: ruling: <ruling>"
+	NewCase       = "N1"
+)
+
 // prompt lays out the judge's prompt around one case.
 func (t Texts) prompt(c string) string {
 	var b strings.Builder
-	b.WriteString("# Question\n\n")
+	b.WriteString(QuestionHead)
 	b.WriteString(t.Question)
-	b.WriteString("\n\n# The owner's cases\n\n")
+	b.WriteString(SepCases)
 	for i, e := range t.Examples {
 		if i > 0 {
-			b.WriteString("\n\n")
+			b.WriteString(BlockSep)
 		}
 		b.WriteString("## C" + strconv.Itoa(i+1) + ": ruling: " + e.Ruling + "\n")
 		b.WriteString(e.Text)
 	}
-	b.WriteString("\n\n# New cases\n\n## N1\n")
+	b.WriteString(SepNew + "## " + NewCase + "\n")
 	b.WriteString(c)
-	b.WriteString("\n\n# Answer format\n\n")
+	b.WriteString(SepFormat)
 	b.WriteString(t.Format)
 	return b.String()
 }

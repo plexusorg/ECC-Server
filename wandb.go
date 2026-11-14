@@ -169,7 +169,7 @@ func (w *wandb) artifact(ctx context.Context, name string) (*wbArtifact, error) 
 	}
 	a := out.Project.Artifact
 	if a != nil && a.Files.PageInfo.HasNextPage {
-		return nil, fmt.Errorf("%s has more than 100 files; a bundle has three", name)
+		return nil, fmt.Errorf("%s has more than 100 files; a bundle has fewer", name)
 	}
 	return a, nil
 }

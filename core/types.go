@@ -32,6 +32,9 @@ type Line struct {
 	Context bool
 	// Sitting names the sitting the line belongs to when the driver defines sittings (Config.DriverSittings).
 	Sitting string
+	// Ref is the driver's own id for the line (the plugin's line id); a release action lists the refs of the lines it
+	// delivers.
+	Ref string
 }
 
 // Verdict is the fast model's verdict on one line and the kinds it marks, in the order the judge sees them.
@@ -62,9 +65,9 @@ type Answer struct {
 	Sure   *bool    `json:"sure,omitempty"`
 }
 
-// Judge rules one prompt.
+// Judge rules one checkpoint: its Prompt, with Mine and Cases to check the answer against.
 type Judge interface {
-	Rule(prompt string) (Answer, error)
+	Rule(job *Job) (Answer, error)
 }
 
 // ErrNotSent is the error a driver hands to Engine.Rule for a checkpoint whose prompt it chose not to send.
@@ -82,14 +85,20 @@ const (
 	ActionRelease = "release" // deliver these held lines late, in order
 )
 
-// Action is one thing the plugin is told to do.
+// Action is one thing the plugin is told to do. A release names its lines by stream id (Lines) and by the driver's
+// refs (Refs: each line's own, then its repeats', in the order they arrived).
 type Action struct {
 	Kind    string   `json:"kind"`
 	Account string   `json:"account"`
 	Name    string   `json:"name"`
 	Sitting string   `json:"sitting"`
 	Lines   []string `json:"lines,omitempty"`
+	Refs    []string `json:"refs,omitempty"`
 }
+
+// RepeatWindow: a speaker's line with the same text as their previous line in the conversation, within this long of
+// that line's last copy, is a repeat of it.
+const RepeatWindow = 60 * time.Second
 
 // Example is one of the owner's ruled cases, shown to the judge.
 type Example struct {

@@ -6,144 +6,64 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math"
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
 	"sync"
 	"syscall"
 	"time"
+
+	"ecc-server/core"
 )
 
-// A conversation idle this long drops its window; its next message starts a new one.
-const idleWindow = 30 * time.Minute
-
-// model is one served bundle with its llama-server. A swap replaces it whole, so a score, its bundle version and the
-// decision parameters always come from the same bundle.
-type model struct {
-	bundle   *Bundle
-	llama    *llama
-	ban, ok  int           // token ids of the two answers
-	header   int           // tokens of the header
-	slots    chan struct{} // one per llama-server slot
-	inflight sync.WaitGroup
-}
-
-func startModel(cfg Config, b *Bundle) (*model, error) {
-	l, err := startLlama(cfg, b)
-	if err != nil {
-		return nil, err
-	}
-	m, err := newModel(b, l)
-	if err != nil {
-		l.stop()
-		return nil, err
-	}
-	slog.Info("serving bundle", "version", b.Version, "llama", l.url)
-	return m, nil
-}
-
-func newModel(b *Bundle, l *llama) (*model, error) {
-	m := &model{bundle: b, llama: l, slots: make(chan struct{}, parallelSlots(b.LlamaServerArgs))}
-	ids := make([]int, 2)
-	for i, a := range b.Prompt.Answers {
-		t, err := l.tokenize(a)
-		if err != nil {
-			return nil, err
-		}
-		if len(t) != 1 {
-			return nil, fmt.Errorf("bundle %s: answer %q is %d tokens, not one", b.Version, a, len(t))
-		}
-		ids[i] = t[0]
-	}
-	m.ban, m.ok = ids[0], ids[1]
-	h, err := l.tokenize(b.Prompt.Header)
-	m.header = len(h)
-	return m, err
-}
-
-// parallelSlots is llama-server's slot count from its arguments (-np, --parallel; 1 when unset).
-func parallelSlots(args []string) int {
-	for i := 0; i+1 < len(args); i++ {
-		if args[i] == "-np" || args[i] == "--parallel" {
-			if n, err := strconv.Atoi(args[i+1]); err == nil && n > 0 {
-				return n
-			}
-		}
-	}
-	return 1
-}
-
-// complete holds one llama-server slot for the call, released even if it panics.
-func (m *model) complete(prompt string, topLogprobs int) (*completion, error) {
-	m.slots <- struct{}{}
-	defer func() { <-m.slots }()
-	return m.llama.complete(prompt, topLogprobs)
-}
-
-func (m *model) count(text string) (int, error) {
-	t, err := m.llama.tokenize(text)
-	return len(t), err
-}
-
-// conversation holds one conversation's window. Its messages take turns in arrival order: each waits for the
-// previous one's turn channel to close. Only the turn holder touches gen and win.
-type conversation struct {
-	tail    chan struct{}
-	pending int
-	last    time.Time
-	gen     *model
-	win     window
-}
+// Line ids remembered, so a resend after a lost answer gets the same verdict and is not counted twice.
+const seenIDs = 50000
 
 type server struct {
 	cfg      Config
 	ctx      context.Context // cancelled when the host stops
-	mu       sync.Mutex
-	cur      *model
-	convs    map[string]*conversation
-	switchMu sync.Mutex
-	upd      *updater // nil without a W&B key
-	br       *bedrock
 	rec      *recordLog
-	safety   *safety
-}
+	recorder *recorder
+	acts     *actionStore
+	spend    *spend
+	br       *bedrock
+	judge    core.Judge
+	scorer   core.Scorer
+	scorerIs string
+	upd      *updater // nil without a W&B key
+	switchMu sync.Mutex
+	jobs     sync.WaitGroup
 
-type scoreRequest struct {
-	Conversation string `json:"conversation"`
-	Speaker      string `json:"speaker"`
-	Text         string `json:"text"`
+	// mu guards the engine and what follows; the engine is not safe for concurrent use.
+	mu      sync.Mutex
+	eng     *core.Engine // nil until a bundle is served
+	bundle  *Bundle
+	last    time.Time
+	seen    map[string]string
+	seenLog []string
 }
-
-type scoreResponse struct {
-	PBan      float64 `json:"p_ban"`
-	Margin    float64 `json:"margin"`
-	Version   string  `json:"version"`
-	Earlier   int     `json:"earlier"`   // earlier lines in the prompt
-	Tokens    int     `json:"tokens"`    // prompt tokens
-	Evaluated int     `json:"evaluated"` // prompt tokens llama-server decoded (the rest came from its cache)
-}
-
-// errNoAnswer: neither answer token is among the top logprobs, so the message has no score.
-var errNoAnswer = errors.New("neither answer token is among the top logprobs")
 
 func run(cfg Config) error {
-	if err := ownChildren(); err != nil {
-		return err
-	}
 	ctx, stopped := context.WithCancel(context.Background())
 	defer stopped()
+	s := &server{cfg: cfg, ctx: ctx, seen: map[string]string{}}
+	if cfg.Test.HoldWordsFile == "" {
+		return errors.New("no scorer: the fast model's runner is not part of this build; the end-to-end rig sets [test] hold_words_file")
+	}
+	ws, err := newWordScorer(cfg.Test.HoldWordsFile)
+	if err != nil {
+		return err
+	}
+	s.scorer, s.scorerIs = ws, "the test rig's word list (not a model)"
 	token, err := loadOrCreateToken(cfg)
 	if err != nil {
 		return fmt.Errorf("the token: %w", err)
 	}
-	s := &server{cfg: cfg, ctx: ctx, convs: map[string]*conversation{}}
 	brKey, err := credential(bedrockCredential)
 	if err != nil {
 		return fmt.Errorf("reading the Bedrock key credential: %w", err)
 	}
-	s.br = newBedrock(brKey, cfg.BedrockRegion, cfg.BedrockModel)
+	s.br = newBedrock(brKey, cfg)
 	key, err := credential(wandbCredential)
 	if err != nil {
 		return fmt.Errorf("reading the W&B key credential: %w", err)
@@ -158,9 +78,20 @@ func run(cfg Config) error {
 		return fmt.Errorf("opening the record: %w", err)
 	}
 	defer s.rec.close()
-	if s.safety, err = openSafety(s, cfg, s.rec); err != nil {
+	if s.recorder, err = newRecorder(cfg, s.rec); err != nil {
 		return err
 	}
+	if err := scanRestart(s.recorder, s.rec.dir, time.Now()); err != nil {
+		return fmt.Errorf("reading the record for sittings left open: %w", err)
+	}
+	if s.spend, err = openSpend(cfg); err != nil {
+		return err
+	}
+	if s.acts, err = openActions(cfg, s.rec); err != nil {
+		return err
+	}
+	s.judge = &bedrockJudge{ctx: ctx, br: s.br, spend: s.spend, tier: cfg.Judge.ServiceTier,
+		maxOut: cfg.Judge.MaxOutputTokens, timeout: cfg.Judge.Timeout, told: s.budgetUsedUp}
 	st, err := readState(cfg)
 	if err != nil {
 		return err
@@ -173,9 +104,7 @@ func run(cfg Config) error {
 		if err != nil {
 			return err
 		}
-		if s.cur, err = startModel(cfg, b); err != nil {
-			return err
-		}
+		s.use(b)
 	} else if s.upd != nil {
 		slog.Warn("no bundle installed; not ready until one is fetched from W&B")
 	} else {
@@ -183,16 +112,14 @@ func run(cfg Config) error {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /messages", s.handleMessages)
+	mux.HandleFunc("POST /line", s.handleLine)
+	mux.HandleFunc("POST /presence", s.handlePresence)
 	mux.HandleFunc("GET /actions", s.handleActions)
 	mux.HandleFunc("POST /actions/ack", s.handleAck)
-	mux.HandleFunc("GET /muted", s.handleMuted)
 	mux.HandleFunc("GET /status", s.handleStatus)
-	mux.HandleFunc("POST /score", s.handleScore)
 	mux.HandleFunc("POST /switch", s.handleSwitch)
 	mux.HandleFunc("POST /update", s.handleUpdate)
 	srv := &http.Server{Addr: cfg.Listen, Handler: requireToken(token, mux)}
-	go s.dropIdle()
 	if s.upd != nil {
 		slog.Info("checking W&B for the production bundle", "artifact", s.upd.name(), "every", cfg.CheckInterval.String())
 		go s.upd.loop(ctx)
@@ -200,13 +127,13 @@ func run(cfg Config) error {
 		slog.Info("no W&B key is set; serving the bundle on disk (set one with sudo ecc-server wandb login)")
 	}
 	if brKey == "" {
-		slog.Warn("no Bedrock key is set; slow checks fail until one is set with sudo ecc-server bedrock login")
+		slog.Warn("no Bedrock key is set; checkpoints are not judged until one is set with sudo ecc-server bedrock login")
 	} else {
-		slog.Info("slow checks call Bedrock", "model", cfg.BedrockModel, "region", cfg.BedrockRegion)
+		slog.Info("the judge calls Bedrock", "model", cfg.Judge.Model, "region", cfg.Judge.Region,
+			"service_tier", cfg.Judge.ServiceTier, "endpoint", s.br.endpoint)
 	}
+	go s.tick()
 
-	died := make(chan struct{})
-	go s.watchLlama(died)
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	errc := make(chan error, 1)
@@ -214,8 +141,6 @@ func run(cfg Config) error {
 	slog.Info("listening", "addr", cfg.Listen)
 	select {
 	case err = <-errc:
-	case <-died:
-		err = errors.New("llama-server exited; stopping so the service manager restarts the host")
 	case sig := <-stop:
 		slog.Info("stopping", "signal", sig.String())
 	}
@@ -223,48 +148,98 @@ func run(cfg Config) error {
 	shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(shutdown)
-	s.safety.close()
-	s.mu.Lock()
-	m := s.cur
-	s.mu.Unlock()
-	if m != nil {
-		m.llama.stop()
+	// Judge calls in flight end with the host's context; their sittings are ended by the next start's scan.
+	done := make(chan struct{})
+	go func() { s.jobs.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-shutdown.Done():
 	}
 	return err
 }
 
-// watchLlama closes died when the serving llama-server exits on its own. The windows live in the host, but the
-// host does not restart llama-server itself: it exits and the service manager restarts it.
-func (s *server) watchLlama(died chan<- struct{}) {
+// use serves a bundle's judge texts and settings: the engine is made with the first bundle and takes later ones in
+// place, keeping its sittings.
+func (s *server) use(b *Bundle) {
+	cc := coreConfig(s.cfg, b)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.eng == nil {
+		s.eng = core.NewEngine(cc, b.texts, s.scorer, s.recorder)
+	} else {
+		s.eng.Swap(cc, b.texts, s.scorer)
+	}
+	s.bundle = b
+	slog.Info("serving bundle", "version", b.Version, "cases", len(b.texts.Examples), "scorer", s.scorerIs)
+}
+
+// now is the engine's clock: the host's time, never earlier than a time the engine has seen. The caller holds mu.
+func (s *server) now() time.Time {
+	t := time.Now()
+	if t.Before(s.last) {
+		t = s.last
+	}
+	s.last = t
+	return t
+}
+
+// tick runs the waiting-time checkpoints and sitting ends once a second, on the host's clock.
+func (s *server) tick() {
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
 	for {
-		s.mu.Lock()
-		m := s.cur
-		s.mu.Unlock()
-		if m == nil {
-			time.Sleep(time.Second)
-			continue
-		}
-		<-m.llama.exited
-		s.mu.Lock()
-		swapped := s.cur != m
-		s.mu.Unlock()
-		if !swapped {
-			close(died)
+		select {
+		case <-s.ctx.Done():
 			return
+		case <-t.C:
 		}
+		s.mu.Lock()
+		if s.eng != nil {
+			s.dispatch(s.eng.Tick(s.now()))
+		}
+		s.mu.Unlock()
 	}
 }
 
-func (s *server) dropIdle() {
-	for range time.Tick(time.Minute) {
-		s.mu.Lock()
-		for id, c := range s.convs {
-			if c.pending == 0 && time.Since(c.last) >= idleWindow {
-				delete(s.convs, id)
-			}
+// dispatch hands the engine's actions to the plugin and starts its judge calls. The caller holds mu.
+func (s *server) dispatch(r core.Result) {
+	for _, a := range r.Actions {
+		if act, ok := fromCore(a); ok {
+			s.acts.add(act)
 		}
-		s.mu.Unlock()
 	}
+	for _, j := range r.Jobs {
+		s.jobs.Add(1)
+		go s.runJob(j)
+	}
+}
+
+// runJob puts one checkpoint to the judge and hands the answer to the engine.
+func (s *server) runJob(j *core.Job) {
+	defer s.jobs.Done()
+	a, err := s.judge.Rule(j)
+	if err != nil {
+		slog.Warn("checkpoint not ruled; its lines stay held", "sitting", j.Sitting, "k", j.K, "err", err.Error())
+	} else {
+		slog.Info("ruling", "sitting", j.Sitting, "k", j.K, "ruling", a.Ruling, "by", a.By)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.now()
+	s.dispatch(s.eng.Rule(j, a, err))
+}
+
+// budgetUsedUp tells staff that a budget stops the judge's calls, once per day or month.
+func (s *server) budgetUsedUp(e *errOverBudget) {
+	until := "the next UTC day"
+	if e.period == "monthly" {
+		until = "the next UTC month"
+	}
+	slog.Error("the judge's budget is used up; held lines wait for review", "budget", e.period,
+		"usd", fmt.Sprintf("%.2f", e.budget))
+	s.acts.add(action{Type: actionNotice, Kind: "budget",
+		Text: fmt.Sprintf("ECC: the judge's %s budget of $%.2f is used up. Until %s, held lines stay held and their "+
+			"sittings go to the review queue.", e.period, e.budget, until)})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -277,199 +252,162 @@ func writeError(w http.ResponseWriter, status int, err error) {
 	writeJSON(w, status, map[string]string{"error": err.Error()})
 }
 
-// errNoBundle: no bundle is served yet, so nothing can be scored.
 var errNoBundle = errors.New("no bundle is being served")
 
-// inTurn runs fn as the conversation's next line, once the lines before it are done, with the served model. at is
-// the line's time: a conversation idle for idleWindow before it starts a new window.
-func (s *server) inTurn(id string, at time.Time, fn func(m *model, c *conversation, idle bool) error) error {
-	s.mu.Lock()
-	c := s.convs[id]
-	if c == nil {
-		c = &conversation{tail: make(chan struct{})}
-		close(c.tail)
-		s.convs[id] = c
-	}
-	prev, mine := c.tail, make(chan struct{})
-	c.tail = mine
-	c.pending++
-	s.mu.Unlock()
-
-	<-prev
-	s.mu.Lock()
-	m := s.cur
-	if m != nil {
-		m.inflight.Add(1)
-	}
-	idle := at.Sub(c.last) >= idleWindow
-	s.mu.Unlock()
-	// Released even if fn panics, so the conversation's later lines and a bundle switch never wait on it.
-	defer func() {
-		if m != nil {
-			m.inflight.Done()
-		}
-		s.mu.Lock()
-		c.pending--
-		if at.After(c.last) {
-			c.last = at
-		}
-		s.mu.Unlock()
-		close(mine)
-	}()
-	if m == nil {
-		return errNoBundle
-	}
-	return fn(m, c, idle)
+// lineRequest is one line from the plugin. A line with no speaker_uuid (a Discord relay) is context only.
+type lineRequest struct {
+	ID           string   `json:"id"`
+	Channel      string   `json:"channel"`
+	Conversation string   `json:"conversation"`
+	Private      bool     `json:"private"`
+	SpeakerUUID  string   `json:"speaker_uuid"`
+	Speaker      string   `json:"speaker"`
+	TargetUUID   string   `json:"target_uuid"`
+	Target       string   `json:"target"`
+	Text         string   `json:"text"`
+	Groups       []string `json:"groups"`
 }
 
-// handleScore scores a line outside chat safety, with no record and no decision: the parity tool's interface.
-func (s *server) handleScore(w http.ResponseWriter, r *http.Request) {
-	var req scoreRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Conversation == "" {
-		writeError(w, http.StatusBadRequest, errors.New("expected {\"conversation\", \"speaker\", \"text\"}"))
+// handleLine gives a line its verdict, timed by the host's clock on arrival.
+func (s *server) handleLine(w http.ResponseWriter, r *http.Request) {
+	var req lineRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	var res *scoreResponse
-	err := s.inTurn(req.Conversation, time.Now(), func(m *model, c *conversation, idle bool) error {
-		var err error
-		res, err = s.score(m, c, idle, req)
-		return err
-	})
-	switch {
-	case errors.Is(err, errNoBundle):
-		writeError(w, http.StatusServiceUnavailable, err)
-	case errors.Is(err, errNoAnswer):
-		writeError(w, http.StatusUnprocessableEntity, err)
-	case err != nil:
-		slog.Error("scoring failed", "conversation", req.Conversation, "err", err)
-		writeError(w, http.StatusBadGateway, err)
+	if req.ID == "" || req.Channel == "" || req.Conversation == "" || req.Speaker == "" {
+		writeError(w, http.StatusBadRequest, errors.New("id, channel, conversation and speaker are required"))
+		return
+	}
+	s.mu.Lock()
+	verdict, seen := s.seen[req.ID]
+	if !seen && s.eng != nil {
+		res := s.eng.Line(core.Line{Ref: req.ID, Time: s.now(), Channel: req.Channel, Conversation: req.Conversation,
+			Private: req.Private, Account: req.SpeakerUUID, Name: req.Speaker, TargetAccount: req.TargetUUID,
+			Target: req.Target, Text: req.Text, Groups: req.Groups, Context: req.SpeakerUUID == ""})
+		s.dispatch(res)
+		verdict = res.Verdict
+		s.seen[req.ID] = verdict
+		s.seenLog = append(s.seenLog, req.ID)
+		if len(s.seenLog) > seenIDs {
+			delete(s.seen, s.seenLog[0])
+			s.seenLog = s.seenLog[1:]
+		}
+	}
+	s.mu.Unlock()
+	if verdict == "" {
+		writeError(w, http.StatusServiceUnavailable, errNoBundle)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"verdict": verdict})
+}
+
+// handlePresence takes the plugin's start (a new stream: every open sitting ends) and players' joins and leaves.
+func (s *server) handlePresence(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Kind string `json:"kind"`
+		UUID string `json:"uuid"`
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if req.Kind != "start" && (req.Kind != "join" && req.Kind != "leave" || req.UUID == "") {
+		writeError(w, http.StatusBadRequest, errors.New(`expected {"kind": "start"} or {"kind": "join"|"leave", "uuid"}`))
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.eng == nil {
+		writeError(w, http.StatusServiceUnavailable, errNoBundle)
+		return
+	}
+	now := s.now()
+	switch req.Kind {
+	case "start":
+		slog.Info("the game server started: a new stream, every open sitting ends")
+		s.dispatch(s.eng.Start(stamp(now), now))
 	default:
-		writeJSON(w, http.StatusOK, res)
+		s.dispatch(s.eng.Presence(req.UUID, req.Kind == "join", now))
+	}
+	s.rec.append("presence", struct {
+		Time string `json:"time"`
+		Kind string `json:"kind"`
+		UUID string `json:"uuid,omitempty"`
+		Name string `json:"name,omitempty"`
+	}{stamp(now), req.Kind, req.UUID, req.Name})
+	writeJSON(w, http.StatusOK, struct{}{})
+}
+
+// handleActions answers with every unacknowledged action, oldest first, as soon as there is one, or with none after
+// 30 seconds.
+func (s *server) handleActions(w http.ResponseWriter, r *http.Request) {
+	timeout := time.NewTimer(30 * time.Second)
+	defer timeout.Stop()
+	for {
+		acts, wake := s.acts.unacknowledged()
+		if len(acts) > 0 {
+			writeJSON(w, http.StatusOK, acts)
+			return
+		}
+		select {
+		case <-wake:
+		case <-timeout.C:
+			writeJSON(w, http.StatusOK, []action{})
+			return
+		case <-r.Context().Done():
+			return
+		case <-s.ctx.Done():
+			writeJSON(w, http.StatusOK, []action{})
+			return
+		}
 	}
 }
 
-// resetWindow starts a new window for the served model, or after the conversation was idle.
-func resetWindow(m *model, c *conversation, idle bool) {
-	if c.gen != m || idle {
-		c.gen, c.win = m, window{used: m.header}
+func (s *server) handleAck(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ID     string `json:"id"`
+		OK     *bool  `json:"ok"`
+		Detail string `json:"detail"`
 	}
-}
-
-// appendLine adds a line to the conversation's window without scoring it, with its token cost, as scoring it would.
-func (s *server) appendLine(m *model, c *conversation, idle bool, speaker, text string) error {
-	resetWindow(m, c, idle)
-	cost, err := m.count(promptLine(speaker, text))
-	if err != nil {
-		return err
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&req); err != nil || req.ID == "" || req.OK == nil {
+		writeError(w, http.StatusBadRequest, errors.New(`expected {"id", "ok", "detail"}`))
+		return
 	}
-	c.win.fit(m.bundle, m.header, cost)
-	c.win.add(line{speaker: speaker, text: text, cost: cost})
-	return nil
-}
-
-// score scores the message as its conversation's next line and appends it to the window. A message that fails to
-// score is not appended, so a retry of it takes its place in the conversation.
-func (s *server) score(m *model, c *conversation, idle bool, req scoreRequest) (*scoreResponse, error) {
-	b := m.bundle
-	resetWindow(m, c, idle)
-	cost, err := m.count(promptLine(req.Speaker, req.Text))
-	if err != nil {
-		return nil, err
-	}
-	c.win.fit(b, m.header, cost)
-	prompt, tokens, err := fittedPrompt(b.Prompt.Header, c.win.lines, req.Speaker, req.Text, b.Prompt.WindowTokens, m.count)
-	if err != nil {
-		return nil, err
-	}
-	out, err := m.complete(prompt, b.Prompt.TopLogprobs)
-	if err != nil {
-		return nil, err
-	}
-	if len(out.Probs) == 0 {
-		return nil, errors.New("llama-server returned no probabilities")
-	}
-	earlier := len(c.win.lines)
-	c.win.add(line{speaker: req.Speaker, text: req.Text, cost: cost})
-
-	// log P(ban) - log P(ok) of the exact answer tokens; an answer missing from the top logprobs gets the lowest
-	// listed one (Module-ECC evaluate.classifier_margin).
-	got := map[int]float64{}
-	floor := math.Inf(1)
-	for _, t := range out.Probs[0].TopLogprobs {
-		got[t.ID] = t.Logprob
-		floor = min(floor, t.Logprob)
-	}
-	lb, okB := got[m.ban]
-	lo, okO := got[m.ok]
-	if !okB && !okO {
-		return nil, errNoAnswer
-	}
-	if !okB {
-		lb = floor
-	}
-	if !okO {
-		lo = floor
-	}
-	margin := lb - lo
-	return &scoreResponse{
-		PBan:      1 / (1 + math.Exp(-(b.Platt.A*margin + b.Platt.B))),
-		Margin:    margin,
-		Version:   b.Version,
-		Earlier:   earlier,
-		Tokens:    tokens,
-		Evaluated: out.Timings.PromptN,
-	}, nil
+	s.acts.ack(req.ID, *req.OK, req.Detail)
+	writeJSON(w, http.StatusOK, struct{}{})
 }
 
 type hostStatus struct {
-	Status  string         `json:"status"`
-	Version string         `json:"version,omitempty"`
-	Wandb   *wandbStatus   `json:"wandb"` // null when no W&B key is set
-	Bedrock *bedrockStatus `json:"bedrock"`
-	Safety  safetyStatus   `json:"safety"`
+	Status         string         `json:"status"`
+	Version        string         `json:"version,omitempty"`
+	Scorer         string         `json:"scorer"`
+	Wandb          *wandbStatus   `json:"wandb"` // null when no W&B key is set
+	Judge          *bedrockStatus `json:"judge"`
+	Spend          spendStatus    `json:"spend"`
+	Sittings       core.Status    `json:"sittings"`
+	Unacknowledged int            `json:"unacknowledged_actions"`
 }
 
-// safetyStatus is chat safety's state: Backlog counts the messages waiting to be scored, Paused says why scoring
-// waits ("" while it runs), Pending lists the muted players awaiting a verdict, and Unacknowledged counts the
-// actions Module-ECC has not confirmed.
-type safetyStatus struct {
-	Backlog        int        `json:"backlog"`
-	Paused         string     `json:"paused,omitempty"`
-	Pending        []string   `json:"pending"`
-	SlowCheck      slowStatus `json:"slow_check"`
-	Unacknowledged int        `json:"unacknowledged_actions"`
-}
-
-// handleStatus is 200 when a bundle is served and its llama-server answers its own health check, otherwise 503,
-// with the same body.
+// handleStatus is 200 when a bundle is served, otherwise 503, with the same body.
 func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
-	s.mu.Lock()
-	m := s.cur
-	s.mu.Unlock()
-	h := hostStatus{Status: "ready", Bedrock: s.br.status()}
+	h := hostStatus{Status: "ready", Scorer: s.scorerIs, Judge: s.br.status(), Spend: s.spend.status(),
+		Unacknowledged: s.acts.count()}
 	if s.upd != nil {
 		h.Wandb = s.upd.status()
 	}
-	sf := s.safety
-	h.Safety.Backlog, h.Safety.Paused = sf.sc.state()
-	h.Safety.Pending = []string{}
-	for _, p := range sf.pend.players() {
-		h.Safety.Pending = append(h.Safety.Pending, p.Name)
+	code := http.StatusOK
+	s.mu.Lock()
+	if s.eng == nil {
+		h.Status, code = "no bundle", http.StatusServiceUnavailable
+	} else {
+		h.Version, h.Sittings = s.bundle.Version, s.eng.Status()
 	}
-	sortNames(h.Safety.Pending)
-	h.Safety.SlowCheck = sf.slow.status()
-	h.Safety.Unacknowledged = sf.acts.count()
-	code := http.StatusServiceUnavailable
-	switch {
-	case m == nil:
-		h.Status = "no bundle"
-	case !m.llama.healthy():
-		h.Status, h.Version = "llama-server unhealthy", m.bundle.Version
-	default:
-		h.Version, code = m.bundle.Version, http.StatusOK
-	}
+	s.mu.Unlock()
 	writeJSON(w, code, h)
 }
+
 func (s *server) handleSwitch(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Version string `json:"version"`
@@ -487,38 +425,24 @@ func (s *server) handleSwitch(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"version": req.Version})
 }
 
-// serve switches to an installed bundle without a gap in scoring: it starts and health-checks the new llama-server,
-// switches scoring and the served decision parameters over together, then stops the old one once its in-flight
-// messages finish. A bundle that fails to start is not activated and the current one keeps serving. The caller holds
-// switchMu.
+// serve switches to an installed bundle: a bundle that fails to load is not activated and the current one keeps
+// serving. The caller holds switchMu.
 func (s *server) serve(version string, byOperator bool) error {
 	s.mu.Lock()
-	old := s.cur
+	cur := s.bundle
 	s.mu.Unlock()
-	if old != nil && old.bundle.Version == version {
+	if cur != nil && cur.Version == version {
 		return nil
 	}
 	b, err := loadBundle(bundleDir(s.cfg, version))
 	if err != nil {
-		return err
-	}
-	m, err := startModel(s.cfg, b)
-	if err != nil {
-		slog.Error("bundle failed to start; keeping the current one", "version", version, "err", err)
+		slog.Error("bundle failed to load; keeping the current one", "version", version, "err", err)
 		return err
 	}
 	if err := activate(s.cfg, version, byOperator); err != nil {
-		m.llama.stop()
 		return err
 	}
-	s.mu.Lock()
-	s.cur = m
-	s.mu.Unlock()
-	if old != nil {
-		old.inflight.Wait()
-		old.llama.stop()
-		slog.Info("stopped the previous bundle's llama-server", "version", old.bundle.Version)
-	}
+	s.use(b)
 	return nil
 }
 

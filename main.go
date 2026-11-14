@@ -1,6 +1,7 @@
-// ECC-Server makes Module-ECC's chat-safety decisions: it scores chat messages with a classifier bundle served by a
-// llama-server child process, runs the slow check on Amazon Bedrock, keeps the record, and tells Module-ECC whom to
-// mute, unmute and ban, over HTTP with a shared token.
+// ECC-Server makes Module-ECC's chat-safety decisions: it gives every chat line a verdict before delivery, keeps
+// each player's sitting with its held lines, asks a judge on Amazon Bedrock for a ruling at the sitting's checkpoints
+// within a spend budget, keeps the record, and tells Module-ECC whom to ban or warn and which held lines to deliver,
+// over HTTP with a shared token.
 package main
 
 import (
@@ -21,31 +22,67 @@ var version = "dev"
 const defaultConfig = "/etc/ecc-server/config.toml"
 
 type Config struct {
-	Listen  string `toml:"listen"`
-	Data    string `toml:"data"`
-	Threads int    `toml:"threads"`
-	// A local llama-server binary to run instead of the bundle's llama.cpp release (development, or a host
-	// without a release build).
-	LlamaServer string `toml:"llama_server"`
+	Listen string `toml:"listen"`
+	Data   string `toml:"data"`
+	// This game server's name, written in every record line.
+	Server string `toml:"server"`
+	// How many days the daily records are kept.
+	RecordRetentionDays int `toml:"record_retention_days"`
 	// The W&B artifact whose `production` alias names the bundle to serve, and how often to check it.
 	WandbEntity   string        `toml:"wandb_entity"`
 	WandbProject  string        `toml:"wandb_project"`
 	WandbArtifact string        `toml:"wandb_artifact"`
 	CheckInterval time.Duration `toml:"check_interval"`
-	// The Bedrock region and model (a model or inference profile ID) the slow check calls.
-	BedrockRegion string `toml:"bedrock_region"`
-	BedrockModel  string `toml:"bedrock_model"`
-	// This game server's name, written in every record line.
-	Server string `toml:"server"`
-	// How many of a player's messages can wait to be scored; past this, their oldest waiting message is not scored.
-	QueueSize int `toml:"queue_size"`
-	// A banned player is kicked at a random time this long after the verdict.
-	KickDelayMin time.Duration `toml:"kick_delay_min"`
-	KickDelayMax time.Duration `toml:"kick_delay_max"`
-	// How long "not sure yet" verdicts may hold a player muted, not counting time while Bedrock fails.
-	HeldCap time.Duration `toml:"held_cap"`
-	// How many days the daily records are kept.
-	RecordRetentionDays int `toml:"record_retention_days"`
+
+	Judge  JudgeConfig  `toml:"judge"`
+	Budget BudgetConfig `toml:"budget"`
+	Chat   ChatConfig   `toml:"chat"`
+	Test   TestConfig   `toml:"test"`
+}
+
+// JudgeConfig is the Bedrock model the judge calls.
+type JudgeConfig struct {
+	Region string `toml:"region"`
+	Model  string `toml:"model"`
+	// ServiceTier is Bedrock's service tier: flex, default or priority.
+	ServiceTier     string        `toml:"service_tier"`
+	MaxOutputTokens int           `toml:"max_output_tokens"`
+	Timeout         time.Duration `toml:"timeout"`
+}
+
+// BudgetConfig caps what the judge's calls cost.
+type BudgetConfig struct {
+	DailyUSD   float64 `toml:"daily_usd"`
+	MonthlyUSD float64 `toml:"monthly_usd"`
+	// Standard-tier prices in dollars per million tokens; the server halves them on the flex tier.
+	InputPerMillion      float64 `toml:"input_per_million"`
+	OutputPerMillion     float64 `toml:"output_per_million"`
+	CacheReadPerMillion  float64 `toml:"cache_read_per_million"`
+	CacheWritePerMillion float64 `toml:"cache_write_per_million"`
+	// A prompt longer than this many characters is not sent; no more than MaxCallsPerDay calls are made in a UTC day.
+	MaxPromptChars int `toml:"max_prompt_chars"`
+	MaxCallsPerDay int `toml:"max_calls_per_day"`
+}
+
+// ChatConfig is the server's part of the decision settings; the bundle carries the rest.
+type ChatConfig struct {
+	TrustedGroups   []string `toml:"trusted_groups"`
+	AllowedLinks    []string `toml:"allowed_links"`
+	LinkPlaceholder string   `toml:"link_placeholder"`
+	// Set, these replace the bundle's checkpoint schedule, its every-n-th held line and its waiting time.
+	Schedule []int         `toml:"schedule"`
+	Every    int           `toml:"every"`
+	Wait     time.Duration `toml:"wait"`
+
+	setSchedule, setEvery, setWait bool
+}
+
+// TestConfig is for the end-to-end rig only.
+type TestConfig struct {
+	// HoldWordsFile names a file of words, one a line: the rig's scorer holds a line that contains one of them.
+	HoldWordsFile string `toml:"hold_words_file"`
+	// BedrockEndpoint replaces the Bedrock runtime endpoint (a local fake of the Converse API).
+	BedrockEndpoint string `toml:"bedrock_endpoint"`
 }
 
 var serverName = regexp.MustCompile(`^[a-z0-9_-]{1,32}$`)
@@ -54,10 +91,13 @@ var serverName = regexp.MustCompile(`^[a-z0-9_-]{1,32}$`)
 var regionName = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
 
 func loadConfig(path string) (Config, error) {
-	cfg := Config{Listen: "127.0.0.1:8790", Data: "/var/lib/ecc-server", Threads: 6, WandbEntity: "telesphoreo-telesphoreo",
-		WandbProject: "ecc", WandbArtifact: "classifier-bundle", CheckInterval: 10 * time.Minute,
-		BedrockRegion: "us-east-1", BedrockModel: "us.moonshotai.kimi-k3.1", QueueSize: 20, KickDelayMin: 2 * time.Minute,
-		KickDelayMax: 10 * time.Minute, HeldCap: 10 * time.Minute, RecordRetentionDays: 180}
+	cfg := Config{Listen: "127.0.0.1:8790", Data: "/var/lib/ecc-server", RecordRetentionDays: 180,
+		WandbEntity: "telesphoreo-telesphoreo", WandbProject: "ecc", WandbArtifact: "classifier-bundle",
+		CheckInterval: 10 * time.Minute,
+		Judge: JudgeConfig{Region: "us-east-1", Model: "us.moonshotai.kimi-k3.1", ServiceTier: "flex",
+			MaxOutputTokens: 8000, Timeout: 10 * time.Minute},
+		Budget: BudgetConfig{DailyUSD: 10, MonthlyUSD: 150, InputPerMillion: 4.40, OutputPerMillion: 22.00,
+			CacheReadPerMillion: 0.22, CacheWritePerMillion: 5.50, MaxPromptChars: 500000, MaxCallsPerDay: 2000}}
 	md, err := toml.DecodeFile(path, &cfg)
 	if err != nil {
 		return cfg, fmt.Errorf("config %s: %w", path, err)
@@ -65,38 +105,64 @@ func loadConfig(path string) (Config, error) {
 	if keys := md.Undecoded(); len(keys) > 0 {
 		return cfg, fmt.Errorf("config %s: unknown keys %v", path, keys)
 	}
-	if _, _, err := net.SplitHostPort(cfg.Listen); err != nil {
-		return cfg, fmt.Errorf("config %s: listen: %w", path, err)
+	cfg.Chat.setSchedule = md.IsDefined("chat", "schedule")
+	cfg.Chat.setEvery = md.IsDefined("chat", "every")
+	cfg.Chat.setWait = md.IsDefined("chat", "wait")
+	bad := func(format string, args ...any) (Config, error) {
+		return cfg, fmt.Errorf("config %s: "+format, append([]any{path}, args...)...)
 	}
-	if cfg.Threads < 1 {
-		return cfg, fmt.Errorf("config %s: threads must be at least 1", path)
+	if _, _, err := net.SplitHostPort(cfg.Listen); err != nil {
+		return bad("listen: %w", err)
 	}
 	if cfg.Data == "" {
-		return cfg, fmt.Errorf("config %s: data is empty", path)
+		return bad("data is empty")
 	}
 	if cfg.WandbEntity == "" || cfg.WandbProject == "" || cfg.WandbArtifact == "" {
-		return cfg, fmt.Errorf("config %s: wandb_entity, wandb_project and wandb_artifact must not be empty", path)
+		return bad("wandb_entity, wandb_project and wandb_artifact must not be empty")
 	}
 	if cfg.CheckInterval < time.Minute {
-		return cfg, fmt.Errorf("config %s: check_interval must be at least 1m", path)
-	}
-	if !regionName.MatchString(cfg.BedrockRegion) {
-		return cfg, fmt.Errorf("config %s: bedrock_region %q is not an AWS region name", path, cfg.BedrockRegion)
-	}
-	if cfg.BedrockModel == "" {
-		return cfg, fmt.Errorf("config %s: bedrock_model is empty", path)
+		return bad("check_interval must be at least 1m")
 	}
 	if !serverName.MatchString(cfg.Server) {
-		return cfg, fmt.Errorf("config %s: server %q must be 1 to 32 lowercase letters, digits, - or _", path, cfg.Server)
+		return bad("server %q must be 1 to 32 lowercase letters, digits, - or _", cfg.Server)
 	}
-	if cfg.QueueSize < 1 || cfg.RecordRetentionDays < 1 {
-		return cfg, fmt.Errorf("config %s: queue_size and record_retention_days must be at least 1", path)
+	if cfg.RecordRetentionDays < 3 {
+		return bad("record_retention_days must be at least 3")
 	}
-	if cfg.KickDelayMin < time.Second || cfg.KickDelayMax < cfg.KickDelayMin {
-		return cfg, fmt.Errorf("config %s: kick_delay_min must be at least 1s and kick_delay_max at least kick_delay_min", path)
+	j := cfg.Judge
+	switch {
+	case !regionName.MatchString(j.Region):
+		return bad("judge.region %q is not an AWS region name", j.Region)
+	case j.Model == "":
+		return bad("judge.model is empty")
+	case j.ServiceTier != "flex" && j.ServiceTier != "default" && j.ServiceTier != "priority":
+		return bad("judge.service_tier must be flex, default or priority")
+	case j.MaxOutputTokens < 16:
+		return bad("judge.max_output_tokens must be at least 16")
+	case j.Timeout < 10*time.Second:
+		return bad("judge.timeout must be at least 10s")
 	}
-	if cfg.HeldCap < time.Minute {
-		return cfg, fmt.Errorf("config %s: held_cap must be at least 1m", path)
+	b := cfg.Budget
+	for _, p := range []float64{b.DailyUSD, b.MonthlyUSD, b.InputPerMillion, b.OutputPerMillion, b.CacheReadPerMillion,
+		b.CacheWritePerMillion} {
+		if p < 0 {
+			return bad("budget amounts and prices must not be negative")
+		}
+	}
+	if b.MaxPromptChars < 1 || b.MaxCallsPerDay < 1 {
+		return bad("budget.max_prompt_chars and budget.max_calls_per_day must be at least 1")
+	}
+	c := cfg.Chat
+	for _, n := range c.Schedule {
+		if n < 1 {
+			return bad("chat.schedule counts must be at least 1")
+		}
+	}
+	if c.Every < 0 || c.Wait < 0 {
+		return bad("chat.every and chat.wait must not be negative")
+	}
+	if len(c.AllowedLinks) > 0 && c.LinkPlaceholder == "" {
+		return bad("chat.link_placeholder is empty while chat.allowed_links lists links")
 	}
 	return cfg, nil
 }
@@ -104,10 +170,10 @@ func loadConfig(path string) (Config, error) {
 const usage = `ecc-server <command> [-config FILE] [FOLDER]
 
   run              serve the current bundle on the configured address
-  use FOLDER       install a bundle folder (model.gguf, bundle.json, manifest.json) and switch to it
+  use FOLDER       install a bundle folder (bundle.json, manifest.json and the files they name) and switch to it
   rollback         switch back to the previous bundle
   update           have the running host check W&B for a new production bundle now (run with sudo)
-  status           (run with sudo) print the running host's bundle, health, W&B updates, Bedrock calls, backlog, pending players and actions
+  status           (run with sudo) print the running host's bundle, health, W&B updates, judge calls, spend and sittings
   token            print the token Module-ECC needs (run with sudo)
   wandb login      store the W&B API key, encrypted for the service (run with sudo)
   wandb logout     remove the stored W&B API key (run with sudo)

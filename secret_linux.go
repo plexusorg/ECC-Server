@@ -5,30 +5,11 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"os/signal"
 	"strings"
 	"syscall"
-	"time"
 	"unsafe"
 )
-
-// childAttr has the kernel kill llama-server when the host dies, so a crashed host never leaves one running.
-func childAttr() *syscall.SysProcAttr {
-	return &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
-}
-
-func ownChildren() error { return nil }
-
-func stopChild(cmd *exec.Cmd, exited <-chan struct{}) {
-	_ = cmd.Process.Signal(syscall.SIGTERM)
-	select {
-	case <-exited:
-	case <-time.After(15 * time.Second):
-		_ = cmd.Process.Kill()
-		<-exited
-	}
-}
 
 func termios(fd uintptr, req uintptr, t *syscall.Termios) syscall.Errno {
 	_, _, e := syscall.Syscall(syscall.SYS_IOCTL, fd, req, uintptr(unsafe.Pointer(t)))

@@ -100,9 +100,9 @@ type savedJudge struct {
 	missing int
 }
 
-func (j *savedJudge) Rule(prompt string) (core.Answer, error) {
+func (j *savedJudge) Rule(job *core.Job) (core.Answer, error) {
 	j.asked++
-	a, ok := j.answers[core.PromptHash(prompt)]
+	a, ok := j.answers[job.Hash]
 	if !ok {
 		j.missing++
 		return core.Answer{}, errNoSavedAnswer
@@ -117,6 +117,7 @@ type replayRecorder struct {
 	sittings []core.SittingRecord
 	actions  map[string]int
 	reviews  int
+	repeats  int
 }
 
 func (r *replayRecorder) Record(kind string, v any) {
@@ -134,6 +135,8 @@ func (r *replayRecorder) Record(kind string, v any) {
 		r.actions[x.Kind]++
 	case core.ReviewRecord:
 		r.reviews++
+	case core.RepeatRecord:
+		r.repeats++
 	}
 }
 
@@ -258,7 +261,7 @@ func replay(args []string) error {
 				notSent++
 				res = eng.Rule(j, core.Answer{}, core.ErrNotSent)
 			} else {
-				a, err := judge.Rule(j.Prompt)
+				a, err := judge.Rule(j)
 				if err != nil && parity {
 					stop = fmt.Errorf("checkpoint %s#%d (sha256 %s): %w", j.Sitting, j.K, j.Hash, err)
 					return
@@ -382,6 +385,7 @@ type replaySummary struct {
 	NoAnswer       int            `json:"sent_without_a_saved_answer"`
 	Actions        map[string]int `json:"actions"`
 	Reviews        int            `json:"review_queue"`
+	Repeats        int            `json:"repeats"`
 	Parity         *parityResult  `json:"parity,omitempty"`
 	LiveComparison *liveResult    `json:"live,omitempty"`
 }
@@ -411,7 +415,7 @@ type liveResult struct {
 func summarize(mode string, rec *replayRecorder, judge *savedJudge, notSent int, exp expected,
 	answers map[string]savedAnswer, pyHeld map[string]bool) replaySummary {
 	s := replaySummary{Mode: mode, Sittings: len(rec.sittings), Outcomes: map[string]int{},
-		Checkpoints: map[string]int{}, Actions: rec.actions, Reviews: rec.reviews, NotSent: notSent,
+		Checkpoints: map[string]int{}, Actions: rec.actions, Reviews: rec.reviews, Repeats: rec.repeats, NotSent: notSent,
 		NoAnswer: judge.missing}
 	for _, st := range rec.sittings {
 		s.Outcomes[st.Outcome]++

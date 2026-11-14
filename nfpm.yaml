@@ -9,12 +9,12 @@ priority: optional
 maintainer: Telesphoreo <me@telesphoreo.me>
 description: |
   Chat-safety decisions for Module-ECC.
-  Scores chat with a classifier bundle served by a llama-server child process,
-  runs the slow check on Amazon Bedrock, keeps the daily record, and tells
-  Module-ECC over token-protected HTTP whom to mute, unmute and ban. Fetches the
-  bundle promoted to production from Weights & Biases.
+  Gives every chat line a verdict before delivery, keeps each player's sitting,
+  asks a judge on Amazon Bedrock for a ruling at the sitting's checkpoints within
+  a spend budget, keeps the daily record, and tells Module-ECC over
+  token-protected HTTP whom to ban or warn and which held lines to deliver.
+  Fetches the bundle promoted to production from Weights & Biases.
 depends:
-  - libgomp1
   - ca-certificates
 contents:
   - src: dist/ecc-server

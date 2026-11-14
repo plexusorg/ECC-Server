@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -11,58 +12,60 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
+
+	"ecc-server/core"
 )
 
-// Bundle is bundle.json, written by the pipeline's `uv run bundle`.
+// Bundle is bundle.json, written by the pipeline's `uv run bundle`, with the judge's texts it names.
 type Bundle struct {
 	Version string `json:"version"`
-	GGUF    string `json:"gguf"`
-	Platt   struct {
-		A float64 `json:"a"`
-		B float64 `json:"b"`
-	} `json:"platt"`
-	Prompt struct {
-		Header       string   `json:"header"`
-		WindowMin    int      `json:"window_min"`
-		WindowMax    int      `json:"window_max"`
-		WindowTokens int      `json:"window_tokens"`
-		Answers      []string `json:"answers"`
-		TopLogprobs  int      `json:"top_logprobs"`
-	} `json:"prompt"`
-	Decision Decision `json:"decision"`
-	// The slow check's system prompt, which the host sends to Bedrock (slowCheck), so the policy text stays out of
-	// Module-ECC's public code.
-	SlowCheck struct {
-		System string `json:"system"`
-	} `json:"slow_check"`
-	LlamaCpp struct {
-		Release string `json:"release"`
-		Asset   string `json:"asset"`
-		URL     string `json:"url"`
-		SHA256  string `json:"sha256"`
-	} `json:"llama_cpp"`
-	LlamaServerArgs []string `json:"llama_server_args"`
+	// The fast model's graphs and tokenizers, by name.
+	Graphs map[string]struct {
+		XML string `json:"xml"`
+		Bin string `json:"bin"`
+	} `json:"graphs"`
+	Tokenizers map[string]struct {
+		File string `json:"file"`
+	} `json:"tokenizers"`
+	// The fast model's conversation window: the last Lines lines within Seconds.
+	Context struct {
+		Lines   int `json:"lines"`
+		Seconds int `json:"seconds"`
+	} `json:"context"`
+	// The fast model's thresholds, logits: a line SH passes goes to C, which holds it at Hold[Default] or above.
+	Thresholds struct {
+		SHPass  *float64           `json:"sh_pass"`
+		Hold    map[string]float64 `json:"hold"`
+		Default string             `json:"default"`
+	} `json:"thresholds"`
+	Judge struct {
+		// question.md (the prompt's fixed strings, in a JSON block) and examples.json (the owner's cases).
+		Question string `json:"question"`
+		Examples string `json:"examples"`
+		// Checkpoints: after these held-line counts of a sitting, then every Every-th; when a held line has waited
+		// WaitSeconds; a sitting ends SittingEndSeconds after the player's leave; a sitting that ends with ReviewHeld
+		// held lines goes on the review queue.
+		Checkpoints struct {
+			Schedule          []int `json:"schedule"`
+			Every             int   `json:"every"`
+			WaitSeconds       int   `json:"wait_seconds"`
+			SittingEndSeconds int   `json:"sitting_end_seconds"`
+			ReviewHeld        int   `json:"review_held"`
+		} `json:"checkpoints"`
+		// Render: how a sitting is shown to the judge (core.Render).
+		Render struct {
+			Before    int               `json:"before"`
+			After     int               `json:"after"`
+			MaxChars  int               `json:"max_chars"`
+			CutBefore int               `json:"cut_before"`
+			CutAfter  int               `json:"cut_after"`
+			Kinds     map[string]string `json:"kinds"`
+		} `json:"render"`
+	} `json:"judge"`
 
-	dir string
-}
-
-// Decision holds the bundle's decision parameters: a message whose P(ban) is at or above trigger triggers its
-// speaker (the "single" window rule, the only one there is); clearing and corroboration are the slow check's
-// thresholds.
-type Decision struct {
-	WindowRule    string   `json:"window_rule"`
-	Trigger       *float64 `json:"trigger"`
-	Clearing      *float64 `json:"clearing"`
-	Corroboration *float64 `json:"corroboration"`
-}
-
-func (d Decision) valid() bool {
-	for _, p := range []*float64{d.Trigger, d.Clearing, d.Corroboration} {
-		if p == nil || *p < 0 || *p > 1 {
-			return false
-		}
-	}
-	return d.WindowRule == "single"
+	dir   string
+	texts core.Texts
 }
 
 type Manifest struct {
@@ -84,26 +87,141 @@ func readJSON(path string, v any) error {
 	return nil
 }
 
+// files is every file bundle.json names.
+func (b *Bundle) files() []string {
+	out := []string{b.Judge.Question, b.Judge.Examples}
+	for _, g := range b.Graphs {
+		out = append(out, g.XML, g.Bin)
+	}
+	for _, t := range b.Tokenizers {
+		out = append(out, t.File)
+	}
+	return out
+}
+
 func loadBundle(dir string) (*Bundle, error) {
 	var b Bundle
 	if err := readJSON(filepath.Join(dir, "bundle.json"), &b); err != nil {
 		return nil, err
 	}
-	p := b.Prompt
-	switch {
-	case len(p.Answers) != 2 || p.TopLogprobs < 2:
-		return nil, fmt.Errorf("bundle %s: prompt needs two answers and top_logprobs of at least 2", b.Version)
-	case p.WindowMin < 0 || p.WindowMax <= p.WindowMin || p.WindowTokens < 1:
-		return nil, fmt.Errorf("bundle %s: invalid window bounds", b.Version)
-	case b.GGUF == "" || filepath.Base(b.GGUF) != b.GGUF:
-		return nil, fmt.Errorf("bundle %s: gguf must be a file name in the bundle", b.Version)
-	case !b.Decision.valid():
-		return nil, fmt.Errorf("bundle %s: decision needs window_rule \"single\" and trigger, clearing and corroboration from 0 to 1", b.Version)
-	case b.SlowCheck.System == "":
-		return nil, fmt.Errorf("bundle %s: slow_check.system is missing or empty", b.Version)
+	bad := func(format string, args ...any) (*Bundle, error) {
+		return nil, fmt.Errorf("bundle %s: "+format, append([]any{b.Version}, args...)...)
 	}
-	b.dir = dir
+	for _, f := range b.files() {
+		if f == "" || !filepath.IsLocal(f) {
+			return bad("%q is not a file in the bundle", f)
+		}
+	}
+	t, cp, r := b.Thresholds, b.Judge.Checkpoints, b.Judge.Render
+	switch {
+	case b.Context.Lines < 1 || b.Context.Seconds < 1:
+		return bad("context needs lines and seconds")
+	case t.SHPass == nil || len(t.Hold) == 0:
+		return bad("thresholds need sh_pass and hold")
+	case len(cp.Schedule) == 0 || cp.Every < 0 || cp.WaitSeconds < 0 || cp.SittingEndSeconds < 1 || cp.ReviewHeld < 0:
+		return bad("judge.checkpoints needs schedule, every, wait_seconds, sitting_end_seconds and review_held")
+	case r.Before < 0 || r.After < 0 || r.MaxChars < 1 || r.CutBefore < 0 || r.CutAfter < 0:
+		return bad("judge.render needs before, after, max_chars, cut_before and cut_after")
+	}
+	if _, ok := t.Hold[t.Default]; !ok {
+		return bad("thresholds.default %q is not one of thresholds.hold", t.Default)
+	}
+	for _, n := range cp.Schedule {
+		if n < 1 {
+			return bad("judge.checkpoints.schedule counts must be at least 1")
+		}
+	}
+	texts, err := readJudgeTexts(filepath.Join(dir, b.Judge.Question), filepath.Join(dir, b.Judge.Examples))
+	if err != nil {
+		return bad("%w", err)
+	}
+	b.dir, b.texts = dir, texts
 	return &b, nil
+}
+
+// readJudgeTexts reads the judge's question and answer format from question.md's JSON block and the owner's cases
+// from examples.json, and checks that the prompt's fixed strings are the ones the core lays the prompt out with.
+func readJudgeTexts(questionPath, examplesPath string) (core.Texts, error) {
+	var t core.Texts
+	raw, err := os.ReadFile(questionPath)
+	if err != nil {
+		return t, err
+	}
+	raw = bytes.ReplaceAll(raw, []byte("\r\n"), []byte("\n"))
+	_, block, ok := strings.Cut(string(raw)+"\n", "\n```json\n")
+	if ok {
+		block, _, ok = strings.Cut(block, "\n```\n")
+	}
+	if !ok {
+		return t, fmt.Errorf("%s has no ```json block", questionPath)
+	}
+	var fixed struct {
+		Question  string `json:"QUESTION"`
+		Added     string `json:"ADDED"`
+		SepCases  string `json:"SEP_CASES"`
+		BlockSep  string `json:"BLOCK_SEP"`
+		SepNew    string `json:"SEP_NEW"`
+		SepFormat string `json:"SEP_FMT"`
+		Format    string `json:"FORMAT"`
+	}
+	if err := json.Unmarshal([]byte(block), &fixed); err != nil {
+		return t, fmt.Errorf("%s: %w", questionPath, err)
+	}
+	if fixed.Question == "" || fixed.Format == "" {
+		return t, fmt.Errorf("%s: QUESTION or FORMAT is empty", questionPath)
+	}
+	if fixed.SepCases != core.SepCases || fixed.BlockSep != core.BlockSep || fixed.SepNew != core.SepNew ||
+		fixed.SepFormat != core.SepFormat {
+		return t, fmt.Errorf("%s: the prompt's separators are not the ones this server lays the prompt out with", questionPath)
+	}
+	t.Question, t.Format = fixed.Question, fixed.Format
+	if fixed.Added != "" {
+		t.Question += "\n\n" + fixed.Added
+	}
+	var ex struct {
+		Header   string         `json:"header"`
+		Examples []core.Example `json:"examples"`
+	}
+	if err := readJSON(examplesPath, &ex); err != nil {
+		return t, err
+	}
+	if ex.Header != core.ExampleHeader {
+		return t, fmt.Errorf("%s: header %q is not the one this server writes, %q", examplesPath, ex.Header, core.ExampleHeader)
+	}
+	if len(ex.Examples) == 0 {
+		return t, fmt.Errorf("%s lists no cases", examplesPath)
+	}
+	for i, e := range ex.Examples {
+		if e.Ruling == "" || e.Text == "" {
+			return t, fmt.Errorf("%s: case %d has no ruling or text", examplesPath, i+1)
+		}
+	}
+	t.Examples = ex.Examples
+	return t, nil
+}
+
+// coreConfig is the decision core's configuration: the bundle's settings, with the config's trusted groups, links,
+// caps and any checkpoint settings it sets.
+func coreConfig(cfg Config, b *Bundle) core.Config {
+	cp, r := b.Judge.Checkpoints, b.Judge.Render
+	sec := func(n int) time.Duration { return time.Duration(n) * time.Second }
+	c := core.Config{Schedule: cp.Schedule, Every: cp.Every, Wait: sec(cp.WaitSeconds),
+		SittingEnd: sec(cp.SittingEndSeconds), TrustedGroups: cfg.Chat.TrustedGroups, ContextLines: b.Context.Lines,
+		ContextAge: sec(b.Context.Seconds), ReviewHeld: cp.ReviewHeld,
+		Render: core.Render{Before: r.Before, After: r.After, MaxChars: r.MaxChars, CutBefore: r.CutBefore,
+			CutAfter: r.CutAfter, Kinds: r.Kinds},
+		Links:          core.Links{Allowed: cfg.Chat.AllowedLinks, Placeholder: cfg.Chat.LinkPlaceholder},
+		MaxPromptChars: cfg.Budget.MaxPromptChars, MaxCallsPerDay: cfg.Budget.MaxCallsPerDay, Zone: time.UTC}
+	if cfg.Chat.setSchedule {
+		c.Schedule = cfg.Chat.Schedule
+	}
+	if cfg.Chat.setEvery {
+		c.Every = cfg.Chat.Every
+	}
+	if cfg.Chat.setWait {
+		c.Wait = cfg.Chat.Wait
+	}
+	return c
 }
 
 // ---------------------------------------------------------------- the bundle store
@@ -211,8 +329,10 @@ func installBundle(cfg Config, src string) (string, bool, error) {
 	if _, ok := m.Files["bundle.json"]; !ok {
 		return "", false, fmt.Errorf("%s: the manifest does not cover bundle.json", src)
 	}
-	if _, ok := m.Files[b.GGUF]; !ok {
-		return "", false, fmt.Errorf("%s: the manifest does not cover %s", src, b.GGUF)
+	for _, f := range b.files() {
+		if _, ok := m.Files[f]; !ok {
+			return "", false, fmt.Errorf("%s: the manifest does not cover %s", src, f)
+		}
 	}
 	dst := bundleDir(cfg, m.Version)
 	if _, err := os.Stat(dst); err == nil {

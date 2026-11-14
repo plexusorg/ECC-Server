@@ -3,6 +3,7 @@ package core
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"slices"
 	"strconv"
@@ -53,8 +54,12 @@ type Job struct {
 	Prompt string
 	Hash   string
 	Chars  int
-	end    int
-	day    string
+	// Mine is the ids of the player's lines the case shows, the lines a hold or ban may name; Cases is how many of the
+	// owner's cases the prompt lists.
+	Mine  []string
+	Cases int
+	end   int
+	day   string
 }
 
 // Result is what one call to the engine produced.
@@ -107,6 +112,15 @@ type Engine struct {
 	banned map[string]bool // accounts banned in this stream
 	calls  map[string]int
 	lines  int
+	// copies is each speaker's last line in each conversation and the time of its last copy, for repeats.
+	copies map[copyKey]lastCopy
+}
+
+type copyKey struct{ speaker, conversation string }
+
+type lastCopy struct {
+	en *entry
+	at time.Time
 }
 
 func NewEngine(cfg Config, texts Texts, scorer Scorer, rec Recorder) *Engine {
@@ -115,7 +129,40 @@ func NewEngine(cfg Config, texts Texts, scorer Scorer, rec Recorder) *Engine {
 	}
 	return &Engine{cfg: cfg, texts: texts, scorer: scorer, rec: rec, convs: map[string][]Line{},
 		open: map[string]*sitting{}, live: map[string]*sitting{}, online: map[string]bool{}, left: map[string]time.Time{},
-		closed: map[string]bool{}, banned: map[string]bool{}, calls: map[string]int{}}
+		closed: map[string]bool{}, banned: map[string]bool{}, calls: map[string]int{}, copies: map[copyKey]lastCopy{}}
+}
+
+// Swap replaces the configuration, the judge's texts and the scorer (a new bundle). Open sittings keep their lines
+// and rulings; their later checkpoints use the new texts and settings.
+func (e *Engine) Swap(cfg Config, texts Texts, scorer Scorer) {
+	if cfg.Zone == nil {
+		cfg.Zone = time.UTC
+	}
+	e.cfg, e.texts, e.scorer = cfg, texts, scorer
+}
+
+// Status is a count of the engine's state.
+type Status struct {
+	Stream   string `json:"stream"`
+	Sittings int    `json:"open_sittings"`
+	// Unruled counts the held lines of open sittings that no ruling covers yet; InFlight the judge calls running.
+	Unruled  int `json:"held_unruled"`
+	InFlight int `json:"judge_calls_in_flight"`
+}
+
+func (e *Engine) Status() Status {
+	var st Status
+	if e.st != nil {
+		st.Stream = e.st.name
+	}
+	for _, s := range e.open {
+		st.Sittings++
+		st.Unruled += len(s.held) - s.ruled
+		if s.inFlight != nil {
+			st.InFlight++
+		}
+	}
+	return st
 }
 
 // Records.
@@ -211,6 +258,7 @@ func (e *Engine) Start(name string, at time.Time) Result {
 	y, m, d := at.In(e.cfg.Zone).Date()
 	e.st = newStream(name, time.Date(y, m, d, 0, 0, 0, 0, e.cfg.Zone))
 	e.convs = map[string][]Line{}
+	e.copies = map[copyKey]lastCopy{}
 	e.closed = map[string]bool{}
 	e.banned = map[string]bool{}
 	e.online = map[string]bool{}
@@ -325,6 +373,14 @@ func (e *Engine) Line(l Line) Result {
 		y, m, d := l.Time.In(e.cfg.Zone).Date()
 		e.st = newStream(stamp(l.Time), time.Date(y, m, d, 0, 0, 0, 0, e.cfg.Zone))
 	}
+	key := copyKey{l.Account, l.Conversation}
+	if l.Account == "" {
+		key.speaker = "name:" + l.Name
+	}
+	if c, ok := e.copies[key]; ok && c.en.line.Text == l.Text && l.Time.Sub(c.at) <= RepeatWindow {
+		r.Verdict = e.repeat(key, c.en, l)
+		return r
+	}
 	if l.ID == "" {
 		l.ID = "L" + strconv.Itoa(e.st.next+1)
 	}
@@ -335,7 +391,12 @@ func (e *Engine) Line(l Line) Result {
 	rec := LineRecord{Stream: e.st.name, ID: l.ID, Time: stamp(l.Time), Channel: l.Channel,
 		Conversation: l.Conversation, Account: l.Account, Name: l.Name, Target: l.Target, Text: l.Text, Verdict: "deliver"}
 	en := &entry{line: l}
+	if l.Ref != "" {
+		en.refs = []string{l.Ref}
+	}
 	defer func() {
+		en.verdict = rec.Verdict
+		e.copies[key] = lastCopy{en, l.Time}
 		e.rec.Record("line", rec)
 		e.lines++
 		if e.lines%256 == 0 {
@@ -381,6 +442,39 @@ func (e *Engine) Line(l Line) Result {
 	}
 	r.Verdict = rec.Verdict
 	return r
+}
+
+// RepeatRecord is a line taken as a repeat of an earlier one: the earlier line's id, its count of sends with this
+// one, and the verdict this copy got.
+type RepeatRecord struct {
+	Stream  string `json:"stream"`
+	Of      string `json:"of"`
+	Time    string `json:"time"`
+	Account string `json:"account"`
+	Ref     string `json:"ref,omitempty"`
+	Sent    int    `json:"sent"`
+	Verdict string `json:"verdict"`
+}
+
+// repeat counts l as one more send of the line en and gives it that line's verdict: a held line's copy is held with
+// it and released with it, a copy of a line a ruling released is delivered. A repeat is not scored, adds no line to
+// the stream or a conversation's window, and is no new held line for the checkpoints.
+func (e *Engine) repeat(key copyKey, en *entry, l Line) string {
+	en.line.Sent++
+	e.copies[key] = lastCopy{en, l.Time}
+	verdict := en.verdict
+	if en.released {
+		verdict = "deliver"
+	}
+	if verdict == "hold" && l.Ref != "" {
+		en.refs = append(en.refs, l.Ref)
+	}
+	if s := e.open[en.sitting]; s != nil && !s.ending && l.Time.After(s.last) {
+		s.last = l.Time
+	}
+	e.rec.Record("repeat", RepeatRecord{Stream: e.st.name, Of: en.line.ID, Time: stamp(l.Time), Account: l.Account,
+		Ref: l.Ref, Sent: en.line.Sent, Verdict: verdict})
+	return verdict
 }
 
 func (e *Engine) sittingFor(l Line) *sitting {
@@ -456,7 +550,7 @@ func (e *Engine) checkpoint(s *sitting, reason string, end int) Result {
 	case err != nil:
 		cp.NotSent = err.Error()
 	default:
-		prompt := e.texts.prompt(c)
+		prompt := e.texts.prompt(c.text)
 		cp.Hash = PromptHash(prompt)
 		cp.Chars = utf8.RuneCountInString(prompt)
 		switch {
@@ -468,7 +562,7 @@ func (e *Engine) checkpoint(s *sitting, reason string, end int) Result {
 			cp.Sent = true
 			e.calls[day]++
 			job = &Job{Sitting: s.id, Account: s.account, K: covers, Reason: reason, Line: cp.Line, Prompt: prompt,
-				Hash: cp.Hash, Chars: cp.Chars, end: end, day: day}
+				Hash: cp.Hash, Chars: cp.Chars, Mine: c.mine, Cases: len(e.texts.Examples), end: end, day: day}
 		}
 	}
 	e.rec.Record("checkpoint", cp)
@@ -497,7 +591,7 @@ func (e *Engine) Rule(job *Job, a Answer, err error) Result {
 	switch {
 	case err != nil:
 		rr.Error = err.Error()
-		if err == ErrNotSent {
+		if errors.Is(err, ErrNotSent) {
 			e.calls[job.day]--
 		}
 		s.unjudged = true
@@ -511,14 +605,17 @@ func (e *Engine) Rule(job *Job, a Answer, err error) Result {
 		rr.Covers = len(covered)
 		switch ruling {
 		case RulingNothing:
-			var ids []string
+			var ids, refs []string
 			for _, p := range covered {
-				ids = append(ids, s.st.get(p).line.ID)
+				en := s.st.get(p)
+				en.released = true
+				ids = append(ids, en.line.ID)
+				refs = append(refs, en.refs...)
 			}
 			if len(ids) > 0 {
 				s.released = append(s.released, ids...)
 				r.Actions = append(r.Actions, Action{Kind: ActionRelease, Account: s.account, Name: s.name,
-					Sitting: s.id, Lines: ids})
+					Sitting: s.id, Lines: ids, Refs: refs})
 			}
 		case RulingHold:
 			s.kept += len(covered)
@@ -679,6 +776,11 @@ func (e *Engine) prune() {
 	for k, w := range e.convs {
 		if len(w) == 0 || e.now.Sub(w[len(w)-1].Time) > e.cfg.ContextAge {
 			delete(e.convs, k)
+		}
+	}
+	for k, c := range e.copies {
+		if e.now.Sub(c.at) > RepeatWindow {
+			delete(e.copies, k)
 		}
 	}
 }

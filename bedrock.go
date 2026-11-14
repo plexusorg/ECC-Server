@@ -17,18 +17,16 @@ import (
 
 const bedrockCredential = "ecc-server.bedrock-api-key"
 
-// The slow check's output cap. A login check asks for the least the model accepts (Kimi rejects fewer than 16).
-const (
-	slowCheckMaxTokens  = 8000
-	loginCheckMaxTokens = 16
-)
+// A login check asks for the least output the model accepts (Kimi rejects fewer than 16).
+const loginCheckMaxTokens = 16
 
 // bedrock calls Amazon Bedrock's Converse API with the Bedrock API key, a bearer token. Each call is one attempt.
 type bedrock struct {
-	key    string
-	region string
-	model  string
-	client *http.Client
+	key      string
+	region   string
+	model    string
+	endpoint string // https://bedrock-runtime.<region>.amazonaws.com, or the rig's fake
+	client   *http.Client
 
 	mu          sync.Mutex
 	st          bedrockStatus
@@ -39,17 +37,23 @@ type bedrockStatus struct {
 	KeySet   bool      `json:"key_set"`
 	Region   string    `json:"region"`
 	Model    string    `json:"model"`
+	Tier     string    `json:"service_tier"`
 	LastCall time.Time `json:"last_call,omitzero"`
-	Result   string    `json:"result,omitempty"` // "ok", or the failure's reason
+	Result   string    `json:"result,omitempty"` // "ok", or the failure
 }
 
-func newBedrock(key, region, model string) *bedrock {
+func newBedrock(key string, cfg Config) *bedrock {
+	endpoint := cfg.Test.BedrockEndpoint
+	if endpoint == "" {
+		endpoint = "https://bedrock-runtime." + cfg.Judge.Region + ".amazonaws.com"
+	}
 	return &bedrock{
-		key:    key,
-		region: region,
-		model:  model,
-		client: &http.Client{Timeout: 300 * time.Second},
-		st:     bedrockStatus{KeySet: key != "", Region: region, Model: model},
+		key:      key,
+		region:   cfg.Judge.Region,
+		model:    cfg.Judge.Model,
+		endpoint: strings.TrimSuffix(endpoint, "/"),
+		client:   &http.Client{},
+		st:       bedrockStatus{KeySet: key != "", Region: cfg.Judge.Region, Model: cfg.Judge.Model, Tier: cfg.Judge.ServiceTier},
 	}
 }
 
@@ -75,6 +79,9 @@ type converseRequest struct {
 	InferenceConfig struct {
 		MaxTokens int `json:"maxTokens"`
 	} `json:"inferenceConfig"`
+	ServiceTier *struct {
+		Type string `json:"type"`
+	} `json:"serviceTier,omitempty"`
 }
 
 type converseResponse struct {
@@ -94,21 +101,11 @@ type converseResponse struct {
 	} `json:"usage"`
 }
 
-type converseUsage struct {
-	InputTokens           int `json:"input_tokens"`
-	OutputTokens          int `json:"output_tokens"`
-	CacheReadInputTokens  int `json:"cache_read_input_tokens"`
-	CacheWriteInputTokens int `json:"cache_write_input_tokens"`
-}
-
-// converseAnswer is a 200 from Bedrock. A refusal or a token cap is still an answer; the slow check judges
-// StopReason and Text.
+// converseAnswer is a 200 from Bedrock. A refusal or a token cap is still an answer; the judge checks Text.
 type converseAnswer struct {
-	Version    string        `json:"version"` // the bundle whose slow-check system prompt was sent
-	Model      string        `json:"model"`
-	StopReason string        `json:"stop_reason"`
-	Text       string        `json:"text"` // every text block of the output message, joined
-	Usage      converseUsage `json:"usage"`
+	StopReason string
+	Text       string // every text block of the output message, joined
+	Usage      tokenUsage
 }
 
 // bedrockError is an answer from Bedrock other than 200, or a 200 whose body is not a Converse response.
@@ -130,16 +127,22 @@ func (e *bedrockError) auth() bool {
 	return e.Status == http.StatusUnauthorized || e.Status == http.StatusForbidden
 }
 
-// converse sends one user message to the model, with system as the system prompt when it is not empty.
-func (b *bedrock) converse(ctx context.Context, system, user string, maxTokens int) (*converseAnswer, error) {
+// converse sends one user message to the model, with system as the system prompt when it is not empty, on the
+// given service tier ("" for the account's default).
+func (b *bedrock) converse(ctx context.Context, system, user string, maxTokens int, tier string) (*converseAnswer, error) {
 	var body converseRequest
 	if system != "" {
 		body.System = []textBlock{{Text: system}}
 	}
 	body.Messages = []converseMessage{{Role: "user", Content: []textBlock{{Text: user}}}}
 	body.InferenceConfig.MaxTokens = maxTokens
+	if tier != "" {
+		body.ServiceTier = &struct {
+			Type string `json:"type"`
+		}{tier}
+	}
 	raw, _ := json.Marshal(body)
-	endpoint := fmt.Sprintf("https://bedrock-runtime.%s.amazonaws.com/model/%s/converse", b.region, url.PathEscape(b.model))
+	endpoint := b.endpoint + "/model/" + url.PathEscape(b.model) + "/converse"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(raw))
 	if err != nil {
 		return nil, err
@@ -177,99 +180,41 @@ func (b *bedrock) converse(ctx context.Context, system, user string, maxTokens i
 	for _, c := range out.Output.Message.Content {
 		text.WriteString(c.Text)
 	}
-	return &converseAnswer{
-		Model:      b.model,
-		StopReason: out.StopReason,
-		Text:       text.String(),
-		Usage:      converseUsage(out.Usage),
-	}, nil
+	u := out.Usage
+	return &converseAnswer{StopReason: out.StopReason, Text: text.String(),
+		Usage: tokenUsage{Input: u.InputTokens, Output: u.OutputTokens, CacheRead: u.CacheReadInputTokens,
+			CacheWrite: u.CacheWriteInputTokens}}, nil
 }
 
-// Reasons a slow-check call has no answer.
-const (
-	reasonNoBundle    = "no_bundle"           // no bundle is served, so there is no system prompt
-	reasonNoKey       = "no_key"              // no Bedrock key is set
-	reasonAuth        = "bedrock_auth"        // Bedrock answered 401 or 403: an invalid or expired key, or no access to the model
-	reasonError       = "bedrock_error"       // any other answer than 200: throttling, 5xx, validation
-	reasonUnreachable = "bedrock_unreachable" // a network error or the 300 s timeout
-)
-
-// converseError is a slow-check call without an answer; it wraps the *bedrockError when Bedrock answered.
-type converseError struct {
-	Reason string
-	err    error
-}
-
-func (e *converseError) Error() string { return e.err.Error() }
-func (e *converseError) Unwrap() error { return e.err }
-
-// slowCheck makes the slow check's Bedrock call: the served bundle's slow_check.system as the system prompt and user
-// as the one user message, capped at 8000 output tokens. It runs alongside scoring and other calls; it holds no
-// llama-server slot. A failure is a *converseError. One attempt: the caller retries.
-func (s *server) slowCheck(ctx context.Context, user string) (*converseAnswer, error) {
-	s.mu.Lock()
-	m := s.cur
-	s.mu.Unlock()
-	if m == nil {
-		return nil, &converseError{Reason: reasonNoBundle, err: errors.New("no bundle is being served")}
-	}
-	if s.br.key == "" {
-		return nil, &converseError{Reason: reasonNoKey, err: errors.New("no Bedrock key is set; set one with sudo ecc-server bedrock login")}
-	}
-	start := time.Now()
-	res, err := s.br.converse(ctx, m.bundle.SlowCheck.System, user, slowCheckMaxTokens)
-	if err == nil {
-		res.Version = m.bundle.Version
-		s.br.record(nil, len(user), res, time.Since(start))
-		return res, nil
-	}
-	ce := &converseError{Reason: reasonUnreachable, err: fmt.Errorf("Bedrock is unreachable: %w", err)}
-	var be *bedrockError
-	switch {
-	case errors.As(err, &be) && be.auth():
-		ce = &converseError{Reason: reasonAuth,
-			err: fmt.Errorf("%w; set a valid key with access to %s with sudo ecc-server bedrock login", err, s.br.model)}
-	case errors.As(err, &be):
-		ce = &converseError{Reason: reasonError, err: err}
-	}
-	if ctx.Err() == nil { // a caller that gave up is not a Bedrock outage
-		s.br.record(ce, len(user), nil, time.Since(start))
-	}
-	return nil, ce
-}
-
-// record keeps a call's outcome for status and logs it: status and sizes only, since the system prompt, the user
-// text and the answer hold policy and player chat. A refused key is logged once per outage, with the fix.
-func (b *bedrock) record(ce *converseError, userBytes int, res *converseAnswer, took time.Duration) {
+// record keeps a judge call's outcome for status and logs it: sizes, tokens and cost only, since the prompt and the
+// answer hold the owner's cases and player chat. A refused key is logged once per outage, with the fix.
+func (b *bedrock) record(err error, promptBytes int, res *converseAnswer, cost float64, took time.Duration) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.st.LastCall = time.Now()
 	took = took.Round(time.Millisecond)
-	if ce == nil {
+	usd := fmt.Sprintf("%.4f", cost)
+	if err == nil {
 		b.st.Result = "ok"
 		if b.authFailing {
 			slog.Info("Bedrock accepts the key again")
 			b.authFailing = false
 		}
-		slog.Info("slow check call", "stop_reason", res.StopReason, "user_bytes", userBytes, "text_bytes", len(res.Text),
-			"input_tokens", res.Usage.InputTokens, "output_tokens", res.Usage.OutputTokens, "took", took.String())
+		slog.Info("judge call", "stop_reason", res.StopReason, "prompt_bytes", promptBytes, "text_bytes", len(res.Text),
+			"input_tokens", res.Usage.Input, "cache_read_tokens", res.Usage.CacheRead,
+			"cache_write_tokens", res.Usage.CacheWrite, "output_tokens", res.Usage.Output, "usd", usd,
+			"took", took.String())
 		return
 	}
-	b.st.Result = ce.Reason
+	b.st.Result = err.Error()
 	var be *bedrockError
-	switch {
-	case errors.As(ce, &be) && be.Type != "":
-		b.st.Result = fmt.Sprintf("%s (%d %s)", ce.Reason, be.Status, be.Type)
-	case be != nil:
-		b.st.Result = fmt.Sprintf("%s (%d)", ce.Reason, be.Status)
-	}
-	if ce.Reason == reasonAuth {
+	if errors.As(err, &be) && be.auth() {
 		if !b.authFailing {
-			slog.Error("Bedrock refused the key for the slow check; set a valid key with access to the model with sudo ecc-server bedrock login",
+			slog.Error("Bedrock refused the key for the judge; set a valid key with access to the model with sudo ecc-server bedrock login",
 				"status", be.Status, "type", be.Type, "model", b.model)
 			b.authFailing = true
 		}
 		return
 	}
-	slog.Warn("slow check call failed", "result", b.st.Result, "user_bytes", userBytes, "took", took.String())
+	slog.Warn("judge call failed", "err", err.Error(), "prompt_bytes", promptBytes, "usd", usd, "took", took.String())
 }

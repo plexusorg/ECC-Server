@@ -209,18 +209,6 @@ func (u *updater) fetch(ctx context.Context, a *wbArtifact) (string, error) {
 
 	u.s.switchMu.Lock()
 	defer u.s.switchMu.Unlock()
-	// The bundle's llama.cpp release is fetched before the bundle is judged: failing to download it says nothing
-	// about the bundle, so the staged files stay for the next check. Under switchMu, because serve fetches it too.
-	b, err := loadBundle(dir)
-	if err != nil {
-		os.RemoveAll(dir)
-		return "", bad("%w", err)
-	}
-	if cfg.LlamaServer == "" {
-		if _, err := llamaRelease(cfg, b); err != nil {
-			return "", err
-		}
-	}
 	defer os.RemoveAll(dir)
 	version, added, err := installBundle(cfg, dir)
 	if err != nil {

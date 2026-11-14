@@ -16,9 +16,9 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
-// recordLog is the day's record: one JSON line per message, decision, slow-check call, verdict, action and
-// acknowledgement, in <data>/record/YYYY-MM-DD.jsonl (UTC days). At midnight the day's file is compressed to
-// YYYY-MM-DD.jsonl.zst and compressed files past retention are deleted. Lines are written in the order they are
+// recordLog is the day's record: one JSON line per line, repeat, presence, sitting start and end, checkpoint, ruling,
+// action, acknowledgement and review entry, in <data>/record/YYYY-MM-DD.jsonl (UTC days). At midnight the day's file
+// is compressed to YYYY-MM-DD.jsonl.zst and compressed files past retention are deleted. Lines are written in the order they are
 // appended, each flushed at once, so a crash loses at most the line being written.
 type recordLog struct {
 	dir       string
