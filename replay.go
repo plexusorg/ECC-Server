@@ -38,25 +38,27 @@ sitting and a summary to DIR.
 
 // replayEvent is one line of the replay's input.
 type replayEvent struct {
-	Type          string   `json:"type"`
-	Name          string   `json:"name"`
-	Day           string   `json:"day"`
-	ID            string   `json:"id"`
-	Time          string   `json:"time"`
-	Channel       string   `json:"channel"`
-	Conversation  string   `json:"conversation"`
-	Private       bool     `json:"private"`
-	Account       string   `json:"account"`
-	Shown         string   `json:"name_shown"`
-	TargetAccount string   `json:"target_account"`
-	Target        string   `json:"target"`
-	Text          string   `json:"text"`
-	Sent          int      `json:"sent"`
-	Trusted       bool     `json:"trusted"`
-	Context       bool     `json:"context"`
-	Sitting       string   `json:"sitting"`
-	Verdict       string   `json:"verdict"`
-	Kinds         []string `json:"kinds"`
+	Type          string `json:"type"`
+	Name          string `json:"name"`
+	Day           string `json:"day"`
+	ID            string `json:"id"`
+	Time          string `json:"time"`
+	Channel       string `json:"channel"`
+	Conversation  string `json:"conversation"`
+	Private       bool   `json:"private"`
+	Account       string `json:"account"`
+	Shown         string `json:"name_shown"`
+	TargetAccount string `json:"target_account"`
+	Target        string `json:"target"`
+	Text          string `json:"text"`
+	// Speaker is the speaker's account name as the models know them (a Discord relay: "discord:" and the shown name).
+	Speaker string   `json:"speaker"`
+	Sent    int      `json:"sent"`
+	Trusted bool     `json:"trusted"`
+	Context bool     `json:"context"`
+	Sitting string   `json:"sitting"`
+	Verdict string   `json:"verdict"`
+	Kinds   []string `json:"kinds"`
 }
 
 type savedAnswer struct {
@@ -319,12 +321,15 @@ func replay(args []string) error {
 				return fmt.Errorf("line %s: %w", ev.ID, err)
 			}
 			last = t
+			if *bundle != "" && ev.Speaker == "" {
+				return fmt.Errorf("line %s has no speaker, which the models need", ev.ID)
+			}
 			sit := ev.Sitting
 			if !parity {
 				sit = ""
 			}
 			r := eng.Line(core.Line{ID: ev.ID, Time: t, Channel: ev.Channel, Conversation: ev.Conversation,
-				Private: ev.Private, Account: ev.Account, Name: ev.Shown, TargetAccount: ev.TargetAccount,
+				Private: ev.Private, Account: ev.Account, Name: ev.Shown, Speaker: ev.Speaker, TargetAccount: ev.TargetAccount,
 				Target: ev.Target, Text: ev.Text, Sent: ev.Sent, Context: ev.Context || ev.Trusted, Sitting: sit})
 			run(r)
 			if parity && ev.Sitting != "" && lastOf[ev.Sitting] == i {

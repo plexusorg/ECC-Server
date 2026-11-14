@@ -20,9 +20,11 @@ type Line struct {
 	// Private marks a two-player conversation (a private message): the judge sees it among that conversation's lines
 	// only.
 	Private bool
-	// Account is the speaker's player key (UUID); Name is the name shown with the line.
+	// Account is the speaker's player key (UUID); Name is the name shown with the line; Speaker is the speaker's
+	// account name, the key the fast model knows them by (a Discord relay: "discord:" and the shown name).
 	Account       string
 	Name          string
+	Speaker       string
 	TargetAccount string
 	Target        string
 	Text          string

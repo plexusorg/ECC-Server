@@ -349,7 +349,8 @@ All bodies are JSON. Module-ECC uses the first four; every endpoint needs the to
 `{"verdict": "deliver"}` or `{"verdict": "hold"}`. `id` is Module-ECC's own id for the line: Module-ECC keeps a held
 line by it until a `release` names it or a `ban` drops it, and a line sent again with the same id gets the same verdict
 and is not counted twice. `private` marks a two-player conversation; `target_uuid` and `target` are set for private
-messages and mail. A line with no `speaker_uuid`, or with `trusted: true`, is context only. `400`
+messages and mail. `speaker` is the player's account name, not a display name: the models tell players apart by it (a
+Discord relay's shown name). A line with no `speaker_uuid`, or with `trusted: true`, is context only. `400`
 names what is malformed; `503` while no bundle is served, or while 10,000 lines wait to be scored (Module-ECC asks
 again).
 

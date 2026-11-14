@@ -408,8 +408,12 @@ func (s *server) scoreLines() {
 		}
 		req := j.req
 		s.mu.Lock()
+		speaker := req.Speaker
+		if req.SpeakerUUID == "" {
+			speaker = "discord:" + speaker
+		}
 		l := core.Line{Ref: req.ID, Time: s.now(), Channel: req.Channel, Conversation: req.Conversation,
-			Private: req.Private, Account: req.SpeakerUUID, Name: req.Speaker, TargetAccount: req.TargetUUID,
+			Private: req.Private, Account: req.SpeakerUUID, Name: req.Speaker, Speaker: speaker, TargetAccount: req.TargetUUID,
 			Target: req.Target, Text: req.Text, Context: req.SpeakerUUID == "" || req.Trusted}
 		var res core.Result
 		scored, score := s.eng.Prepare(l)

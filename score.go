@@ -84,7 +84,7 @@ func scoreLines(args []string) error {
 		}
 		n++
 		l := core.Line{ID: x.ID, Stream: x.Stream, Time: time.Unix(x.Time, 0), Channel: x.Channel, Account: x.Author,
-			Name: x.Author, Target: x.Partner, Text: x.Text}
+			Name: x.Author, Speaker: x.Author, Target: x.Partner, Text: x.Text}
 		rec := map[string]any{"stream": x.Stream, "id": x.ID}
 		if x.ContextOnly {
 			sc.See(l)

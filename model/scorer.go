@@ -398,14 +398,11 @@ func (s *Scorer) remember(st *stream, e *entry) {
 }
 
 // entryOf is the line as the models see it: author and partner keys, whole seconds, SH's input ids. A line's author
-// key is the speaker's account name lowercased; a line with no account (a Discord relay) is "discord:" and the shown
-// name lowercased.
+// key is Line.Speaker lowercased: the speaker's account name, or for a Discord relay "discord:" and the shown name.
 func (s *Scorer) entryOf(l core.Line) *entry {
-	e := &entry{id: l.ID, time: l.Time.Unix(), channel: l.Channel, author: strings.ToLower(l.Name),
+	e := &entry{id: l.ID, time: l.Time.Unix(), channel: l.Channel, author: strings.ToLower(l.Speaker),
 		text: l.Text}
-	if l.Account == "" || l.Channel == "discord" {
-		e.author = "discord:" + e.author
-	}
+
 	if l.Channel == s.spec.Context.Private {
 		e.partner = strings.ToLower(l.Target)
 	}
