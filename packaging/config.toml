@@ -50,14 +50,6 @@ max_prompt_chars = 500000
 max_calls_per_day = 2000
 
 [chat]
-# LuckPerms groups whose lines are never held or judged: they are context for other players' lines only.
-trusted_groups = []
-
-# Links replaced by the placeholder before a line is scored: a host covers its subdomains, a host and path the paths
-# under it. The placeholder must be the one the bundle's models were trained with.
-allowed_links = []
-link_placeholder = ""
-
 # The bundle sets when the judge is called. Set these to replace its schedule (the held-line counts of a sitting that
 # bring a checkpoint), its every-n-th held line after the schedule (0: none) and how long a held line waits for a
 # ruling before it brings a checkpoint, for example:

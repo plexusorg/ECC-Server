@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -166,6 +167,11 @@ func (s *server) use(b *Bundle) {
 	defer s.mu.Unlock()
 	if s.eng == nil {
 		s.eng = core.NewEngine(cc, b.texts, s.scorer, s.recorder)
+		if allowed, err := loadLinks(s.cfg); err != nil {
+			slog.Error("the saved allowlist of links is not read; no link is replaced until the plugin's next start", "err", err)
+		} else if err := s.eng.AllowLinks(allowed); err != nil {
+			slog.Error("the saved allowlist of links is not used; no link is replaced until the plugin's next start", "err", err)
+		}
 	} else {
 		s.eng.Swap(cc, b.texts, s.scorer)
 	}
@@ -242,6 +248,23 @@ func (s *server) budgetUsedUp(e *errOverBudget) {
 			"sittings go to the review queue.", e.period, e.budget, until)})
 }
 
+// The plugin's allowlist of links from its last start, in <data>/links.json, so a restart of this server replaces the
+// same links before the plugin's next start.
+func linksPath(cfg Config) string { return filepath.Join(cfg.Data, "links.json") }
+
+func saveLinks(cfg Config, allowed []string) error {
+	data, _ := json.Marshal(allowed)
+	return writeAtomic(linksPath(cfg), data)
+}
+
+func loadLinks(cfg Config) ([]string, error) {
+	var allowed []string
+	if err := readJSON(linksPath(cfg), &allowed); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	return allowed, nil
+}
+
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -254,18 +277,19 @@ func writeError(w http.ResponseWriter, status int, err error) {
 
 var errNoBundle = errors.New("no bundle is being served")
 
-// lineRequest is one line from the plugin. A line with no speaker_uuid (a Discord relay) is context only.
+// lineRequest is one line from the plugin. A line with no speaker_uuid (a Discord relay) or from a trusted player,
+// which the plugin delivered at once, is context only.
 type lineRequest struct {
-	ID           string   `json:"id"`
-	Channel      string   `json:"channel"`
-	Conversation string   `json:"conversation"`
-	Private      bool     `json:"private"`
-	SpeakerUUID  string   `json:"speaker_uuid"`
-	Speaker      string   `json:"speaker"`
-	TargetUUID   string   `json:"target_uuid"`
-	Target       string   `json:"target"`
-	Text         string   `json:"text"`
-	Groups       []string `json:"groups"`
+	ID           string `json:"id"`
+	Channel      string `json:"channel"`
+	Conversation string `json:"conversation"`
+	Private      bool   `json:"private"`
+	SpeakerUUID  string `json:"speaker_uuid"`
+	Speaker      string `json:"speaker"`
+	TargetUUID   string `json:"target_uuid"`
+	Target       string `json:"target"`
+	Text         string `json:"text"`
+	Trusted      bool   `json:"trusted"`
 }
 
 // handleLine gives a line its verdict, timed by the host's clock on arrival.
@@ -284,7 +308,7 @@ func (s *server) handleLine(w http.ResponseWriter, r *http.Request) {
 	if !seen && s.eng != nil {
 		res := s.eng.Line(core.Line{Ref: req.ID, Time: s.now(), Channel: req.Channel, Conversation: req.Conversation,
 			Private: req.Private, Account: req.SpeakerUUID, Name: req.Speaker, TargetAccount: req.TargetUUID,
-			Target: req.Target, Text: req.Text, Groups: req.Groups, Context: req.SpeakerUUID == ""})
+			Target: req.Target, Text: req.Text, Context: req.SpeakerUUID == "" || req.Trusted})
 		s.dispatch(res)
 		verdict = res.Verdict
 		s.seen[req.ID] = verdict
@@ -302,12 +326,14 @@ func (s *server) handleLine(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"verdict": verdict})
 }
 
-// handlePresence takes the plugin's start (a new stream: every open sitting ends) and players' joins and leaves.
+// handlePresence takes the plugin's start (a new stream: every open sitting ends; the allowlist of links) and
+// players' joins and leaves.
 func (s *server) handlePresence(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Kind string `json:"kind"`
-		UUID string `json:"uuid"`
-		Name string `json:"name"`
+		Kind         string   `json:"kind"`
+		UUID         string   `json:"uuid"`
+		Name         string   `json:"name"`
+		AllowedLinks []string `json:"allowed_links"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -323,20 +349,30 @@ func (s *server) handlePresence(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, errNoBundle)
 		return
 	}
+	if req.Kind == "start" {
+		if err := s.eng.AllowLinks(req.AllowedLinks); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := saveLinks(s.cfg, req.AllowedLinks); err != nil {
+			slog.Error("could not save the allowlist of links; a restart replaces no link until the next start", "err", err)
+		}
+	}
 	now := s.now()
 	switch req.Kind {
 	case "start":
-		slog.Info("the game server started: a new stream, every open sitting ends")
+		slog.Info("the game server started: a new stream, every open sitting ends", "allowed_links", len(req.AllowedLinks))
 		s.dispatch(s.eng.Start(stamp(now), now))
 	default:
 		s.dispatch(s.eng.Presence(req.UUID, req.Kind == "join", now))
 	}
 	s.rec.append("presence", struct {
-		Time string `json:"time"`
-		Kind string `json:"kind"`
-		UUID string `json:"uuid,omitempty"`
-		Name string `json:"name,omitempty"`
-	}{stamp(now), req.Kind, req.UUID, req.Name})
+		Time         string   `json:"time"`
+		Kind         string   `json:"kind"`
+		UUID         string   `json:"uuid,omitempty"`
+		Name         string   `json:"name,omitempty"`
+		AllowedLinks []string `json:"allowed_links,omitempty"`
+	}{stamp(now), req.Kind, req.UUID, req.Name, req.AllowedLinks})
 	writeJSON(w, http.StatusOK, struct{}{})
 }
 

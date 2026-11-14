@@ -67,7 +67,8 @@ host reads:
 - `judge.checkpoints`: `schedule`, `every`, `wait_seconds`, `sitting_end_seconds`, `review_held` (see Sittings and
   checkpoints);
 - `judge.render`: how a sitting is shown to the judge: `before`, `after`, `max_chars`, `cut_before`, `cut_after`, and
-  `kinds`, the name the judge reads for each kind the fast model marks.
+  `kinds`, the name the judge reads for each kind the fast model marks;
+- `links.canonical`: the link the models were trained with in place of an allowed link (see A line).
 
 The config replaces only the checkpoint schedule, `every` and the wait when it sets them (see Configuration).
 
@@ -121,9 +122,14 @@ the earlier version in W&B also switches the host back, at its next check. With 
 
 **A line.** Module-ECC sends each line (`POST /line`) and waits for the verdict. The host times it by its own clock
 on arrival and numbers it `L<n>` in the current stream (a stream runs from one game server start to the next). A line
-with no speaker UUID (a Discord relay) or from a player in a trusted group is delivered and kept as context for other
-players' lines only. Every other line is scored by the fast model with its conversation's recent lines (the bundle's
-`context`), with allowlisted links replaced by the placeholder; a line the scorer cannot score is held.
+with no speaker UUID (a Discord relay) or marked `trusted` (Module-ECC delivered it at once: its speaker is in one of
+the module's trusted groups or holds the bypass permission) is kept as context for other players' lines only: never
+scored, held or judged, and in no sitting. Every other line is scored by the fast model with its conversation's recent
+lines (the bundle's `context`); a line the scorer cannot score is held. In the text the scorer sees, the line's and
+its context's, each link on the allowlist Module-ECC sends with `start` is replaced by the bundle's `links.canonical`:
+a domain covers its subdomains and every path on them, an exact URL only itself. The record and the judge see the
+original text. The host keeps the last allowlist in `<data>/links.json` for its next start; before any `start`, no link
+is replaced.
 
 **Repeats.** A speaker's line with the same text as their previous line in the same conversation, within 60 seconds
 of that line's last copy, is a repeat of it, as the training logs count repeats: it is not scored, it gets the verdict
@@ -245,8 +251,6 @@ A TOML file, `/etc/ecc-server/config.toml` unless `-config` names another. Unkno
 | `budget.input_per_million`, `output_per_million`, `cache_read_per_million`, `cache_write_per_million` | `4.40`, `22.00`, `0.22`, `5.50` | standard-tier prices in dollars per million tokens; halved on `flex` |
 | `budget.max_prompt_chars` | `500000` | a longer prompt is not sent |
 | `budget.max_calls_per_day` | `2000` | the most calls in a UTC day |
-| `chat.trusted_groups` | `[]` | LuckPerms groups whose lines are only context |
-| `chat.allowed_links`, `chat.link_placeholder` | `[]`, `""` | links replaced by the placeholder before scoring: a host covers its subdomains, a host and path the paths under it |
 | `chat.schedule`, `chat.every`, `chat.wait` | the bundle's | set, they replace the bundle's checkpoint schedule, every-n-th held line and wait |
 | `test.hold_words_file` | (none) | the test rig's scorer: a file of words, one a line; a line containing one is held |
 | `test.bedrock_endpoint` | (none) | replaces the Bedrock runtime endpoint, for the rig's fake |
@@ -317,16 +321,18 @@ All bodies are JSON. Module-ECC uses the first four; every endpoint needs the to
 `POST /line` with one line answers its verdict:
 
 ```json
-{"id": "<uuid>", "channel": "chat", "conversation": "chat", "private": false, "speaker_uuid": "<uuid>", "speaker": "Name", "target_uuid": "", "target": "", "text": "...", "groups": ["default"]}
+{"id": "<uuid>", "channel": "chat", "conversation": "chat", "private": false, "speaker_uuid": "<uuid>", "speaker": "Name", "target_uuid": "", "target": "", "text": "...", "trusted": false}
 ```
 
 `{"verdict": "deliver"}` or `{"verdict": "hold"}`. `id` is Module-ECC's own id for the line: Module-ECC keeps a held
 line by it until a `release` names it or a `ban` drops it, and a line sent again with the same id gets the same verdict
 and is not counted twice. `private` marks a two-player conversation; `target_uuid` and `target` are set for private
-messages and mail; `groups` are the speaker's LuckPerms groups. A line with no `speaker_uuid` is context only. `400`
+messages and mail. A line with no `speaker_uuid`, or with `trusted: true`, is context only. `400`
 names what is malformed; `503` while no bundle is served.
 
-`POST /presence` with `{"kind": "start"}` when Module-ECC starts (a new stream: every open sitting ends), or
+`POST /presence` with `{"kind": "start", "allowed_links": ["example.org", "https://discord.gg/<code>"]}` when Module-ECC
+starts (a new stream: every open sitting ends; the allowlist of links, `400` naming an entry that is not a domain or
+a URL), or
 `{"kind": "join" | "leave", "uuid": "<uuid>", "name": "Name"}`: `200 {}`.
 
 `GET /actions` long-polls: it answers as soon as there is an unacknowledged action, or after 30 seconds, with every
@@ -340,7 +346,7 @@ unacknowledged action, oldest first:
 | --- | --- | --- |
 | `ban` | `uuid`, `name` | ban the player indefinitely, kick them at once, drop their held lines |
 | `warn` | `uuid`, `name` | show the player the warning; their held lines stay held |
-| `release` | `uuid`, `name`, `ids` | deliver the held lines with these ids, in this order |
+| `release` | `uuid`, `name`, `ids` | deliver the held lines with these ids in the order they were written (the host lists them in that order, a repeat's id after its line's) |
 | `notice` | `kind`, `text` | show `text` to staff with the alert permission (`kind` `budget`: a judge budget is used up) |
 
 `POST /actions/ack` with `{"id": "...", "ok": true, "detail": "..."}` once an action is carried out: `200 {}`. Only

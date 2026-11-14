@@ -64,11 +64,9 @@ type BudgetConfig struct {
 	MaxCallsPerDay int `toml:"max_calls_per_day"`
 }
 
-// ChatConfig is the server's part of the decision settings; the bundle carries the rest.
+// ChatConfig is the server's part of the decision settings; the bundle carries the rest, and the plugin sends which
+// players are trusted and the allowlist of links.
 type ChatConfig struct {
-	TrustedGroups   []string `toml:"trusted_groups"`
-	AllowedLinks    []string `toml:"allowed_links"`
-	LinkPlaceholder string   `toml:"link_placeholder"`
 	// Set, these replace the bundle's checkpoint schedule, its every-n-th held line and its waiting time.
 	Schedule []int         `toml:"schedule"`
 	Every    int           `toml:"every"`
@@ -161,9 +159,7 @@ func loadConfig(path string) (Config, error) {
 	if c.Every < 0 || c.Wait < 0 {
 		return bad("chat.every and chat.wait must not be negative")
 	}
-	if len(c.AllowedLinks) > 0 && c.LinkPlaceholder == "" {
-		return bad("chat.link_placeholder is empty while chat.allowed_links lists links")
-	}
+
 	return cfg, nil
 }
 

@@ -49,7 +49,7 @@ type replayEvent struct {
 	Target        string   `json:"target"`
 	Text          string   `json:"text"`
 	Sent          int      `json:"sent"`
-	Groups        []string `json:"groups"`
+	Trusted       bool     `json:"trusted"`
 	Context       bool     `json:"context"`
 	Sitting       string   `json:"sitting"`
 	Verdict       string   `json:"verdict"`
@@ -304,7 +304,7 @@ func replay(args []string) error {
 			}
 			r := eng.Line(core.Line{ID: ev.ID, Time: t, Channel: ev.Channel, Conversation: ev.Conversation,
 				Private: ev.Private, Account: ev.Account, Name: ev.Shown, TargetAccount: ev.TargetAccount,
-				Target: ev.Target, Text: ev.Text, Sent: ev.Sent, Groups: ev.Groups, Context: ev.Context, Sitting: sit})
+				Target: ev.Target, Text: ev.Text, Sent: ev.Sent, Context: ev.Context || ev.Trusted, Sitting: sit})
 			run(r)
 			if parity && ev.Sitting != "" && lastOf[ev.Sitting] == i {
 				run(eng.End(ev.Sitting, t))
@@ -341,7 +341,7 @@ func replay(args []string) error {
 		return err
 	}
 
-	sum := summarize(*mode, rec, judge, notSent, exp, answers, parityHeldSets(events, cfg.TrustedGroups))
+	sum := summarize(*mode, rec, judge, notSent, exp, answers, parityHeldSets(events))
 	b, _ := json.MarshalIndent(sum, "", " ")
 	if err := os.WriteFile(filepath.Join(*outDir, "summary.json"), append(b, '\n'), 0o640); err != nil {
 		return err
@@ -351,7 +351,7 @@ func replay(args []string) error {
 }
 
 // parityHeldSets is each input sitting's held lines, keyed as summarize keys a replayed sitting's.
-func parityHeldSets(events []replayEvent, trusted []string) map[string]bool {
+func parityHeldSets(events []replayEvent) map[string]bool {
 	by := map[string][]string{}
 	stream := map[string]string{}
 	cur := ""
@@ -360,7 +360,7 @@ func parityHeldSets(events []replayEvent, trusted []string) map[string]bool {
 			cur = ev.Name
 			continue
 		}
-		if ev.Verdict == "hold" && !slices.ContainsFunc(ev.Groups, func(g string) bool { return slices.Contains(trusted, g) }) {
+		if ev.Verdict == "hold" && !ev.Trusted {
 			by[ev.Sitting] = append(by[ev.Sitting], ev.ID)
 			stream[ev.Sitting] = cur
 		}

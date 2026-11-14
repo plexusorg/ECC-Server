@@ -25,13 +25,12 @@ type Config struct {
 	LastHeldView bool `toml:"last_held_view"`
 	// DriverSittings takes sittings from Line.Sitting and ends them on End, in place of presence and SittingEnd.
 	DriverSittings bool `toml:"driver_sittings"`
-	// TrustedGroups are the groups whose lines are never held or judged, only context.
-	TrustedGroups []string `toml:"trusted_groups"`
 	// The fast model sees a conversation's last ContextLines lines within ContextAge.
 	ContextLines int           `toml:"context_lines"`
 	ContextAge   time.Duration `toml:"context_age"`
 	Render       Render        `toml:"render"`
-	Links        Links         `toml:"links"`
+	// CanonicalLink replaces each link on the plugin's allowlist (AllowLinks) in the text the fast model sees.
+	CanonicalLink string `toml:"canonical_link"`
 	// The spend cap: a prompt over MaxPromptChars characters is not sent, and no more than MaxCallsPerDay calls are
 	// made in a UTC day. 0 is no cap.
 	MaxPromptChars int `toml:"max_prompt_chars"`
@@ -99,6 +98,8 @@ type sitting struct {
 type Engine struct {
 	cfg    Config
 	texts  Texts
+	allow  []string
+	links  Links
 	scorer Scorer
 	rec    Recorder
 	now    time.Time
@@ -139,6 +140,18 @@ func (e *Engine) Swap(cfg Config, texts Texts, scorer Scorer) {
 		cfg.Zone = time.UTC
 	}
 	e.cfg, e.texts, e.scorer = cfg, texts, scorer
+	e.links, _ = NewLinks(e.allow, cfg.CanonicalLink)
+}
+
+// AllowLinks takes the plugin's allowlist of links: each link it covers is replaced by Config.CanonicalLink in the
+// text the fast model sees. Until it is called, no link is replaced.
+func (e *Engine) AllowLinks(allowed []string) error {
+	l, err := NewLinks(allowed, e.cfg.CanonicalLink)
+	if err != nil {
+		return err
+	}
+	e.allow, e.links = allowed, l
+	return nil
 }
 
 // Status is a count of the engine's state.
@@ -335,15 +348,6 @@ func compareStrings(a, b string) int {
 	return 0
 }
 
-func (e *Engine) trusted(groups []string) bool {
-	for _, g := range groups {
-		if slices.Contains(e.cfg.TrustedGroups, g) {
-			return true
-		}
-	}
-	return false
-}
-
 // context is the conversation's recent lines for the scorer, and the window with this line added.
 func (e *Engine) context(l Line) []Line {
 	w := e.convs[l.Conversation]
@@ -354,7 +358,7 @@ func (e *Engine) context(l Line) []Line {
 	w = w[cut:]
 	out := make([]Line, len(w))
 	for i, c := range w {
-		c.Text = e.cfg.Links.Replace(c.Text)
+		c.Text = e.links.Replace(c.Text)
 		out[i] = c
 	}
 	w = append(w, l)
@@ -403,7 +407,7 @@ func (e *Engine) Line(l Line) Result {
 			e.prune()
 		}
 	}()
-	if l.Context || e.trusted(l.Groups) {
+	if l.Context {
 		rec.Context = true
 		e.st.add(en)
 		r.Verdict = rec.Verdict
@@ -422,7 +426,7 @@ func (e *Engine) Line(l Line) Result {
 		return r
 	}
 	scored := l
-	scored.Text = e.cfg.Links.Replace(l.Text)
+	scored.Text = e.links.Replace(l.Text)
 	v, err := e.scorer.Score(scored, ctx)
 	if err != nil {
 		v = Verdict{Hold: true}

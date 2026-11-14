@@ -26,9 +26,9 @@ type Line struct {
 	Target        string
 	Text          string
 	// Sent is how many times the line was sent in a row (1 for a single send).
-	Sent   int
-	Groups []string
-	// Context marks a line that is no player's own (a Discord relay): it is context for other lines only.
+	Sent int
+	// Context marks a line that is context for other lines only: no player's own (a Discord relay), or a trusted
+	// player's, which the plugin delivered at once. It is never scored, held or judged and opens no sitting.
 	Context bool
 	// Sitting names the sitting the line belongs to when the driver defines sittings (Config.DriverSittings).
 	Sitting string
@@ -44,8 +44,8 @@ type Verdict struct {
 	Score float64
 }
 
-// Scorer is the fast model. It gets the line and its conversation's recent lines (oldest first), with allowlisted
-// links replaced by the placeholder.
+// Scorer is the fast model. It gets the line and its conversation's recent lines (oldest first), with each link on
+// the plugin's allowlist replaced by the canonical link.
 type Scorer interface {
 	Score(line Line, context []Line) (Verdict, error)
 }

@@ -63,6 +63,11 @@ type Bundle struct {
 			Kinds     map[string]string `json:"kinds"`
 		} `json:"render"`
 	} `json:"judge"`
+	// Links: the canonical link that replaces each link on the plugin's allowlist in the text the fast model sees,
+	// the one the models were trained with.
+	Links struct {
+		Canonical string `json:"canonical"`
+	} `json:"links"`
 
 	dir   string
 	texts core.Texts
@@ -122,6 +127,8 @@ func loadBundle(dir string) (*Bundle, error) {
 		return bad("judge.checkpoints needs schedule, every, wait_seconds, sitting_end_seconds and review_held")
 	case r.Before < 0 || r.After < 0 || r.MaxChars < 1 || r.CutBefore < 0 || r.CutAfter < 0:
 		return bad("judge.render needs before, after, max_chars, cut_before and cut_after")
+	case strings.TrimSpace(b.Links.Canonical) == "":
+		return bad("links.canonical is empty")
 	}
 	if _, ok := t.Hold[t.Default]; !ok {
 		return bad("thresholds.default %q is not one of thresholds.hold", t.Default)
@@ -200,18 +207,17 @@ func readJudgeTexts(questionPath, examplesPath string) (core.Texts, error) {
 	return t, nil
 }
 
-// coreConfig is the decision core's configuration: the bundle's settings, with the config's trusted groups, links,
-// caps and any checkpoint settings it sets.
+// coreConfig is the decision core's configuration: the bundle's settings, with the config's caps and any checkpoint
+// settings it sets.
 func coreConfig(cfg Config, b *Bundle) core.Config {
 	cp, r := b.Judge.Checkpoints, b.Judge.Render
 	sec := func(n int) time.Duration { return time.Duration(n) * time.Second }
 	c := core.Config{Schedule: cp.Schedule, Every: cp.Every, Wait: sec(cp.WaitSeconds),
-		SittingEnd: sec(cp.SittingEndSeconds), TrustedGroups: cfg.Chat.TrustedGroups, ContextLines: b.Context.Lines,
+		SittingEnd: sec(cp.SittingEndSeconds), ContextLines: b.Context.Lines,
 		ContextAge: sec(b.Context.Seconds), ReviewHeld: cp.ReviewHeld,
 		Render: core.Render{Before: r.Before, After: r.After, MaxChars: r.MaxChars, CutBefore: r.CutBefore,
 			CutAfter: r.CutAfter, Kinds: r.Kinds},
-		Links:          core.Links{Allowed: cfg.Chat.AllowedLinks, Placeholder: cfg.Chat.LinkPlaceholder},
-		MaxPromptChars: cfg.Budget.MaxPromptChars, MaxCallsPerDay: cfg.Budget.MaxCallsPerDay, Zone: time.UTC}
+		CanonicalLink: b.Links.Canonical, MaxPromptChars: cfg.Budget.MaxPromptChars, MaxCallsPerDay: cfg.Budget.MaxCallsPerDay, Zone: time.UTC}
 	if cfg.Chat.setSchedule {
 		c.Schedule = cfg.Chat.Schedule
 	}
