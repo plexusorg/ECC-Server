@@ -113,6 +113,7 @@ const usage = `ecc-server <command> [-config FILE] [FOLDER]
   wandb logout     remove the stored W&B API key (run with sudo)
   bedrock login    check the Amazon Bedrock API key and store it, encrypted for the service (run with sudo)
   bedrock logout   remove the stored Bedrock API key (run with sudo)
+  replay ...       feed recorded lines through the decision core (ecc-server replay -h)
   version          print the ecc-server version
 
 The config file defaults to ` + defaultConfig + `.
@@ -126,6 +127,12 @@ func main() {
 	cmd := os.Args[1]
 	if cmd == "version" && len(os.Args) == 2 {
 		fmt.Println(version)
+		return
+	}
+	if cmd == "replay" {
+		if err := replay(os.Args[2:]); err != nil {
+			fail(err)
+		}
 		return
 	}
 	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
