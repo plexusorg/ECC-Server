@@ -83,7 +83,9 @@ type recordedScorer struct {
 	verdicts map[string]core.Verdict
 }
 
-func (s *recordedScorer) Score(l core.Line, _ []core.Line) (core.Verdict, error) {
+func (s *recordedScorer) See(core.Line) {}
+
+func (s *recordedScorer) Score(l core.Line) (core.Verdict, error) {
 	v, ok := s.verdicts[l.ID]
 	if !ok {
 		return core.Verdict{}, fmt.Errorf("no recorded verdict for line %s", l.ID)

@@ -24,11 +24,8 @@ type Config struct {
 	// LastHeldView makes the sitting-end checkpoint show the sitting up to its last held line, not up to its end.
 	LastHeldView bool `toml:"last_held_view"`
 	// DriverSittings takes sittings from Line.Sitting and ends them on End, in place of presence and SittingEnd.
-	DriverSittings bool `toml:"driver_sittings"`
-	// The fast model sees a conversation's last ContextLines lines within ContextAge.
-	ContextLines int           `toml:"context_lines"`
-	ContextAge   time.Duration `toml:"context_age"`
-	Render       Render        `toml:"render"`
+	DriverSittings bool   `toml:"driver_sittings"`
+	Render         Render `toml:"render"`
 	// CanonicalLink replaces each link on the plugin's allowlist (AllowLinks) in the text the fast model sees.
 	CanonicalLink string `toml:"canonical_link"`
 	// The spend cap: a prompt over MaxPromptChars characters is not sent, and no more than MaxCallsPerDay calls are
@@ -104,7 +101,6 @@ type Engine struct {
 	rec    Recorder
 	now    time.Time
 	st     *stream
-	convs  map[string][]Line
 	open   map[string]*sitting
 	live   map[string]*sitting // the account's sitting, live sittings
 	online map[string]bool
@@ -128,7 +124,7 @@ func NewEngine(cfg Config, texts Texts, scorer Scorer, rec Recorder) *Engine {
 	if cfg.Zone == nil {
 		cfg.Zone = time.UTC
 	}
-	return &Engine{cfg: cfg, texts: texts, scorer: scorer, rec: rec, convs: map[string][]Line{},
+	return &Engine{cfg: cfg, texts: texts, scorer: scorer, rec: rec,
 		open: map[string]*sitting{}, live: map[string]*sitting{}, online: map[string]bool{}, left: map[string]time.Time{},
 		closed: map[string]bool{}, banned: map[string]bool{}, calls: map[string]int{}, copies: map[copyKey]lastCopy{}}
 }
@@ -194,7 +190,8 @@ type LineRecord struct {
 	Context      bool     `json:"context,omitempty"`
 	Verdict      string   `json:"verdict"`
 	Kinds        []string `json:"kinds,omitempty"`
-	Score        float64  `json:"score,omitempty"`
+	SH           *float64 `json:"sh,omitempty"`
+	C            *float64 `json:"c,omitempty"`
 	Why          string   `json:"why,omitempty"`
 }
 
@@ -270,7 +267,6 @@ func (e *Engine) Start(name string, at time.Time) Result {
 	}
 	y, m, d := at.In(e.cfg.Zone).Date()
 	e.st = newStream(name, time.Date(y, m, d, 0, 0, 0, 0, e.cfg.Zone))
-	e.convs = map[string][]Line{}
 	e.copies = map[copyKey]lastCopy{}
 	e.closed = map[string]bool{}
 	e.banned = map[string]bool{}
@@ -348,41 +344,78 @@ func compareStrings(a, b string) int {
 	return 0
 }
 
-// context is the conversation's recent lines for the scorer, and the window with this line added.
-func (e *Engine) context(l Line) []Line {
-	w := e.convs[l.Conversation]
-	cut := 0
-	for cut < len(w) && l.Time.Sub(w[cut].Time) > e.cfg.ContextAge {
-		cut++
+// streamFor makes the first stream when a line comes before any Start.
+func (e *Engine) streamFor(at time.Time) {
+	if e.st == nil {
+		y, m, d := at.In(e.cfg.Zone).Date()
+		e.st = newStream(stamp(at), time.Date(y, m, d, 0, 0, 0, 0, e.cfg.Zone))
 	}
-	w = w[cut:]
-	out := make([]Line, len(w))
-	for i, c := range w {
-		c.Text = e.links.Replace(c.Text)
-		out[i] = c
-	}
-	w = append(w, l)
-	if len(w) > e.cfg.ContextLines {
-		w = w[len(w)-e.cfg.ContextLines:]
-	}
-	e.convs[l.Conversation] = w
-	return out
 }
 
-// Line takes one line and gives its verdict.
-func (e *Engine) Line(l Line) Result {
-	r := e.advance(l.Time)
-	e.now = l.Time
-	if e.st == nil {
-		y, m, d := l.Time.In(e.cfg.Zone).Date()
-		e.st = newStream(stamp(l.Time), time.Date(y, m, d, 0, 0, 0, 0, e.cfg.Zone))
-	}
+func copyKeyOf(l Line) copyKey {
 	key := copyKey{l.Account, l.Conversation}
 	if l.Account == "" {
 		key.speaker = "name:" + l.Name
 	}
-	if c, ok := e.copies[key]; ok && c.en.line.Text == l.Text && l.Time.Sub(c.at) <= RepeatWindow {
-		r.Verdict = e.repeat(key, c.en, l)
+	return key
+}
+
+// repeatOf is the line l repeats, or nil.
+func (e *Engine) repeatOf(l Line) *entry {
+	if c, ok := e.copies[copyKeyOf(l)]; ok && c.en.line.Text == l.Text && l.Time.Sub(c.at) <= RepeatWindow {
+		return c.en
+	}
+	return nil
+}
+
+// barred tells whether the line's player is banned in this stream (their lines are held unscored).
+func (e *Engine) barred(l Line) bool {
+	if e.cfg.DriverSittings {
+		return e.closed[l.Sitting]
+	}
+	return e.banned[l.Account]
+}
+
+// Prepare tells whether Line would score l now, and gives the line as the scorer gets it: its stream and number set,
+// each allowlisted link replaced by the canonical one. A driver that scores outside the engine's lock scores that line
+// and hands the verdict to LineScored; for a line Prepare does not score it calls Line. No line may be taken between
+// a Prepare and its LineScored.
+func (e *Engine) Prepare(l Line) (Line, bool) {
+	e.streamFor(l.Time)
+	if l.Context || e.repeatOf(l) != nil || e.barred(l) {
+		return Line{}, false
+	}
+	return e.scorerLine(l), true
+}
+
+func (e *Engine) scorerLine(l Line) Line {
+	if l.ID == "" {
+		l.ID = "L" + strconv.Itoa(e.st.next+1)
+	}
+	l.Stream = e.st.name
+	l.Text = e.links.Replace(l.Text)
+	return l
+}
+
+// Line takes one line and gives its verdict, scoring it with the scorer.
+func (e *Engine) Line(l Line) Result { return e.line(l, nil) }
+
+// LineScored takes a line Prepare said to score, with the verdict (or the error) the driver got for it from the
+// scorer.
+func (e *Engine) LineScored(l Line, v Verdict, err error) Result { return e.line(l, &scored{v, err}) }
+
+type scored struct {
+	v   Verdict
+	err error
+}
+
+func (e *Engine) line(l Line, given *scored) Result {
+	r := e.advance(l.Time)
+	e.now = l.Time
+	e.streamFor(l.Time)
+	key := copyKeyOf(l)
+	if en := e.repeatOf(l); en != nil {
+		r.Verdict = e.repeat(key, en, l)
 		return r
 	}
 	if l.ID == "" {
@@ -391,7 +424,6 @@ func (e *Engine) Line(l Line) Result {
 	if l.Sent < 1 {
 		l.Sent = 1
 	}
-	ctx := e.context(l)
 	rec := LineRecord{Stream: e.st.name, ID: l.ID, Time: stamp(l.Time), Channel: l.Channel,
 		Conversation: l.Conversation, Account: l.Account, Name: l.Name, Target: l.Target, Text: l.Text, Verdict: "deliver"}
 	en := &entry{line: l}
@@ -408,6 +440,9 @@ func (e *Engine) Line(l Line) Result {
 		}
 	}()
 	if l.Context {
+		if given == nil {
+			e.scorer.See(e.scorerLine(l))
+		}
 		rec.Context = true
 		e.st.add(en)
 		r.Verdict = rec.Verdict
@@ -416,6 +451,9 @@ func (e *Engine) Line(l Line) Result {
 	s := e.sittingFor(l)
 	if s == nil {
 		// the player's sitting ended with a ban
+		if given == nil {
+			e.scorer.See(e.scorerLine(l))
+		}
 		en.sitting = l.Sitting
 		if !e.cfg.DriverSittings {
 			en.sitting = ""
@@ -425,18 +463,20 @@ func (e *Engine) Line(l Line) Result {
 		r.Verdict = rec.Verdict
 		return r
 	}
-	scored := l
-	scored.Text = e.links.Replace(l.Text)
-	v, err := e.scorer.Score(scored, ctx)
-	if err != nil {
-		v = Verdict{Hold: true}
-		rec.Why = "scorer: " + err.Error()
+	if given == nil {
+		v, err := e.scorer.Score(e.scorerLine(l))
+		given = &scored{v, err}
+	}
+	v := given.v
+	if given.err != nil {
+		v.Hold, v.Kinds = true, nil
+		rec.Why = "scorer: " + given.err.Error()
 	}
 	en.sitting, en.held, en.kinds = s.id, v.Hold, v.Kinds
 	e.st.add(en)
 	s.mine = append(s.mine, en.pos)
 	s.last = l.Time
-	rec.Sitting, rec.Kinds, rec.Score = s.id, v.Kinds, v.Score
+	rec.Sitting, rec.Kinds, rec.SH, rec.C = s.id, v.Kinds, v.SH, v.C
 	if v.Hold {
 		rec.Verdict = "hold"
 		s.held = append(s.held, en.pos)
@@ -777,11 +817,7 @@ func (e *Engine) prune() {
 		}
 	}
 	e.st.prune(max(0, from), back)
-	for k, w := range e.convs {
-		if len(w) == 0 || e.now.Sub(w[len(w)-1].Time) > e.cfg.ContextAge {
-			delete(e.convs, k)
-		}
-	}
+
 	for k, c := range e.copies {
 		if e.now.Sub(c.at) > RepeatWindow {
 			delete(e.copies, k)

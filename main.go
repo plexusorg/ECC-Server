@@ -176,6 +176,7 @@ const usage = `ecc-server <command> [-config FILE] [FOLDER]
   bedrock login    check the Amazon Bedrock API key and store it, encrypted for the service (run with sudo)
   bedrock logout   remove the stored Bedrock API key (run with sudo)
   replay ...       feed recorded lines through the decision core (ecc-server replay -h)
+  score ...        score a file of lines with a bundle's models, as the reference scorer does (ecc-server score -h)
   version          print the ecc-server version
 
 The config file defaults to ` + defaultConfig + `.
@@ -191,8 +192,12 @@ func main() {
 		fmt.Println(version)
 		return
 	}
-	if cmd == "replay" {
-		if err := replay(os.Args[2:]); err != nil {
+	if cmd == "replay" || cmd == "score" {
+		run := replay
+		if cmd == "score" {
+			run = scoreLines
+		}
+		if err := run(os.Args[2:]); err != nil {
 			fail(err)
 		}
 		return

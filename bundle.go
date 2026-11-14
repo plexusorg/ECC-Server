@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"ecc-server/core"
+	"ecc-server/model"
 )
 
 // Bundle is bundle.json, written by the pipeline's `uv run bundle`, with the judge's texts it names.
@@ -28,17 +29,7 @@ type Bundle struct {
 	Tokenizers map[string]struct {
 		File string `json:"file"`
 	} `json:"tokenizers"`
-	// The fast model's conversation window: the last Lines lines within Seconds.
-	Context struct {
-		Lines   int `json:"lines"`
-		Seconds int `json:"seconds"`
-	} `json:"context"`
-	// The fast model's thresholds, logits: a line SH passes goes to C, which holds it at Hold[Default] or above.
-	Thresholds struct {
-		SHPass  *float64           `json:"sh_pass"`
-		Hold    map[string]float64 `json:"hold"`
-		Default string             `json:"default"`
-	} `json:"thresholds"`
+
 	Judge struct {
 		// question.md (the prompt's fixed strings, in a JSON block) and examples.json (the owner's cases).
 		Question string `json:"question"`
@@ -71,6 +62,8 @@ type Bundle struct {
 
 	dir   string
 	texts core.Texts
+	// spec is the scoring part of bundle.json, as the fast model reads it.
+	spec *model.Spec
 }
 
 type Manifest struct {
@@ -117,12 +110,8 @@ func loadBundle(dir string) (*Bundle, error) {
 			return bad("%q is not a file in the bundle", f)
 		}
 	}
-	t, cp, r := b.Thresholds, b.Judge.Checkpoints, b.Judge.Render
+	cp, r := b.Judge.Checkpoints, b.Judge.Render
 	switch {
-	case b.Context.Lines < 1 || b.Context.Seconds < 1:
-		return bad("context needs lines and seconds")
-	case t.SHPass == nil || len(t.Hold) == 0:
-		return bad("thresholds need sh_pass and hold")
 	case len(cp.Schedule) == 0 || cp.Every < 0 || cp.WaitSeconds < 0 || cp.SittingEndSeconds < 1 || cp.ReviewHeld < 0:
 		return bad("judge.checkpoints needs schedule, every, wait_seconds, sitting_end_seconds and review_held")
 	case r.Before < 0 || r.After < 0 || r.MaxChars < 1 || r.CutBefore < 0 || r.CutAfter < 0:
@@ -130,8 +119,9 @@ func loadBundle(dir string) (*Bundle, error) {
 	case strings.TrimSpace(b.Links.Canonical) == "":
 		return bad("links.canonical is empty")
 	}
-	if _, ok := t.Hold[t.Default]; !ok {
-		return bad("thresholds.default %q is not one of thresholds.hold", t.Default)
+	spec, err := model.ReadSpec(dir)
+	if err != nil {
+		return bad("%w", err)
 	}
 	for _, n := range cp.Schedule {
 		if n < 1 {
@@ -142,7 +132,7 @@ func loadBundle(dir string) (*Bundle, error) {
 	if err != nil {
 		return bad("%w", err)
 	}
-	b.dir, b.texts = dir, texts
+	b.dir, b.texts, b.spec = dir, texts, spec
 	return &b, nil
 }
 
@@ -213,8 +203,7 @@ func coreConfig(cfg Config, b *Bundle) core.Config {
 	cp, r := b.Judge.Checkpoints, b.Judge.Render
 	sec := func(n int) time.Duration { return time.Duration(n) * time.Second }
 	c := core.Config{Schedule: cp.Schedule, Every: cp.Every, Wait: sec(cp.WaitSeconds),
-		SittingEnd: sec(cp.SittingEndSeconds), ContextLines: b.Context.Lines,
-		ContextAge: sec(b.Context.Seconds), ReviewHeld: cp.ReviewHeld,
+		SittingEnd: sec(cp.SittingEndSeconds), ReviewHeld: cp.ReviewHeld,
 		Render: core.Render{Before: r.Before, After: r.After, MaxChars: r.MaxChars, CutBefore: r.CutBefore,
 			CutAfter: r.CutAfter, Kinds: r.Kinds},
 		CanonicalLink: b.Links.Canonical, MaxPromptChars: cfg.Budget.MaxPromptChars, MaxCallsPerDay: cfg.Budget.MaxCallsPerDay, Zone: time.UTC}

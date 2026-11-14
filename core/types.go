@@ -11,8 +11,9 @@ import (
 
 // Line is one line as the plugin sends it, with the number the server gives it in its stream.
 type Line struct {
-	// ID is the line's number in its stream as the judge sees it ("L<n>").
+	// ID is the line's number in its stream as the judge sees it ("L<n>"); Stream names the stream (set by the engine).
 	ID           string
+	Stream       string
 	Time         time.Time
 	Channel      string
 	Conversation string
@@ -37,17 +38,21 @@ type Line struct {
 	Ref string
 }
 
-// Verdict is the fast model's verdict on one line and the kinds it marks, in the order the judge sees them.
+// Verdict is the fast model's verdict on one line, the kinds it marks (in the order the judge sees them), and its
+// scores when it gives them: SH's and, for a line SH passed, C's hold logit.
 type Verdict struct {
 	Hold  bool
 	Kinds []string
-	Score float64
+	SH    *float64
+	C     *float64
 }
 
-// Scorer is the fast model. It gets the line and its conversation's recent lines (oldest first), with each link on
-// the plugin's allowlist replaced by the canonical link.
+// Scorer is the fast model. It takes every line of the stream that is not a repeat, in the order the engine takes
+// them, with each link on the plugin's allowlist replaced by the canonical link: Score for a line to score, See for a
+// line that is only context for later lines. It keeps the context it needs from those lines itself.
 type Scorer interface {
-	Score(line Line, context []Line) (Verdict, error)
+	Score(line Line) (Verdict, error)
+	See(line Line)
 }
 
 // Rulings the judge gives.

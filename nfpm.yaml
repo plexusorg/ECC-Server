@@ -13,14 +13,49 @@ description: |
   asks a judge on Amazon Bedrock for a ruling at the sitting's checkpoints within
   a spend budget, keeps the daily record, and tells Module-ECC over
   token-protected HTTP whom to ban or warn and which held lines to deliver.
-  Fetches the bundle promoted to production from Weights & Biases.
+  Fetches the bundle promoted to production from Weights & Biases, and runs its
+  models on the CPU with the OpenVINO runtime it carries.
 depends:
   - ca-certificates
+  - libstdc++6
 contents:
   - src: dist/ecc-server
     dst: /usr/bin/ecc-server
     file_info:
       mode: 0755
+  # OpenVINO's runtime (package.sh takes it from OpenVINO's release archive); the server loads it from here.
+  - src: dist/openvino/libopenvino.so.2026.4.1
+    dst: /usr/lib/ecc-server/openvino/libopenvino.so.2026.4.1
+    file_info:
+      mode: 0644
+  - src: libopenvino.so.2026.4.1
+    dst: /usr/lib/ecc-server/openvino/libopenvino.so.2641
+    type: symlink
+  - src: dist/openvino/libopenvino_c.so.2026.4.1
+    dst: /usr/lib/ecc-server/openvino/libopenvino_c.so.2026.4.1
+    file_info:
+      mode: 0644
+  - src: libopenvino_c.so.2026.4.1
+    dst: /usr/lib/ecc-server/openvino/libopenvino_c.so.2641
+    type: symlink
+  - src: dist/openvino/libopenvino_ir_frontend.so.2026.4.1
+    dst: /usr/lib/ecc-server/openvino/libopenvino_ir_frontend.so.2026.4.1
+    file_info:
+      mode: 0644
+  - src: libopenvino_ir_frontend.so.2026.4.1
+    dst: /usr/lib/ecc-server/openvino/libopenvino_ir_frontend.so.2641
+    type: symlink
+  - src: dist/openvino/libopenvino_intel_cpu_plugin.so
+    dst: /usr/lib/ecc-server/openvino/libopenvino_intel_cpu_plugin.so
+    file_info:
+      mode: 0644
+  - src: dist/openvino/libtbb.so.12.13
+    dst: /usr/lib/ecc-server/openvino/libtbb.so.12.13
+    file_info:
+      mode: 0644
+  - src: libtbb.so.12.13
+    dst: /usr/lib/ecc-server/openvino/libtbb.so.12
+    type: symlink
   - src: packaging/ecc-server.service
     dst: /lib/systemd/system/ecc-server.service
     file_info:

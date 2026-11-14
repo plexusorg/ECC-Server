@@ -39,7 +39,9 @@ func newWordScorer(path string) (*wordScorer, error) {
 	return &w, nil
 }
 
-func (w *wordScorer) Score(l core.Line, _ []core.Line) (core.Verdict, error) {
+func (w *wordScorer) See(core.Line) {}
+
+func (w *wordScorer) Score(l core.Line) (core.Verdict, error) {
 	for _, f := range strings.FieldsFunc(strings.ToLower(l.Text), func(r rune) bool {
 		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
 	}) {
