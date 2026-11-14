@@ -26,7 +26,8 @@ judge's saved answers, and writes the record, one line per sitting and a summary
   -config  the core's settings (TOML: the [core] table of the server's config)
   -lines   the lines, one JSON event a line: {"type":"stream",...} or {"type":"line",...}
   -fold    question.md, format.md, cases.json, answers.json (sha256 of the prompt -> answer), expected.json
-  -mode    parity: sittings and the sitting-end checkpoint as the lines name them; checkpoints of sittings not in
+  -mode    parity: sittings and the sitting-end checkpoint as the lines name them, no waiting-time or every-n-th
+           checkpoint; checkpoints of sittings not in
            expected.json's judged_sittings are built and not sent, and a prompt with no saved answer stops the replay.
            live: sittings from presence and silence, the waiting-time checkpoint; a prompt with no saved answer is
            counted and its lines stay held.
@@ -190,7 +191,7 @@ func replay(args []string) error {
 	cfg := rc.Core
 	cfg.Zone = time.UTC
 	if parity {
-		cfg.DriverSittings, cfg.LastHeldView, cfg.Wait = true, true, 0
+		cfg.DriverSittings, cfg.LastHeldView, cfg.Wait, cfg.Every = true, true, 0, 0
 	} else {
 		cfg.DriverSittings, cfg.LastHeldView = false, false
 	}
@@ -337,13 +338,35 @@ func replay(args []string) error {
 		return err
 	}
 
-	sum := summarize(*mode, rec, judge, notSent, exp, answers)
+	sum := summarize(*mode, rec, judge, notSent, exp, answers, parityHeldSets(events, cfg.TrustedGroups))
 	b, _ := json.MarshalIndent(sum, "", " ")
 	if err := os.WriteFile(filepath.Join(*outDir, "summary.json"), append(b, '\n'), 0o640); err != nil {
 		return err
 	}
 	fmt.Println(string(b))
 	return nil
+}
+
+// parityHeldSets is each input sitting's held lines, keyed as summarize keys a replayed sitting's.
+func parityHeldSets(events []replayEvent, trusted []string) map[string]bool {
+	by := map[string][]string{}
+	stream := map[string]string{}
+	cur := ""
+	for _, ev := range events {
+		if ev.Type == "stream" {
+			cur = ev.Name
+			continue
+		}
+		if ev.Verdict == "hold" && !slices.ContainsFunc(ev.Groups, func(g string) bool { return slices.Contains(trusted, g) }) {
+			by[ev.Sitting] = append(by[ev.Sitting], ev.ID)
+			stream[ev.Sitting] = cur
+		}
+	}
+	out := map[string]bool{}
+	for s, ids := range by {
+		out[stream[s]+"/"+fmt.Sprint(ids)] = true
+	}
+	return out
 }
 
 type replaySummary struct {
@@ -376,13 +399,17 @@ type parityResult struct {
 
 type liveResult struct {
 	SameTextAsParity int `json:"checkpoints_with_a_parity_prompt"`
+	SameTextAnswered int `json:"of_them_with_a_saved_answer"`
 	DifferentText    int `json:"checkpoints_whose_text_differs"`
 	WithAnswer       int `json:"checkpoints_with_a_saved_answer"`
 	WithoutAnswer    int `json:"checkpoints_without_a_saved_answer"`
+	// live sittings with a held line whose held lines are exactly one parity sitting's, and the others
+	SameHeldLines  int `json:"sittings_holding_one_parity_sittings_lines"`
+	OtherHeldLines int `json:"sittings_holding_other_sets"`
 }
 
 func summarize(mode string, rec *replayRecorder, judge *savedJudge, notSent int, exp expected,
-	answers map[string]savedAnswer) replaySummary {
+	answers map[string]savedAnswer, pyHeld map[string]bool) replaySummary {
 	s := replaySummary{Mode: mode, Sittings: len(rec.sittings), Outcomes: map[string]int{},
 		Checkpoints: map[string]int{}, Actions: rec.actions, Reviews: rec.reviews, NotSent: notSent,
 		NoAnswer: judge.missing}
@@ -424,6 +451,9 @@ func summarize(mode string, rec *replayRecorder, judge *savedJudge, notSent int,
 			}
 			if parityHashes[c.Hash] {
 				lr.SameTextAsParity++
+				if _, ok := answers[c.Hash]; ok {
+					lr.SameTextAnswered++
+				}
 			} else {
 				lr.DifferentText++
 			}
@@ -432,6 +462,19 @@ func summarize(mode string, rec *replayRecorder, judge *savedJudge, notSent int,
 			} else {
 				lr.WithoutAnswer++
 			}
+		}
+	}
+	held := map[string][]string{}
+	for _, st := range rec.sittings {
+		if len(st.Held) > 0 {
+			held[st.Stream+"/"+fmt.Sprint(st.Held)] = st.Held
+		}
+	}
+	for k := range held {
+		if pyHeld[k] {
+			lr.SameHeldLines++
+		} else {
+			lr.OtherHeldLines++
 		}
 	}
 	s.LiveComparison = lr
