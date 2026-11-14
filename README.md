@@ -1,6 +1,6 @@
 # ECC-Server
 
-The chat-safety decision maker for Module-ECC. It is one static Go binary beside the game server. Module-ECC asks it
+The chat-safety decision maker for Module-ECC. It is one Go binary beside the game server, with the OpenVINO runtime\nits models run on. Module-ECC asks it
 for a verdict on every line a player writes before the line is delivered, and carries out the actions it gives; every
 decision is made here: the verdict on each line (`deliver` or `hold`), each player's sitting and its held lines, the
 checkpoints at which a judge (a model on Amazon Bedrock) reads the sitting and rules `nothing`, `hold` or `ban`, the
@@ -12,17 +12,22 @@ bundle the Module-ECC training pipeline writes; with a W&B API key, the host fet
 The decisions are made by the package `core/`, which has no clock, network or file of its own: the HTTP server drives
 it on the host's clock, and `ecc-server replay` drives it on a virtual clock over recorded lines.
 
-**The fast model.** This build has no runner for the bundle's models. `ecc-server run` starts only with the test
-rig's scorer (`[test] hold_words_file`, see Configuration), which holds a line that contains one of a file's words and
-logs a warning at every start that the server filters nothing. It exists for the end-to-end rig; never run it for a
-game server with players.
+**The fast model.** Two models score each line on the host's CPU: SH, a small model, on every line, and C, a large
+model, on the lines SH passes; C's score decides `hold` or `deliver`. They run in the server's process through
+OpenVINO's C API (no cgo: the binary loads `/usr/lib/ecc-server/openvino` at start), on Linux only. They take about
+4 GB of memory, 2.7 GB of it the graphs' weights mapped from the bundle's files. On another system `ecc-server run`
+starts only with the test rig's scorer (`[test] hold_words_file`, see Configuration), which holds a line that contains
+one of a file's words and logs a warning at every start that the server filters nothing; it exists for the end-to-end
+rig, never for a game server with players.
 
 ## Install (Debian, Ubuntu)
 
-ECC-Server is packaged as an amd64 `.deb` that depends on `ca-certificates` (the HTTPS calls to W&B and Bedrock). The
-package installs:
+ECC-Server is packaged as an amd64 `.deb` that depends on `ca-certificates` (the HTTPS calls to W&B and Bedrock) and
+`libstdc++6` (OpenVINO). The package installs:
 
-- `/usr/bin/ecc-server`, the static binary
+- `/usr/bin/ecc-server`, the binary
+- `/usr/lib/ecc-server/openvino/`, the five OpenVINO 2026.4.1 libraries the models run on (77 MB, from OpenVINO's
+  release archive), the release the bundles are exported with
 - `/lib/systemd/system/ecc-server.service`, which runs `ecc-server run` as the `ecc-server` user with
   `Restart=always`
 - `/etc/ecc-server/config.toml`, a config file dpkg keeps across upgrades (see Configuration)
@@ -54,12 +59,17 @@ W&B and Bedrock keys, and the `ecc-server` user.
 
 ## The bundle
 
-A bundle is a folder: `bundle.json`, `manifest.json` (every file's SHA-256 and size) and the files `bundle.json`
-names: the fast model's graphs and tokenizers, the judge's `question.md` and `examples.json`. From `bundle.json` the
-host reads:
+A bundle is a folder: `bundle.json`, `manifest.json` (every file's SHA-256 and size, by its path in the folder, such
+as `models/c.bin`) and the files `bundle.json` names: the fast model's graphs and tokenizers, the judge's
+`question.md` and `examples.json`. A manifest name that would leave the folder is refused. From `bundle.json` the host
+reads:
 
-- `context`: the fast model's window (`lines`, `seconds`);
-- `thresholds`: `sh_pass`, `hold` (by name) and `default`, the hold threshold to use;
+- `graphs`, `tokenizers`, `special_tokens`, `outputs`, `kinds`, `openvino` (the release and the compile
+  settings), `context` (the lists of earlier lines a line is scored with), `sh` and `c` (the models' inputs): how a
+  line is scored. The rules `bundle.json` states in words must be the ones this host implements (it compares their
+  SHA-256), or the bundle is refused;
+- `thresholds`: `sh_pass`, `hold` (by name) and `default`, the hold threshold to use, and, when set, `kinds`
+  (a threshold per kind on C's logits; without them no line is marked with a kind);
 - `judge.question`: `question.md`, whose `json` block holds the prompt's fixed strings (`QUESTION`, `ADDED`, `FORMAT`
   and the separators, which must be the ones the host lays the prompt out with, or the bundle is refused);
 - `judge.examples`: `examples.json`, the owner's ruled cases (`examples`: `id`, `ruling`, `date`, `text`) in the
@@ -124,8 +134,13 @@ the earlier version in W&B also switches the host back, at its next check. With 
 on arrival and numbers it `L<n>` in the current stream (a stream runs from one game server start to the next). A line
 with no speaker UUID (a Discord relay) or marked `trusted` (Module-ECC delivered it at once: its speaker is in one of
 the module's trusted groups or holds the bypass permission) is kept as context for other players' lines only: never
-scored, held or judged, and in no sitting. Every other line is scored by the fast model with its conversation's recent
-lines (the bundle's `context`); a line the scorer cannot score is held. In the text the scorer sees, the line's and
+scored, held or judged, and in no sitting. Every other line is scored by the fast model with the lines before it
+that the bundle's `context` names (the public lines, a private message's earlier messages between the same two players,
+a sign's or book's author's earlier placed lines: the last 30 within 30 minutes); a line the scorer cannot score is
+held. Lines are scored one at a time, in the order they arrive. A line still waiting for its verdict `[model] max_wait`
+after it arrived is held, unscored if its models have not run (a burst of lines is held rather than queued past the
+time Module-ECC waits), and a model call is cut off at that point or after `[model] call_timeout`. After a restart or
+a bundle switch, the first lines are scored with only the lines since as their context. In the text the scorer sees, the line's and
 its context's, each link on the allowlist Module-ECC sends with `start` is replaced by the bundle's `links.canonical`,
 the whole link with its scheme, port, path and the punctuation after it, as the models were trained: a domain covers
 its subdomains and every path on them, an exact URL only itself (with or without a scheme, a last `/` or punctuation
@@ -219,8 +234,9 @@ is: its lines stay held, its sitting goes to the review queue, and the first ref
 
 ## Building the package
 
-`./package.sh [version]` (needs Go; nothing else is installed) builds the static binary and runs nfpm, pinned to a
-version, into `dist/ecc-server_<version>_amd64.deb`, then prints the `telesphorepo publish` command for it. The version
+`./package.sh [version]` (needs Go, curl, GNU tar and sha256sum; nothing is installed) fetches OpenVINO's pinned
+release archive into `dist/` (once; checked against its published SHA-256) and takes the five libraries from it,
+builds the binary (`CGO_ENABLED=0`, from any system) and runs nfpm, pinned to a version, into `dist/ecc-server_<version>_amd64.deb`, then prints the `telesphorepo publish` command for it. The version
 is the argument, or else the `VERSION` file; `ecc-server version` prints it. Write a Debian version: `0.1.0` is a
 release, `0.1.0~dev.3` a pre-release that sorts before it. `telesphorepo.toml` sends versions containing `~` to
 `ecc-server-dev` and the rest to `ecc-server`.
@@ -244,6 +260,10 @@ A TOML file, `/etc/ecc-server/config.toml` unless `-config` names another. Unkno
 | `wandb_project` | `ecc` | W&B project holding the bundle artifact |
 | `wandb_artifact` | `classifier-bundle` | the artifact whose `production` alias names the bundle to serve |
 | `check_interval` | `"10m"` | time between W&B checks, at least `1m` |
+| `model.threads` | `6` | CPU threads of each model call (one runs at a time) |
+| `model.call_timeout` | `"800ms"` | a model call that takes longer is cut off and its line held |
+| `model.max_wait` | `"900ms"` | a line still waiting this long after it arrived is held; keep it under Module-ECC's `verdict_timeout_ms` |
+| `model.threshold` | the bundle's default | the name of the bundle's hold threshold to use (`thresholds.hold`) |
 | `judge.region` | `us-east-1` | AWS region of the Bedrock endpoint |
 | `judge.model` | `us.moonshotai.kimi-k3.1` | Bedrock model or inference profile ID |
 | `judge.service_tier` | `flex` | Bedrock service tier: `flex`, `default` or `priority` |
@@ -306,7 +326,7 @@ Every command except `version` and `replay` takes `-config FILE` before its argu
   W&B).
 - `ecc-server bedrock login`, `ecc-server bedrock logout`: store or delete the Amazon Bedrock API key (as root; see
   The judge on Amazon Bedrock).
-- `ecc-server replay ...`: see Replay.
+- `ecc-server replay ...`, `ecc-server score ...`: see Replay.
 - `ecc-server version`: print the package version.
 
 `use` and `rollback` refuse to run as root: run them as the service user (`sudo -u ecc-server ecc-server use ...`),
@@ -330,7 +350,8 @@ All bodies are JSON. Module-ECC uses the first four; every endpoint needs the to
 line by it until a `release` names it or a `ban` drops it, and a line sent again with the same id gets the same verdict
 and is not counted twice. `private` marks a two-player conversation; `target_uuid` and `target` are set for private
 messages and mail. A line with no `speaker_uuid`, or with `trusted: true`, is context only. `400`
-names what is malformed; `503` while no bundle is served.
+names what is malformed; `503` while no bundle is served, or while 10,000 lines wait to be scored (Module-ECC asks
+again).
 
 `POST /presence` with `{"kind": "start", "allowed_links": ["example.org", "https://discord.gg/<code>"]}` when Module-ECC
 starts (a new stream: every open sitting ends; the allowlist of links, `400` naming an entry that is not a domain or
@@ -356,7 +377,7 @@ unacknowledged action, oldest first:
 repeated or unknown id changes nothing.
 
 `GET /status` is `200` when a bundle is served, otherwise `503`; the body is the same either way: `status`, `version`
-(the bundle), `scorer`, `wandb` (`null` without a key, otherwise `artifact`, `last_check`, `result`, `production`,
+(the bundle), `scorer`, `lines_waiting` (lines queued for the models), `wandb` (`null` without a key, otherwise `artifact`, `last_check`, `result`, `production`,
 `production_digest`, and `download` with `file`, `done` and `total` bytes while one runs), `judge` (`key_set`,
 `region`, `model`, `service_tier`, and after the first call `last_call` and `result`), `spend` (`day`, `day_usd`,
 `daily_budget_usd`, `day_calls`, `month`, `month_usd`, `monthly_budget_usd`, `in_flight_reserved_usd`), `sittings`
@@ -374,4 +395,9 @@ decision core on a virtual clock, with the fast model's recorded verdicts and th
 SHA-256 of the prompt), and writes the record, one line per sitting and a summary to `DIR`. `-config` is a TOML file
 with the core's settings in a `[core]` table. Parity mode takes the sittings from the lines and checks every prompt
 and every sitting's outcome against the measured run; live mode makes sittings from presence and silence and uses the
-waiting-time checkpoint. `ecc-server replay -h` describes the inputs.
+waiting-time checkpoint. With `-bundle DIR` (`-threads`, `-threshold`) the bundle's models score every line in place
+of the recorded verdicts (Linux only). `ecc-server replay -h` describes the inputs.
+
+`ecc-server score -bundle DIR -in FILE -out FILE [-ids]` scores a file of lines with the bundle's models as the host
+does and writes the format of the training pipeline's reference scorer (`ecc.reference`), token ids and features
+included with `-ids`, to check the host against it (Linux only). `ecc-server score -h` describes the formats.

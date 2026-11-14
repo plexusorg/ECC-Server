@@ -177,13 +177,21 @@ func (w *wandb) artifact(ctx context.Context, name string) (*wbArtifact, error) 
 // errCorrupt marks a downloaded file whose content does not match W&B's digest.
 var errCorrupt = errors.New("corrupt download")
 
-// download fetches f into dir/<name>. The bytes go to dir/<name>.part first, which a later call resumes with a
-// range request; the file takes its name only once its size and MD5 match W&B's. progress gets the bytes written
-// so far.
+// download fetches f into dir/<name> (a name may have folders, "/" between them, and stays inside dir). The bytes go
+// to dir/<name>.part first, which a later call resumes with a range request; the file takes its name only once its
+// size and MD5 match W&B's. progress gets the bytes written so far.
 func (w *wandb) download(ctx context.Context, f wbFile, dir string, progress func(done int64)) error {
-	final := filepath.Join(dir, f.Name)
+	if f.Name != "manifest.json" {
+		if err := checkBundleName(f.Name); err != nil {
+			return err
+		}
+	}
+	final := filepath.Join(dir, filepath.FromSlash(f.Name))
 	if _, err := os.Stat(final); err == nil {
 		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(final), 0o755); err != nil {
+		return err
 	}
 	want, err := base64.StdEncoding.DecodeString(f.Digest)
 	if err != nil || len(want) != md5.Size {

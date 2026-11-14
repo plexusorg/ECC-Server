@@ -16,12 +16,15 @@ import (
 	"github.com/BurntSushi/toml"
 
 	"ecc-server/core"
+	"ecc-server/model"
 )
 
 const replayUsage = `ecc-server replay -config FILE -lines FILE -fold DIR -out DIR [-mode parity|live]
+                    [-bundle DIR [-threads 6] [-threshold NAME]]
 
-Feeds recorded lines through the decision core on a virtual clock, with the fast model's recorded verdicts and the
-judge's saved answers, and writes the record, one line per sitting and a summary to DIR.
+Feeds recorded lines through the decision core on a virtual clock, with the fast model's recorded verdicts (or, with
+-bundle, the bundle's models scoring every line) and the judge's saved answers, and writes the record, one line per
+sitting and a summary to DIR.
 
   -config  the core's settings (TOML: the [core] table of the server's config)
   -lines   the lines, one JSON event a line: {"type":"stream",...} or {"type":"line",...}
@@ -177,6 +180,9 @@ func replay(args []string) error {
 	foldDir := fs.String("fold", "", "")
 	outDir := fs.String("out", "", "")
 	mode := fs.String("mode", "parity", "")
+	bundle := fs.String("bundle", "", "")
+	threads := fs.Int("threads", 6, "")
+	threshold := fs.String("threshold", "", "")
 	_ = fs.Parse(args)
 	if *configPath == "" || *linesPath == "" || *foldDir == "" || *outDir == "" || fs.NArg() != 0 ||
 		(*mode != "parity" && *mode != "live") {
@@ -237,8 +243,21 @@ func replay(args []string) error {
 	defer rf.Close()
 	rec := &replayRecorder{w: bufio.NewWriterSize(rf, 1<<20), actions: map[string]int{}}
 	scorer := &recordedScorer{}
+	var sc core.Scorer = scorer
+	if *bundle != "" {
+		spec, err := model.ReadSpec(*bundle)
+		if err != nil {
+			return err
+		}
+		m, err := model.Open(*bundle, spec, model.Options{Threads: *threads, Threshold: *threshold})
+		if err != nil {
+			return err
+		}
+		defer m.Close()
+		sc = m
+	}
 	judge := &savedJudge{answers: answers}
-	eng := core.NewEngine(cfg, texts, scorer, rec)
+	eng := core.NewEngine(cfg, texts, sc, rec)
 
 	judged := map[string]bool{}
 	for _, s := range exp.JudgedSittings {

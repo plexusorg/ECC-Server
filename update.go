@@ -197,9 +197,9 @@ func (u *updater) fetch(ctx context.Context, a *wbArtifact) (string, error) {
 	}
 	if _, err := os.Stat(bundleDir(cfg, m.Version)); errors.Is(err, os.ErrNotExist) {
 		for name := range m.Files {
-			if filepath.Base(name) != name || name == "manifest.json" {
+			if err := checkBundleName(name); err != nil {
 				os.RemoveAll(dir)
-				return "", bad("manifest file %q is not a plain bundle file name", name)
+				return "", bad("%w", err)
 			}
 			if err := u.download(ctx, a.Digest, name, dir); err != nil {
 				return "", err
@@ -252,7 +252,7 @@ func pruneStaging(cfg Config, keep string) error {
 // A file whose content does not match W&B's digest is a bad bundle; any other failure leaves the partial file for
 // the next check to resume.
 func (u *updater) download(ctx context.Context, digest, name, dir string) error {
-	if _, err := os.Stat(filepath.Join(dir, name)); err == nil {
+	if _, err := os.Stat(filepath.Join(dir, filepath.FromSlash(name))); err == nil {
 		return nil
 	}
 	a, err := u.wb.artifact(ctx, u.s.cfg.WandbArtifact+":production")

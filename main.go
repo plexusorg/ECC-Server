@@ -34,10 +34,24 @@ type Config struct {
 	WandbArtifact string        `toml:"wandb_artifact"`
 	CheckInterval time.Duration `toml:"check_interval"`
 
+	Model  ModelConfig  `toml:"model"`
 	Judge  JudgeConfig  `toml:"judge"`
 	Budget BudgetConfig `toml:"budget"`
 	Chat   ChatConfig   `toml:"chat"`
 	Test   TestConfig   `toml:"test"`
+}
+
+// ModelConfig is how the bundle's models run on this host.
+type ModelConfig struct {
+	// Threads is each model's CPU threads.
+	Threads int `toml:"threads"`
+	// CallTimeout cuts off a model call that takes longer; its line is held.
+	CallTimeout time.Duration `toml:"call_timeout"`
+	// MaxWait: a line still waiting for its verdict this long after it arrived is held, unscored if its models have
+	// not run.
+	MaxWait time.Duration `toml:"max_wait"`
+	// Threshold names the bundle's hold threshold to use; empty is the bundle's default.
+	Threshold string `toml:"threshold"`
 }
 
 // JudgeConfig is the Bedrock model the judge calls.
@@ -92,6 +106,7 @@ func loadConfig(path string) (Config, error) {
 	cfg := Config{Listen: "127.0.0.1:8790", Data: "/var/lib/ecc-server", RecordRetentionDays: 180,
 		WandbEntity: "telesphoreo-telesphoreo", WandbProject: "ecc", WandbArtifact: "classifier-bundle",
 		CheckInterval: 10 * time.Minute,
+		Model:         ModelConfig{Threads: 6, CallTimeout: 800 * time.Millisecond, MaxWait: 900 * time.Millisecond},
 		Judge: JudgeConfig{Region: "us-east-1", Model: "us.moonshotai.kimi-k3.1", ServiceTier: "flex",
 			MaxOutputTokens: 8000, Timeout: 10 * time.Minute},
 		Budget: BudgetConfig{DailyUSD: 10, MonthlyUSD: 150, InputPerMillion: 4.40, OutputPerMillion: 22.00,
@@ -126,6 +141,9 @@ func loadConfig(path string) (Config, error) {
 	}
 	if cfg.RecordRetentionDays < 3 {
 		return bad("record_retention_days must be at least 3")
+	}
+	if m := cfg.Model; m.Threads < 1 || m.CallTimeout < 10*time.Millisecond || m.MaxWait < 10*time.Millisecond {
+		return bad("model.threads must be at least 1, model.call_timeout and model.max_wait at least 10ms")
 	}
 	j := cfg.Judge
 	switch {

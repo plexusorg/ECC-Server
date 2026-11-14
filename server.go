@@ -10,11 +10,13 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	goruntime "runtime"
 	"sync"
 	"syscall"
 	"time"
 
 	"ecc-server/core"
+	"ecc-server/model"
 )
 
 // Line ids remembered, so a resend after a lost answer gets the same verdict and is not counted twice.
@@ -29,33 +31,42 @@ type server struct {
 	spend    *spend
 	br       *bedrock
 	judge    core.Judge
-	scorer   core.Scorer
-	scorerIs string
-	upd      *updater // nil without a W&B key
+	words    *wordScorer // the rig's scorer, in place of the bundle's models
+	upd      *updater    // nil without a W&B key
 	switchMu sync.Mutex
 	jobs     sync.WaitGroup
+	// queue holds the lines waiting for the scoring worker, in arrival order.
+	queue chan *lineJob
 
 	// mu guards the engine and what follows; the engine is not safe for concurrent use.
-	mu      sync.Mutex
-	eng     *core.Engine // nil until a bundle is served
-	bundle  *Bundle
-	last    time.Time
-	seen    map[string]string
-	seenLog []string
+	mu       sync.Mutex
+	eng      *core.Engine // nil until a bundle is served
+	bundle   *Bundle
+	scorer   core.Scorer
+	models   *model.Scorer // the bundle's models; nil with the rig's scorer
+	scorerIs string
+	last     time.Time
+	seen     map[string]string
+	seenLog  []string
+	pending  map[string]*lineJob
 }
+
+// Lines waiting for the scoring worker at most; a line beyond is answered 503 and the plugin asks again.
+const queueCap = 10000
 
 func run(cfg Config) error {
 	ctx, stopped := context.WithCancel(context.Background())
 	defer stopped()
-	s := &server{cfg: cfg, ctx: ctx, seen: map[string]string{}}
-	if cfg.Test.HoldWordsFile == "" {
-		return errors.New("no scorer: the fast model's runner is not part of this build; the end-to-end rig sets [test] hold_words_file")
+	s := &server{cfg: cfg, ctx: ctx, seen: map[string]string{}, pending: map[string]*lineJob{},
+		queue: make(chan *lineJob, queueCap)}
+	var err error
+	if cfg.Test.HoldWordsFile != "" {
+		if s.words, err = newWordScorer(cfg.Test.HoldWordsFile); err != nil {
+			return err
+		}
+	} else if goruntime.GOOS != "linux" {
+		return errors.New("the models run on Linux hosts only; on this system only the end-to-end rig's scorer runs ([test] hold_words_file)")
 	}
-	ws, err := newWordScorer(cfg.Test.HoldWordsFile)
-	if err != nil {
-		return err
-	}
-	s.scorer, s.scorerIs = ws, "the test rig's word list (not a model)"
 	token, err := loadOrCreateToken(cfg)
 	if err != nil {
 		return fmt.Errorf("the token: %w", err)
@@ -105,7 +116,11 @@ func run(cfg Config) error {
 		if err != nil {
 			return err
 		}
-		s.use(b)
+		sc, err := s.scorerFor(b)
+		if err != nil {
+			return err
+		}
+		s.use(b, sc)
 	} else if s.upd != nil {
 		slog.Warn("no bundle installed; not ready until one is fetched from W&B")
 	} else {
@@ -134,6 +149,7 @@ func run(cfg Config) error {
 			"service_tier", cfg.Judge.ServiceTier, "endpoint", s.br.endpoint)
 	}
 	go s.tick()
+	go s.scoreLines()
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
@@ -159,21 +175,54 @@ func run(cfg Config) error {
 	return err
 }
 
-// use serves a bundle's judge texts and settings: the engine is made with the first bundle and takes later ones in
-// place, keeping its sittings.
-func (s *server) use(b *Bundle) {
+// scorerFor loads the bundle's models, or gives the rig's scorer when one is set.
+func (s *server) scorerFor(b *Bundle) (core.Scorer, error) {
+	if s.words != nil {
+		return s.words, nil
+	}
+	if b.specErr != nil {
+		return nil, fmt.Errorf("bundle %s: %w", b.Version, b.specErr)
+	}
+	m := s.cfg.Model
+	t0 := time.Now()
+	sc, err := model.Open(b.dir, b.spec, model.Options{Threads: m.Threads, CallLimit: m.CallTimeout, Threshold: m.Threshold})
+	if err != nil {
+		return nil, fmt.Errorf("bundle %s: the models: %w", b.Version, err)
+	}
+	slog.Info("models loaded", "bundle", b.Version, "seconds", fmt.Sprintf("%.1f", time.Since(t0).Seconds()),
+		"threads", m.Threads, "threshold", sc.Threshold())
+	if !sc.MarksKinds() {
+		slog.Warn("the bundle sets no kind thresholds; no line is marked with a kind", "bundle", b.Version)
+	}
+	return sc, nil
+}
+
+// use serves a bundle's judge texts, settings and scorer: the engine is made with the first bundle and takes later
+// ones in place, keeping its sittings. The previous bundle's models are freed once the line they are scoring, if any,
+// is done; the new models start with no context.
+func (s *server) use(b *Bundle, sc core.Scorer) {
 	cc := coreConfig(s.cfg, b)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	old := s.models
+	s.scorer, s.models = sc, nil
+	s.scorerIs = "the test rig's word list (not a model)"
+	if m, ok := sc.(*model.Scorer); ok {
+		s.models = m
+		s.scorerIs = "the bundle's models, hold threshold " + m.Threshold()
+	}
+	if old != nil {
+		go old.Close()
+	}
 	if s.eng == nil {
-		s.eng = core.NewEngine(cc, b.texts, s.scorer, s.recorder)
+		s.eng = core.NewEngine(cc, b.texts, sc, s.recorder)
 		if allowed, err := loadLinks(s.cfg); err != nil {
 			slog.Error("the saved allowlist of links is not read; no link is replaced until the plugin's next start", "err", err)
 		} else if err := s.eng.AllowLinks(allowed); err != nil {
 			slog.Error("the saved allowlist of links is not used; no link is replaced until the plugin's next start", "err", err)
 		}
 	} else {
-		s.eng.Swap(cc, b.texts, s.scorer)
+		s.eng.Swap(cc, b.texts, sc)
 	}
 	s.bundle = b
 	slog.Info("serving bundle", "version", b.Version, "cases", len(b.texts.Examples), "scorer", s.scorerIs)
@@ -292,7 +341,16 @@ type lineRequest struct {
 	Trusted      bool   `json:"trusted"`
 }
 
-// handleLine gives a line its verdict, timed by the host's clock on arrival.
+// lineJob is one line waiting for its verdict.
+type lineJob struct {
+	req     lineRequest
+	arrived time.Time
+	done    chan struct{}
+	verdict string
+}
+
+// handleLine gives a line its verdict. Lines are scored one at a time, in the order they arrive, by scoreLines; a
+// resent id gets the verdict its line got (or waits for it) and is not counted twice.
 func (s *server) handleLine(w http.ResponseWriter, r *http.Request) {
 	var req lineRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
@@ -304,26 +362,77 @@ func (s *server) handleLine(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.Lock()
-	verdict, seen := s.seen[req.ID]
-	if !seen && s.eng != nil {
-		res := s.eng.Line(core.Line{Ref: req.ID, Time: s.now(), Channel: req.Channel, Conversation: req.Conversation,
+	if verdict, ok := s.seen[req.ID]; ok {
+		s.mu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]string{"verdict": verdict})
+		return
+	}
+	j := s.pending[req.ID]
+	if j == nil {
+		if s.eng == nil {
+			s.mu.Unlock()
+			writeError(w, http.StatusServiceUnavailable, errNoBundle)
+			return
+		}
+		j = &lineJob{req: req, arrived: time.Now(), done: make(chan struct{})}
+		select {
+		case s.queue <- j:
+			s.pending[req.ID] = j
+		default:
+			s.mu.Unlock()
+			writeError(w, http.StatusServiceUnavailable, errors.New("too many lines are waiting to be scored"))
+			return
+		}
+	}
+	s.mu.Unlock()
+	select {
+	case <-j.done:
+		writeJSON(w, http.StatusOK, map[string]string{"verdict": j.verdict})
+	case <-r.Context().Done():
+	case <-s.ctx.Done():
+		writeError(w, http.StatusServiceUnavailable, errors.New("the server is stopping"))
+	}
+}
+
+// scoreLines is the scoring worker: it takes the queued lines in arrival order, one at a time, so that each line's
+// context is the lines before it and one model call runs at a time. A line is held unscored, though still context for
+// later lines, when it has waited [model] max_wait; a model call is cut off at that point or after
+// [model] call_timeout, and its line held. The engine's lock is not held while the models run.
+func (s *server) scoreLines() {
+	for {
+		var j *lineJob
+		select {
+		case <-s.ctx.Done():
+			return
+		case j = <-s.queue:
+		}
+		req := j.req
+		s.mu.Lock()
+		l := core.Line{Ref: req.ID, Time: s.now(), Channel: req.Channel, Conversation: req.Conversation,
 			Private: req.Private, Account: req.SpeakerUUID, Name: req.Speaker, TargetAccount: req.TargetUUID,
-			Target: req.Target, Text: req.Text, Context: req.SpeakerUUID == "" || req.Trusted})
+			Target: req.Target, Text: req.Text, Context: req.SpeakerUUID == "" || req.Trusted}
+		var res core.Result
+		scored, score := s.eng.Prepare(l)
+		if m := s.models; score && m != nil {
+			s.mu.Unlock()
+			d, err := m.ScoreBy(scored, j.arrived.Add(s.cfg.Model.MaxWait))
+			s.mu.Lock()
+			res = s.eng.LineScored(l, d.Verdict, err)
+		} else {
+			res = s.eng.Line(l)
+		}
 		s.dispatch(res)
-		verdict = res.Verdict
-		s.seen[req.ID] = verdict
+		j.verdict = res.Verdict
+		s.seen[req.ID] = res.Verdict
 		s.seenLog = append(s.seenLog, req.ID)
 		if len(s.seenLog) > seenIDs {
 			delete(s.seen, s.seenLog[0])
 			s.seenLog = s.seenLog[1:]
 		}
+		delete(s.pending, req.ID)
+		s.mu.Unlock()
+		close(j.done)
 	}
-	s.mu.Unlock()
-	if verdict == "" {
-		writeError(w, http.StatusServiceUnavailable, errNoBundle)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]string{"verdict": verdict})
 }
 
 // handlePresence takes the plugin's start (a new stream: every open sitting ends; the allowlist of links) and
@@ -419,6 +528,7 @@ type hostStatus struct {
 	Status         string         `json:"status"`
 	Version        string         `json:"version,omitempty"`
 	Scorer         string         `json:"scorer"`
+	Waiting        int            `json:"lines_waiting"`
 	Wandb          *wandbStatus   `json:"wandb"` // null when no W&B key is set
 	Judge          *bedrockStatus `json:"judge"`
 	Spend          spendStatus    `json:"spend"`
@@ -428,8 +538,8 @@ type hostStatus struct {
 
 // handleStatus is 200 when a bundle is served, otherwise 503, with the same body.
 func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
-	h := hostStatus{Status: "ready", Scorer: s.scorerIs, Judge: s.br.status(), Spend: s.spend.status(),
-		Unacknowledged: s.acts.count()}
+	h := hostStatus{Status: "ready", Judge: s.br.status(), Spend: s.spend.status(), Unacknowledged: s.acts.count(),
+		Waiting: len(s.queue)}
 	if s.upd != nil {
 		h.Wandb = s.upd.status()
 	}
@@ -438,7 +548,7 @@ func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if s.eng == nil {
 		h.Status, code = "no bundle", http.StatusServiceUnavailable
 	} else {
-		h.Version, h.Sittings = s.bundle.Version, s.eng.Status()
+		h.Version, h.Sittings, h.Scorer = s.bundle.Version, s.eng.Status(), s.scorerIs
 	}
 	s.mu.Unlock()
 	writeJSON(w, code, h)
@@ -471,14 +581,21 @@ func (s *server) serve(version string, byOperator bool) error {
 		return nil
 	}
 	b, err := loadBundle(bundleDir(s.cfg, version))
+	var sc core.Scorer
+	if err == nil {
+		sc, err = s.scorerFor(b)
+	}
 	if err != nil {
 		slog.Error("bundle failed to load; keeping the current one", "version", version, "err", err)
 		return err
 	}
 	if err := activate(s.cfg, version, byOperator); err != nil {
+		if m, ok := sc.(*model.Scorer); ok {
+			m.Close()
+		}
 		return err
 	}
-	s.use(b)
+	s.use(b, sc)
 	return nil
 }
 

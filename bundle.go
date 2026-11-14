@@ -62,8 +62,10 @@ type Bundle struct {
 
 	dir   string
 	texts core.Texts
-	// spec is the scoring part of bundle.json, as the fast model reads it.
-	spec *model.Spec
+	// spec is the scoring part of bundle.json, as the fast model reads it; specErr why it cannot be read. A bundle
+	// without one serves only with the test rig's scorer.
+	spec    *model.Spec
+	specErr error
 }
 
 type Manifest struct {
@@ -119,10 +121,7 @@ func loadBundle(dir string) (*Bundle, error) {
 	case strings.TrimSpace(b.Links.Canonical) == "":
 		return bad("links.canonical is empty")
 	}
-	spec, err := model.ReadSpec(dir)
-	if err != nil {
-		return bad("%w", err)
-	}
+
 	for _, n := range cp.Schedule {
 		if n < 1 {
 			return bad("judge.checkpoints.schedule counts must be at least 1")
@@ -132,7 +131,8 @@ func loadBundle(dir string) (*Bundle, error) {
 	if err != nil {
 		return bad("%w", err)
 	}
-	b.dir, b.texts, b.spec = dir, texts, spec
+	b.dir, b.texts = dir, texts
+	b.spec, b.specErr = model.ReadSpec(dir)
 	return &b, nil
 }
 
@@ -342,13 +342,18 @@ func installBundle(cfg Config, src string) (string, bool, error) {
 	}
 	names := []string{"manifest.json"}
 	for name := range m.Files {
-		if filepath.Base(name) != name {
-			return "", false, fmt.Errorf("%s: manifest file %q is not a plain file name", src, name)
+		if err := checkBundleName(name); err != nil {
+			return "", false, fmt.Errorf("%s: %w", src, err)
 		}
 		names = append(names, name)
 	}
 	for _, name := range names {
-		if err := linkOrCopy(filepath.Join(src, name), filepath.Join(tmp, name)); err != nil {
+		dst := filepath.Join(tmp, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			os.RemoveAll(tmp)
+			return "", false, err
+		}
+		if err := linkOrCopy(filepath.Join(src, filepath.FromSlash(name)), dst); err != nil {
 			os.RemoveAll(tmp)
 			return "", false, err
 		}
@@ -363,9 +368,20 @@ func installBundle(cfg Config, src string) (string, bool, error) {
 	return m.Version, true, nil
 }
 
+// checkBundleName accepts a manifest's file name: a path inside the bundle folder, "/" between folders.
+func checkBundleName(name string) error {
+	if name == "" || name == "manifest.json" || strings.Contains(name, "\\") || !filepath.IsLocal(filepath.FromSlash(name)) {
+		return fmt.Errorf("manifest file %q is not a file name inside the bundle", name)
+	}
+	return nil
+}
+
 func verifyBundle(dir string, m Manifest) error {
 	for name, want := range m.Files {
-		f, err := os.Open(filepath.Join(dir, name))
+		if err := checkBundleName(name); err != nil {
+			return err
+		}
+		f, err := os.Open(filepath.Join(dir, filepath.FromSlash(name)))
 		if err != nil {
 			return err
 		}
