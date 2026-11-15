@@ -22,6 +22,8 @@ type entry struct {
 	// verdict is the line's verdict; released marks a held line a ruling delivered.
 	verdict  string
 	released bool
+	// unscored marks a line held whose models have not run yet (ErrLater): not held for the judge until Rescored.
+	unscored bool
 	// refs is the driver's id of the line and of each of its held repeats, with the order each arrived in.
 	refs []lineRef
 }

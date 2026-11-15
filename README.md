@@ -147,9 +147,13 @@ sitting. A private message is a `msg` line; its conversation is the pair of the 
 scored by the fast model with the lines before it that the bundle's `context` names (the public lines, a private
 message's earlier messages between the same two players, a placed line's author's earlier placed lines: the last 30
 within 30 minutes); a line the scorer cannot score is held. Lines are scored one at a time, in the order they arrive. A
-line still waiting for its verdict `[model] max_wait` after it arrived is held, unscored if its models have not run (a
-burst of lines is held rather than queued past the time Module-ECC waits), and a model call is cut off at that point or
-after `[model] call_timeout`. A bundle switch comes between two lines: the new models take the lists of earlier lines
+line still waiting for its verdict `[model] max_wait` after it arrived is answered hold before its models have run (a
+burst of lines is held rather than queued past the time Module-ECC waits; a model call is cut off at that point, and
+after `[model] call_timeout`). It is context for later lines at once, and is scored, with the context it had, as soon
+as no line is waiting: a line the models would hold becomes one of its sitting's held lines, with its kinds; a line
+they would deliver is released with its repeats (`release`). Until then its sitting's checkpoints wait for it, so the
+judge never sees it unscored; only when the sitting ends, or the line has waited `[core] wait`, first is it put to the
+judge as held without a kind. `/status` counts such lines (`held_unscored`). A bundle switch comes between two lines: the new models take the lists of earlier lines
 the old models kept, so a line's context is the same across the switch. After a restart, the first lines are scored
 with only the lines since as their context.
 
@@ -214,7 +218,9 @@ acknowledged.
 
 **The record.** `<data>/record/YYYY-MM-DD.jsonl` (UTC days), one JSON line per event, each with `type` and `server`
 (the config's `server`): every `line` (stream, id, ref: Module-ECC's id for it, time, channel, conversation, account, name and the raw name,
-target, the prepared and the raw text, sitting, verdict, kinds, score), `repeat`, `sitting_start`, `checkpoint` (the
+target, the prepared and the raw text, sitting, verdict, kinds, score), `rescored` (the verdict, kinds and scores of a
+line held before its models ran), `unscored` (such a line put to the judge without a score), `repeat`,
+`sitting_start`, `checkpoint` (the
 held-line count it covers, why it was made, the prompt's size and SHA-256, whether it was sent), `judge_call` (each
 call: attempt, status, the usage's input, cached, cache-write, output and reasoning tokens, cost, duration, or the
 error), `ruling` (the judge's answer, the error, or `pending` with the time it is put again), `checkpoint_again`,
@@ -448,7 +454,7 @@ repeated or unknown id changes nothing.
 after the first call `last_call`, `result` and `last_usage`: `input_tokens`, `cached_tokens`, `cache_write_tokens`,
 `output_tokens`, `reasoning_tokens`), `spend` (`day`, `day_usd`,
 `daily_budget_usd`, `day_calls`, `month`, `month_usd`, `monthly_budget_usd`, `in_flight_reserved_usd`), `sittings`
-(`stream`, `open_sittings`, `held_unruled`, `judge_calls_in_flight`, `checkpoints_pending`, `unknown_channels` by
+(`stream`, `open_sittings`, `held_unruled`, `held_unscored`, `judge_calls_in_flight`, `checkpoints_pending`, `unknown_channels` by
 channel) and `unacknowledged_actions`.
 
 `POST /switch` with `{"version": "..."}` switches to an installed bundle; `use` and `rollback` call it.

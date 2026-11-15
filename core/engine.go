@@ -88,6 +88,10 @@ type sitting struct {
 	online                     bool
 	first                      int
 	mine, held                 []int
+	// unscored is the positions of the player's lines held while they wait to be scored (ErrLater), oldest first; while
+	// there is one, no checkpoint is put, and due marks a checkpoint the held count brought meanwhile.
+	unscored []int
+	due      bool
 	// included held lines (a prefix of held) have been put to a checkpoint; ruled ones have a ruling.
 	included, ruled int
 	released        []string
@@ -132,6 +136,8 @@ type Engine struct {
 	copies map[copyKey]lastCopy
 	// unknown counts the lines taken on each channel outside Config.Channels.
 	unknown map[string]int
+	// later is the lines waiting to be scored (ErrLater), by Line.Ref.
+	later map[string]*entry
 }
 
 // copyKey is what a repeat shares with the line it repeats: the speaker's shown name (lower case), the channel, the
@@ -147,7 +153,7 @@ func NewEngine(cfg Config, texts Texts, scorer Scorer, rec Recorder) *Engine {
 	return &Engine{cfg: cfg, texts: texts, scorer: scorer, rec: rec,
 		open: map[string]*sitting{}, live: map[string]*sitting{}, online: map[string]bool{}, left: map[string]time.Time{},
 		closed: map[string]bool{}, banned: map[string]bool{}, calls: map[string]int{}, copies: map[copyKey]lastCopy{},
-		unknown: map[string]int{}}
+		unknown: map[string]int{}, later: map[string]*entry{}}
 }
 
 // Swap replaces the configuration, the judge's texts and the scorer (a new bundle). Open sittings keep their lines
@@ -174,7 +180,9 @@ type Status struct {
 	Sittings int    `json:"open_sittings"`
 	// Unruled counts the held lines of open sittings that no ruling covers yet; InFlight the judge calls running;
 	// Pending the checkpoints waiting to be put again after the judge could not be reached.
-	Unruled  int `json:"held_unruled"`
+	Unruled int `json:"held_unruled"`
+	// Unscored counts the held lines waiting to be scored (ErrLater).
+	Unscored int `json:"held_unscored"`
 	InFlight int `json:"judge_calls_in_flight"`
 	Pending  int `json:"checkpoints_pending"`
 	// UnknownChannels counts, by channel, the lines taken on channels outside the bundle's.
@@ -189,6 +197,7 @@ func (e *Engine) Status() Status {
 	for _, s := range e.open {
 		st.Sittings++
 		st.Unruled += len(s.held) - s.ruled
+		st.Unscored += len(s.unscored)
 		switch {
 		case s.parked:
 			st.Pending++
@@ -560,24 +569,128 @@ func (e *Engine) line(l Line, given *scored) Result {
 		given = &scored{v, err}
 	}
 	v := given.v
+	later := errors.Is(given.err, ErrLater) && l.Ref != ""
 	if given.err != nil {
 		v.Hold, v.Kinds = true, nil
 		rec.Why = "scorer: " + given.err.Error()
 	}
-	en.sitting, en.held, en.kinds = s.id, v.Hold, v.Kinds
+	en.sitting, en.held, en.kinds = s.id, v.Hold && !later, v.Kinds
 	e.st.add(en)
 	s.mine = append(s.mine, en.pos)
 	s.last = l.Time
 	rec.Sitting, rec.Kinds, rec.SH, rec.C = s.id, v.Kinds, v.SH, v.C
-	if v.Hold {
+	switch {
+	case later:
 		rec.Verdict = "hold"
-		s.held = append(s.held, en.pos)
-		if e.scheduled(len(s.held)) {
-			r.add(e.checkpoint(s, "held "+strconv.Itoa(len(s.held)), en.pos))
-		}
+		rec.Why += "; scored when no line is waiting"
+		en.unscored = true
+		s.unscored = append(s.unscored, en.pos)
+		e.later[l.Ref] = en
+	case v.Hold:
+		rec.Verdict = "hold"
+		r.add(e.hold(s, en.pos))
 	}
 	r.Verdict = rec.Verdict
 	return r
+}
+
+// hold makes the line at pos one of the sitting's held lines, in stream order, and puts the checkpoint the held count
+// brings; while a line of the sitting waits to be scored, that checkpoint waits for it.
+func (e *Engine) hold(s *sitting, pos int) Result {
+	i, _ := slices.BinarySearch(s.held, pos)
+	s.held = slices.Insert(s.held, i, pos)
+	if e.scheduled(len(s.held)) {
+		s.due = true
+	}
+	if !s.due || len(s.unscored) > 0 || s.banned {
+		return Result{}
+	}
+	s.due = false
+	return e.checkpoint(s, "held "+strconv.Itoa(len(s.held)), s.held[len(s.held)-1])
+}
+
+// Unscored tells whether the line with this ref is held waiting to be scored.
+func (e *Engine) Unscored(ref string) bool { return e.later[ref] != nil }
+
+// RescoredRecord is the verdict of a line held while it waited to be scored.
+type RescoredRecord struct {
+	Time    string   `json:"time"`
+	Stream  string   `json:"stream"`
+	Sitting string   `json:"sitting"`
+	ID      string   `json:"id"`
+	Ref     string   `json:"ref"`
+	Verdict string   `json:"verdict"`
+	Kinds   []string `json:"kinds,omitempty"`
+	SH      *float64 `json:"sh,omitempty"`
+	C       *float64 `json:"c,omitempty"`
+	Why     string   `json:"why,omitempty"`
+}
+
+// Rescored takes the verdict (or the error) the driver got for a line held while it waited to be scored: a line to
+// hold becomes one of its sitting's held lines, with its kinds; a line to deliver, and its held repeats, are released.
+// A line its sitting already settled (Wait or the sitting's end came first) stays held unscored.
+func (e *Engine) Rescored(ref string, v Verdict, err error) Result {
+	en := e.later[ref]
+	if en == nil {
+		return Result{}
+	}
+	delete(e.later, ref)
+	s := e.open[en.sitting]
+	if s == nil {
+		return Result{}
+	}
+	en.unscored = false
+	s.unscored = slices.DeleteFunc(s.unscored, func(p int) bool { return p == en.pos })
+	rec := RescoredRecord{Time: stamp(e.now), Stream: s.st.name, Sitting: s.id, ID: en.line.ID, Ref: ref,
+		Verdict: "hold", SH: v.SH, C: v.C}
+	if err != nil {
+		v.Hold, v.Kinds = true, nil
+		rec.Why = "scorer: " + err.Error()
+	}
+	var r Result
+	if v.Hold || s.banned {
+		en.held, en.kinds, rec.Kinds = true, v.Kinds, v.Kinds
+		e.rec.Record("rescored", rec)
+		r = e.hold(s, en.pos)
+	} else {
+		rec.Verdict = "deliver"
+		e.rec.Record("rescored", rec)
+		en.verdict, en.released = "deliver", true
+		refs := slices.Clone(en.refs)
+		slices.SortFunc(refs, func(a, b lineRef) int { return a.n - b.n })
+		act := Action{Kind: ActionRelease, Account: s.account, Speaker: s.speaker, Sitting: s.id, Lines: []string{en.line.ID}}
+		for _, x := range refs {
+			act.Refs = append(act.Refs, x.ref)
+		}
+		r.Actions = append(r.Actions, act)
+		if s.due && len(s.unscored) == 0 {
+			s.due = false
+			r.add(e.checkpoint(s, "held "+strconv.Itoa(len(s.held)), s.held[len(s.held)-1]))
+		}
+	}
+	for _, act := range r.Actions {
+		e.rec.Record("action", act)
+	}
+	return r
+}
+
+// settle makes the sitting's lines still waiting to be scored held lines without a kind, for a checkpoint that cannot
+// wait for them (the sitting waited Wait, or ends).
+func (e *Engine) settle(s *sitting) {
+	for _, p := range s.unscored {
+		en := s.st.get(p)
+		en.unscored, en.held = false, true
+		delete(e.later, en.line.Ref)
+		i, _ := slices.BinarySearch(s.held, p)
+		s.held = slices.Insert(s.held, i, p)
+		e.rec.Record("unscored", struct {
+			Time    string `json:"time"`
+			Sitting string `json:"sitting"`
+			ID      string `json:"id"`
+			Ref     string `json:"ref"`
+		}{stamp(e.now), s.id, en.line.ID, en.line.Ref})
+	}
+	s.unscored, s.due = nil, false
 }
 
 // RepeatRecord is a line taken as a repeat of an earlier one: the earlier line's id, its count of sends with this
@@ -847,6 +960,7 @@ func (e *Engine) nextCall(s *sitting) Result {
 // call is in flight. A checkpoint waiting to be put again is given up: the last checkpoint covers its lines.
 func (e *Engine) endSitting(s *sitting) Result {
 	s.ending = true
+	e.settle(s)
 	var r Result
 	if len(s.held) > s.included {
 		end := s.st.next - 1
@@ -870,6 +984,7 @@ func (e *Engine) endSitting(s *sitting) Result {
 }
 
 func (e *Engine) closeSitting(s *sitting) {
+	e.settle(s)
 	delete(e.open, s.id)
 	if e.live[s.account] == s {
 		delete(e.live, s.account)
@@ -932,8 +1047,18 @@ func (e *Engine) due() (next *sitting, at time.Time, kind int) {
 		if s.parked && (next == nil || s.retryAt.Before(at)) {
 			next, at, kind = s, s.retryAt, timerRetry
 		}
-		if e.cfg.Wait > 0 && s.inFlight == nil && len(s.held) > s.included {
-			due := s.st.get(s.held[s.included]).line.Time.Add(e.cfg.Wait)
+		if e.cfg.Wait > 0 && s.inFlight == nil && (len(s.held) > s.included || len(s.unscored) > 0) {
+			// the oldest held line not yet put to the judge, a line waiting to be scored included
+			var oldest time.Time
+			if len(s.held) > s.included {
+				oldest = s.st.get(s.held[s.included]).line.Time
+			}
+			if len(s.unscored) > 0 {
+				if t := s.st.get(s.unscored[0]).line.Time; oldest.IsZero() || t.Before(oldest) {
+					oldest = t
+				}
+			}
+			due := oldest.Add(e.cfg.Wait)
 			if next == nil || due.Before(at) {
 				next, at, kind = s, due, timerWait
 			}
@@ -964,6 +1089,7 @@ func (e *Engine) advance(now time.Time) Result {
 		e.at(at)
 		switch kind {
 		case timerWait:
+			e.settle(s)
 			r.add(e.checkpoint(s, "waited", s.st.next-1))
 		case timerEnd:
 			r.add(e.endSitting(s))

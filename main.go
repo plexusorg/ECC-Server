@@ -48,8 +48,8 @@ type ModelConfig struct {
 	Threads int `toml:"threads"`
 	// CallTimeout cuts off a model call that takes longer; its line is held.
 	CallTimeout time.Duration `toml:"call_timeout"`
-	// MaxWait: a line still waiting for its verdict this long after it arrived is held, unscored if its models have
-	// not run.
+	// MaxWait: a line still waiting for its verdict this long after it arrived is held; if its models have not run, it
+	// is scored when no line is waiting (core.ErrLater).
 	MaxWait time.Duration `toml:"max_wait"`
 	// Threshold names the bundle's hold threshold to use; empty is the bundle's default.
 	Threshold string `toml:"threshold"`

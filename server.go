@@ -415,48 +415,102 @@ func (s *server) handleLine(w http.ResponseWriter, r *http.Request) {
 }
 
 // scoreLines is the scoring worker: it takes the queued lines in arrival order, one at a time, so that each line's
-// context is the lines before it and one model call runs at a time. A line is held unscored, though still context for
-// later lines, when it has waited [model] max_wait; a model call is cut off at that point or after
-// [model] call_timeout, and its line held. The engine's lock is not held while the models run.
+// context is the lines before it and one model call runs at a time. A line that has waited [model] max_wait is held
+// (its model call is cut off at that point; a call is also cut after [model] call_timeout, and its line held): it is
+// context for later lines at once, and is scored, with the context it had, when no line is waiting (rescore). The
+// engine's lock is not held while the models run.
 func (s *server) scoreLines() {
+	var later []laterLine
 	for {
 		var j *lineJob
 		select {
 		case <-s.ctx.Done():
 			return
 		case j = <-s.queue:
+		default:
+			if len(later) > 0 {
+				s.rescore(later[0])
+				later = later[1:]
+				continue
+			}
+			select {
+			case <-s.ctx.Done():
+				return
+			case j = <-s.queue:
+			}
 		}
-		s.scoreMu.Lock()
-		req := j.req
-		l := req.coreLine(j.arrived)
-		s.mu.Lock()
-		if !s.eng.Known(l.Channel) {
-			slog.Error("a line on a channel this server does not know is held; its sitting goes on the review queue",
-				"channel", l.Channel, "id", req.ID)
+		if l, ok := s.scoreLine(j); ok {
+			later = append(later, l)
 		}
-		var res core.Result
-		scored, score := s.eng.Prepare(l)
-		if m := s.models; score && m != nil {
-			s.mu.Unlock()
-			d, err := m.ScoreBy(scored, j.arrived.Add(s.cfg.Model.MaxWait))
-			s.mu.Lock()
-			res = s.eng.LineScored(l, d.Verdict, err)
-		} else {
-			res = s.eng.Line(l)
-		}
-		s.dispatch(res)
-		j.verdict = res.Verdict
-		s.seen[req.ID] = res.Verdict
-		s.seenLog = append(s.seenLog, req.ID)
-		if len(s.seenLog) > seenIDs {
-			delete(s.seen, s.seenLog[0])
-			s.seenLog = s.seenLog[1:]
-		}
-		delete(s.pending, req.ID)
-		s.mu.Unlock()
-		s.scoreMu.Unlock()
-		close(j.done)
 	}
+}
+
+// laterLine is a line held when its time to be scored ran out, to score when no line is waiting.
+type laterLine struct {
+	line core.Line
+	p    *model.Later
+}
+
+// rescore scores a line held when its time ran out and hands its verdict to the engine, unless its sitting settled it
+// meanwhile.
+func (s *server) rescore(l laterLine) {
+	s.scoreMu.Lock()
+	defer s.scoreMu.Unlock()
+	s.mu.Lock()
+	m := s.models
+	waiting := s.eng.Unscored(l.line.Ref)
+	s.mu.Unlock()
+	if !waiting {
+		return
+	}
+	var d model.Detail
+	err := errors.New("the models are closed")
+	if m != nil {
+		d, err = m.ScoreLater(l.p)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.now()
+	s.dispatch(s.eng.Rescored(l.line.Ref, d.Verdict, err))
+}
+
+// scoreLine gives one queued line its verdict; ok when the line is held to be scored later.
+func (s *server) scoreLine(j *lineJob) (later laterLine, ok bool) {
+	s.scoreMu.Lock()
+	req := j.req
+	l := req.coreLine(j.arrived)
+	s.mu.Lock()
+	if !s.eng.Known(l.Channel) {
+		slog.Error("a line on a channel this server does not know is held; its sitting goes on the review queue",
+			"channel", l.Channel, "id", req.ID)
+	}
+	var res core.Result
+	scored, score := s.eng.Prepare(l)
+	if m := s.models; score && m != nil {
+		s.mu.Unlock()
+		d, err := m.ScoreBy(scored, j.arrived.Add(s.cfg.Model.MaxWait))
+		s.mu.Lock()
+		res = s.eng.LineScored(l, d.Verdict, err)
+		var p *model.Later
+		if errors.As(err, &p) && s.eng.Unscored(l.Ref) {
+			later, ok = laterLine{scored, p}, true
+		}
+	} else {
+		res = s.eng.Line(l)
+	}
+	s.dispatch(res)
+	j.verdict = res.Verdict
+	s.seen[req.ID] = res.Verdict
+	s.seenLog = append(s.seenLog, req.ID)
+	if len(s.seenLog) > seenIDs {
+		delete(s.seen, s.seenLog[0])
+		s.seenLog = s.seenLog[1:]
+	}
+	delete(s.pending, req.ID)
+	s.mu.Unlock()
+	s.scoreMu.Unlock()
+	close(j.done)
+	return later, ok
 }
 
 // handlePresence takes the plugin's start (a new stream: every open sitting ends; the allowlist of links) and
