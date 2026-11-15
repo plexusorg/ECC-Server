@@ -217,6 +217,7 @@ func (e *Engine) at(t time.Time) {
 type LineRecord struct {
 	Stream       string   `json:"stream"`
 	ID           string   `json:"id"`
+	Ref          string   `json:"ref,omitempty"`
 	Time         string   `json:"time"`
 	Channel      string   `json:"channel"`
 	Conversation string   `json:"conversation"`
@@ -241,6 +242,7 @@ type CheckpointRecord struct {
 	K       int    `json:"k"`
 	Reason  string `json:"reason"`
 	Line    string `json:"line"`
+	LineRef string `json:"line_ref,omitempty"`
 	Chars   int    `json:"chars"`
 	Hash    string `json:"sha256,omitempty"`
 	Sent    bool   `json:"sent"`
@@ -269,6 +271,7 @@ type SittingRecord struct {
 	Start       string             `json:"start"`
 	Lines       int                `json:"lines"`
 	Held        []string           `json:"held"`
+	HeldRefs    []string           `json:"held_refs"`
 	Outcome     string             `json:"outcome"`
 	BanLine     string             `json:"ban_line,omitempty"`
 	Released    []string           `json:"released"`
@@ -493,7 +496,7 @@ func (e *Engine) line(l Line, given *scored) Result {
 	}
 	if l.Empty {
 		// preparation emptied the text: delivered, not scored, no line of the stream
-		e.rec.Record("line", LineRecord{Stream: e.st.name, Time: stamp(l.Time), Channel: l.Channel,
+		e.rec.Record("line", LineRecord{Stream: e.st.name, Ref: l.Ref, Time: stamp(l.Time), Channel: l.Channel,
 			Conversation: l.Conversation, Account: l.Account, Name: l.Name, RawName: l.RawName, Target: l.Target,
 			Raw: l.Raw, Context: l.Context, Verdict: "deliver", Why: "empty after preparation"})
 		r.Verdict = "deliver"
@@ -510,7 +513,7 @@ func (e *Engine) line(l Line, given *scored) Result {
 	if l.Sent < 1 {
 		l.Sent = 1
 	}
-	rec := LineRecord{Stream: e.st.name, ID: l.ID, Time: stamp(l.Time), Channel: l.Channel,
+	rec := LineRecord{Stream: e.st.name, ID: l.ID, Ref: l.Ref, Time: stamp(l.Time), Channel: l.Channel,
 		Conversation: l.Conversation, Account: l.Account, Name: l.Name, RawName: l.RawName, Target: l.Target,
 		Text: l.Text, Raw: l.Raw, Verdict: "deliver"}
 	en := &entry{line: l}
@@ -580,6 +583,7 @@ func (e *Engine) line(l Line, given *scored) Result {
 type RepeatRecord struct {
 	Stream  string `json:"stream"`
 	Of      string `json:"of"`
+	OfRef   string `json:"of_ref,omitempty"`
 	Time    string `json:"time"`
 	Account string `json:"account"`
 	Ref     string `json:"ref,omitempty"`
@@ -604,7 +608,7 @@ func (e *Engine) repeat(key copyKey, en *entry, l Line) string {
 	if s := e.open[en.sitting]; s != nil && !s.ending && l.Time.After(s.last) {
 		s.last = l.Time
 	}
-	e.rec.Record("repeat", RepeatRecord{Stream: e.st.name, Of: en.line.ID, Time: stamp(l.Time), Account: l.Account,
+	e.rec.Record("repeat", RepeatRecord{Stream: e.st.name, Of: en.line.ID, OfRef: en.line.Ref, Time: stamp(l.Time), Account: l.Account,
 		Ref: l.Ref, Raw: l.Raw, Sent: en.line.Sent, Verdict: verdict})
 	return verdict
 }
@@ -613,7 +617,7 @@ func (e *Engine) repeat(key copyKey, en *entry, l Line) string {
 // player's sitting goes on the review queue when it ends.
 func (e *Engine) unknownLine(l Line) string {
 	e.unknown[l.Channel]++
-	rec := LineRecord{Stream: e.st.name, Time: stamp(l.Time), Channel: l.Channel, Conversation: l.Conversation,
+	rec := LineRecord{Stream: e.st.name, Ref: l.Ref, Time: stamp(l.Time), Channel: l.Channel, Conversation: l.Conversation,
 		Account: l.Account, Name: l.Name, RawName: l.RawName, Target: l.Target, Text: l.Text, Raw: l.Raw,
 		Verdict: "hold", Why: "a channel this server does not know"}
 	if l.Account != "" && (!e.cfg.DriverSittings || l.Sitting != "") {
@@ -692,7 +696,8 @@ func (e *Engine) checkpoint(s *sitting, reason string, end int) Result {
 			v.mine = append(v.mine, p)
 		}
 	}
-	cp := CheckpointRecord{Time: stamp(e.now), Sitting: s.id, K: covers, Reason: reason, Line: s.st.get(end).line.ID}
+	cp := CheckpointRecord{Time: stamp(e.now), Sitting: s.id, K: covers, Reason: reason, Line: s.st.get(end).line.ID,
+		LineRef: s.st.get(end).line.Ref}
 	c, err := e.cfg.Render.render(v)
 	day := e.now.UTC().Format(time.DateOnly)
 	var job *Job
@@ -895,12 +900,12 @@ func (e *Engine) closeSitting(s *sitting) {
 		why = append(why, "lines on a channel this server does not know: "+strconv.Itoa(s.unknown))
 	}
 	review := strings.Join(why, "; ")
-	held := make([]string, len(s.held))
+	held, refs := make([]string, len(s.held)), make([]string, len(s.held))
 	for i, p := range s.held {
-		held[i] = s.st.get(p).line.ID
+		held[i], refs[i] = s.st.get(p).line.ID, s.st.get(p).line.Ref
 	}
 	e.rec.Record("sitting_end", SittingRecord{Time: stamp(e.now), Stream: s.st.name, Sitting: s.id, Account: s.account,
-		Start: stamp(s.start), Lines: len(s.mine), Held: held, Outcome: out, BanLine: s.banLine,
+		Start: stamp(s.start), Lines: len(s.mine), Held: held, HeldRefs: refs, Outcome: out, BanLine: s.banLine,
 		Released: s.released, Unruled: unruled, Checkpoints: s.checkpoints, Review: review})
 	if review != "" {
 		e.rec.Record("review", ReviewRecord{Time: stamp(e.now), Sitting: s.id, Account: s.account, Name: s.name,

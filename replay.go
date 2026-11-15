@@ -21,7 +21,7 @@ import (
 )
 
 const replayUsage = `ecc-server replay -config FILE -lines FILE -fold DIR -out DIR [-mode parity|live]
-                    [-judge-delay 15s] [-bundle DIR [-threads 6] [-threshold NAME]]
+                    [-judge-delay 15s] [-keep-going] [-dump FILE] [-bundle DIR [-threads 6] [-threshold NAME]]
 
 Feeds recorded lines through the decision core on a virtual clock, with the fast model's recorded verdicts (or, with
 -bundle, the bundle's models scoring every line) and the judge's saved answers, and writes the record, one line per
@@ -35,7 +35,9 @@ first.
   -fold    question.md, format.md, cases.json, answers.json (sha256 of the prompt -> answer), expected.json
   -mode    parity: sittings and the sitting-end checkpoint as the lines name them, no waiting-time or every-n-th
            checkpoint, rulings at once (as the measured replay ruled); checkpoints of sittings not in
-           expected.json's judged_sittings are built and not sent, and a prompt with no saved answer stops the replay.
+           expected.json's judged_sittings are built and not sent, and a prompt with no saved answer stops the replay
+           (with -keep-going it is counted and its lines stay held).
+  -dump    writes every judge call's sitting, held count, sha256 and the prompt from the new case on, one JSON a line
            live: sittings from presence and silence, the waiting-time checkpoint; a prompt with no saved answer is
            counted and its lines stay held.
 `
@@ -64,6 +66,48 @@ type replayEvent struct {
 	Sitting string   `json:"sitting"`
 	Verdict string   `json:"verdict"`
 	Kinds   []string `json:"kinds"`
+	// Key is the line's own id, unique in its stream (the rendered id may not be); CopyOf names the line a copy
+	// repeats; RawText and RawShown are the text and the shown name before preparation.
+	Key      string  `json:"key"`
+	CopyOf   string  `json:"copy_of"`
+	RawText  *string `json:"raw_text"`
+	RawShown *string `json:"raw_shown"`
+}
+
+func (ev replayEvent) ref() string {
+	if ev.Key != "" {
+		return ev.Key
+	}
+	return ev.ID
+}
+
+// coreLine is the input's line: its text and names prepared already. The repeat key is made as the server makes it,
+// from the raw text and shown name when the input has them, else from the prepared ones.
+func (ev replayEvent) coreLine(t time.Time, sitting string) core.Line {
+	account := strings.TrimPrefix(ev.Speaker, "discord:")
+	l := core.Line{ID: ev.ID, Ref: ev.ref(), Time: t, Channel: ev.Channel, Conversation: ev.Conversation,
+		Private: ev.Private, Account: ev.Account, Name: ev.Shown, Speaker: ev.Speaker, RawName: ev.Shown,
+		TargetAccount: ev.TargetAccount, Target: ev.Target, Text: ev.Text, Raw: ev.Text, Key: ev.Text,
+		KeyName: core.KeyName(ev.Channel, ev.Shown, account), Sent: ev.Sent, Context: ev.Context || ev.Trusted,
+		Sitting: sitting}
+	if ev.RawText != nil {
+		l.Raw = *ev.RawText
+		l.Key, _ = core.PrepareText(l.Raw, ev.Channel)
+	}
+	if ev.RawShown != nil {
+		l.RawName = *ev.RawShown
+		switch ev.Channel {
+		case "chat":
+			shown := core.ShownName(l.RawName)
+			if shown == "" {
+				shown = account
+			}
+			l.KeyName = core.KeyName(ev.Channel, shown, account)
+		case "discord":
+			l.KeyName = core.KeyName(ev.Channel, core.DiscordName(l.RawName), account)
+		}
+	}
+	return l
 }
 
 type savedAnswer struct {
@@ -96,9 +140,9 @@ type recordedScorer struct {
 func (s *recordedScorer) See(core.Line) {}
 
 func (s *recordedScorer) Score(l core.Line) (core.Verdict, error) {
-	v, ok := s.verdicts[l.ID]
+	v, ok := s.verdicts[l.Ref]
 	if !ok {
-		return core.Verdict{}, fmt.Errorf("no recorded verdict for line %s", l.ID)
+		return core.Verdict{}, fmt.Errorf("no recorded verdict for line %s", l.Ref)
 	}
 	return v, nil
 }
@@ -130,6 +174,7 @@ type replayRecorder struct {
 	actions  map[string]int
 	reviews  int
 	repeats  int
+	folded   map[string]string // a repeat's ref -> the ref of the line it repeats
 }
 
 func (r *replayRecorder) Record(kind string, v any) {
@@ -149,6 +194,7 @@ func (r *replayRecorder) Record(kind string, v any) {
 		r.reviews++
 	case core.RepeatRecord:
 		r.repeats++
+		r.folded[x.Ref] = x.OfRef
 	}
 }
 
@@ -191,6 +237,8 @@ func replay(args []string) error {
 	threads := fs.Int("threads", 6, "")
 	threshold := fs.String("threshold", "", "")
 	judgeDelay := fs.Duration("judge-delay", 15*time.Second, "")
+	keepGoing := fs.Bool("keep-going", false, "")
+	dumpPath := fs.String("dump", "", "")
 	_ = fs.Parse(args)
 	if *configPath == "" || *linesPath == "" || *foldDir == "" || *outDir == "" || fs.NArg() != 0 ||
 		(*mode != "parity" && *mode != "live") || *judgeDelay < 0 {
@@ -250,7 +298,7 @@ func replay(args []string) error {
 		return err
 	}
 	defer rf.Close()
-	rec := &replayRecorder{w: bufio.NewWriterSize(rf, 1<<20), actions: map[string]int{}}
+	rec := &replayRecorder{w: bufio.NewWriterSize(rf, 1<<20), actions: map[string]int{}, folded: map[string]string{}}
 	scorer := &recordedScorer{}
 	var sc core.Scorer = scorer
 	if *bundle != "" {
@@ -266,6 +314,15 @@ func replay(args []string) error {
 		sc = m
 	}
 	judge := &savedJudge{answers: answers}
+	var dump *json.Encoder
+	if *dumpPath != "" {
+		df, err := os.Create(*dumpPath)
+		if err != nil {
+			return err
+		}
+		defer df.Close()
+		dump = json.NewEncoder(df)
+	}
 	eng := core.NewEngine(cfg, texts, sc, rec)
 
 	judged := map[string]bool{}
@@ -294,12 +351,15 @@ func replay(args []string) error {
 	put := func(r core.Result, at time.Time) {
 		for _, j := range r.Jobs {
 			p := ruling{job: j, due: later(j.At, at).Add(delay)}
+			if dump != nil {
+				dump.Encode(map[string]any{"sitting": j.Sitting, "k": j.K, "sha256": j.Hash, "case": j.Prompt[j.Split:]})
+			}
 			if parity && !judged[j.Sitting] {
 				notSent++
 				p.due, p.err = later(j.At, at), core.ErrNotSent
 			} else {
 				p.a, p.err = judge.Rule(j)
-				if p.err != nil && parity && stop == nil {
+				if p.err != nil && parity && !*keepGoing && stop == nil {
 					stop = fmt.Errorf("checkpoint %s#%d (sha256 %s): %w", j.Sitting, j.K, j.Hash, p.err)
 				}
 			}
@@ -338,7 +398,7 @@ func replay(args []string) error {
 					break
 				}
 				if x.Verdict != "" {
-					scorer.verdicts[x.ID] = core.Verdict{Hold: x.Verdict == "hold", Kinds: x.Kinds}
+					scorer.verdicts[x.ref()] = core.Verdict{Hold: x.Verdict == "hold", Kinds: x.Kinds}
 				}
 			}
 			day = later(day, last)
@@ -369,13 +429,7 @@ func replay(args []string) error {
 				sit = ""
 			}
 			until(t)
-			// the input's text and names are prepared already; the repeat key is the text and the name as the
-			// dossiers keyed them
-			put(eng.Line(core.Line{ID: ev.ID, Time: t, Channel: ev.Channel, Conversation: ev.Conversation,
-				Private: ev.Private, Account: ev.Account, Name: ev.Shown, Speaker: ev.Speaker, RawName: ev.Shown,
-				TargetAccount: ev.TargetAccount, Target: ev.Target, Text: ev.Text, Raw: ev.Text, Key: ev.Text,
-				KeyName: core.KeyName(ev.Channel, ev.Shown, strings.TrimPrefix(ev.Speaker, "discord:")), Sent: ev.Sent,
-				Context: ev.Context || ev.Trusted, Sitting: sit}), t)
+			put(eng.Line(ev.coreLine(t, sit)), t)
 			if parity && ev.Sitting != "" && lastOf[ev.Sitting] == i {
 				until(t)
 				put(eng.End(ev.Sitting, t), t)
@@ -419,6 +473,7 @@ func replay(args []string) error {
 	}
 
 	sum := summarize(*mode, rec, judge, notSent, exp, answers, parityHeldSets(events))
+	sum.Copies = checkCopies(events, rec.folded)
 	b, _ := json.MarshalIndent(sum, "", " ")
 	if err := os.WriteFile(filepath.Join(*outDir, "summary.json"), append(b, '\n'), 0o640); err != nil {
 		return err
@@ -457,21 +512,60 @@ func parityHeldSets(events []replayEvent) map[string]bool {
 }
 
 type replaySummary struct {
-	Mode           string         `json:"mode"`
-	Sittings       int            `json:"sittings"`
-	WithHeld       int            `json:"sittings_with_a_held_line"`
-	Outcomes       map[string]int `json:"outcomes"`
-	Checkpoints    map[string]int `json:"checkpoints_by_reason"`
-	PromptsBuilt   int            `json:"prompts_built"`
-	Sent           int            `json:"sent"`
-	NotSent        int            `json:"built_not_sent"`
-	CapStopped     int            `json:"stopped_by_the_cap"`
-	NoAnswer       int            `json:"sent_without_a_saved_answer"`
-	Actions        map[string]int `json:"actions"`
-	Reviews        int            `json:"review_queue"`
-	Repeats        int            `json:"repeats"`
-	Parity         *parityResult  `json:"parity,omitempty"`
-	LiveComparison *liveResult    `json:"live,omitempty"`
+	Mode         string         `json:"mode"`
+	Sittings     int            `json:"sittings"`
+	WithHeld     int            `json:"sittings_with_a_held_line"`
+	Outcomes     map[string]int `json:"outcomes"`
+	Checkpoints  map[string]int `json:"checkpoints_by_reason"`
+	PromptsBuilt int            `json:"prompts_built"`
+	Sent         int            `json:"sent"`
+	NotSent      int            `json:"built_not_sent"`
+	CapStopped   int            `json:"stopped_by_the_cap"`
+	NoAnswer     int            `json:"sent_without_a_saved_answer"`
+	Actions      map[string]int `json:"actions"`
+	Reviews      int            `json:"review_queue"`
+	Repeats      int            `json:"repeats"`
+	// Copies: the input's lines that name the line they repeat (copy_of), and how the core folded them.
+	Copies         *copyCheck    `json:"copies,omitempty"`
+	Parity         *parityResult `json:"parity,omitempty"`
+	LiveComparison *liveResult   `json:"live,omitempty"`
+}
+
+type copyCheck struct {
+	InInput       int `json:"in_input"`
+	FoldedAsNamed int `json:"folded_into_the_line_named"`
+	FoldedOther   int `json:"folded_into_another_line"`
+	NotFolded     int `json:"not_folded"`
+	FoldedUnnamed int `json:"folded_without_copy_of"`
+}
+
+func checkCopies(events []replayEvent, folded map[string]string) *copyCheck {
+	c := &copyCheck{}
+	named := map[string]bool{}
+	for _, ev := range events {
+		if ev.Type != "line" || ev.CopyOf == "" {
+			continue
+		}
+		c.InInput++
+		named[ev.ref()] = true
+		switch of, ok := folded[ev.ref()]; {
+		case !ok:
+			c.NotFolded++
+		case of == ev.CopyOf:
+			c.FoldedAsNamed++
+		default:
+			c.FoldedOther++
+		}
+	}
+	for ref := range folded {
+		if !named[ref] {
+			c.FoldedUnnamed++
+		}
+	}
+	if c.InInput == 0 && len(folded) == 0 {
+		return nil
+	}
+	return c
 }
 
 type parityResult struct {
