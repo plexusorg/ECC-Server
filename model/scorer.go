@@ -80,7 +80,7 @@ type Spec struct {
 // RulesSHA256 is the sha256 of the rules bundle.json states in words and patterns, at the paths of Rules, as this
 // server implements them (the models' inputs here, the channels, the text preparation and the link rule in core). A
 // bundle that states other rules is refused rather than served by the wrong ones.
-const RulesSHA256 = "09bed914c65a59282c887272dff4b70222f91c78d6f981ceff5b30c164b8e74f"
+const RulesSHA256 = "3540be87efda1595ea1e0ddc564403ba7fde4e28d1916f3559d7de4f4e4f6042"
 
 // Rules is the paths in bundle.json of the rules RulesSHA256 covers, in order.
 var Rules = []string{"context.rule", "sh.line_string", "sh.line_tokens", "sh.slot", "sh.gap", "sh.pos", "c.roles",
