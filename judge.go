@@ -16,7 +16,7 @@ import (
 )
 
 // The judge's retries. An invalid answer is asked again, up to judgeAttempts answers. A call that fails (throttling,
-// a server error, a timeout, the network) is made again after judgeBackoff, doubling each time, while the failures
+// a server error, a response whose status is failed or cancelled, a timeout, the network) is made again after judgeBackoff, doubling each time, while the failures
 // have lasted less than judgeRetryFor; then the checkpoint is pending and the core puts it again judgeRetryAfter
 // later, until the sitting ends. A call the budget refuses, or one Bedrock refuses for the key (401, 403) or as a bad
 // request, is not made again. The rig sets shorter times ([test]).
@@ -111,8 +111,8 @@ func (j *bedrockJudge) stop(err error) {
 	}
 }
 
-// passing tells whether a failed call may succeed later: throttling, a server error, a 200 that is not an answer, a
-// timeout or a network failure; not a refusal by the budget or for the key, a bad request, or the host stopping.
+// passing tells whether a failed call may succeed later: throttling, a server error, a 200 that is not an answer or
+// whose status is failed or cancelled, a timeout or a network failure; not a refusal by the budget or for the key, a bad request, or the host stopping.
 func passing(err error) bool {
 	var be *bedrockError
 	switch {
@@ -168,7 +168,7 @@ func (j *bedrockJudge) call(job *core.Job, attempt int) (*judgeAnswer, error) {
 	cost := r.usd // no answer: the call may have run
 	var be *bedrockError
 	switch {
-	case err == nil:
+	case res != nil: // an answer, or a failed one that states its usage
 		cost = j.spend.cost(res.Usage)
 	case errors.As(err, &be) && be.Status != 200:
 		cost = 0 // Bedrock refused the request
@@ -178,13 +178,17 @@ func (j *bedrockJudge) call(job *core.Job, attempt int) (*judgeAnswer, error) {
 	j.br.record(err, len(job.Prompt), res, cost, took)
 	rec := judgeCall{Time: stamp(time.Now()), Sitting: job.Sitting, K: job.K, Hash: job.Hash, Attempt: attempt,
 		PromptBytes: len(job.Prompt), USD: cost, Seconds: took.Seconds()}
-	if err != nil {
-		rec.Error = err.Error()
-	} else {
+	if res != nil {
 		rec.Status, rec.Incomplete, rec.Tier, rec.Usage = res.Status, res.Incomplete, res.Tier, &res.Usage
 	}
+	if err != nil {
+		rec.Error = err.Error()
+	}
 	j.record("judge_call", rec)
-	return res, err
+	if err != nil {
+		return nil, err
+	}
+	return res, nil
 }
 
 // checkAnswer takes an answer: an incomplete one (its output cut at max_output_tokens, or stopped otherwise) is

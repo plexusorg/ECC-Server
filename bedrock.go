@@ -110,7 +110,11 @@ type cacheMode struct {
 }
 
 type responsesResponse struct {
-	Status            string `json:"status"`
+	Status string `json:"status"`
+	Error  *struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	} `json:"error"`
 	IncompleteDetails *struct {
 		Reason string `json:"reason"`
 	} `json:"incomplete_details"`
@@ -145,7 +149,8 @@ type judgeAnswer struct {
 	Tier       string // the service tier that served it
 }
 
-// bedrockError is an answer from Bedrock other than 200, or a 200 whose body is not a Responses answer.
+// bedrockError is an answer from Bedrock other than 200, or a 200 whose body is not a Responses answer or is one whose
+// status is failed or cancelled (Status 200 for both: the call may succeed when made again).
 type bedrockError struct {
 	Status  int
 	Type    string // the x-amzn-ErrorType, such as ThrottlingException
@@ -229,7 +234,25 @@ func (b *bedrock) respond(ctx context.Context, prompt string, split, maxTokens i
 		return nil, e
 	}
 	var out responsesResponse
-	if err := json.Unmarshal(data, &out); err != nil || out.Status == "" || out.Usage == nil {
+	if err := json.Unmarshal(data, &out); err != nil || out.Status == "" {
+		return nil, &bedrockError{Status: resp.StatusCode, Message: "the answer is not a Responses answer"}
+	}
+	if out.Status == "failed" || out.Status == "cancelled" {
+		// Bedrock could not make the answer: made again after a backoff, as a server error is. The usage, when stated,
+		// is what the call cost.
+		e := &bedrockError{Status: resp.StatusCode, Message: "the response's status is " + out.Status}
+		if out.Error != nil {
+			e.Type, e.Message = out.Error.Code, e.Message+": "+truncate(out.Error.Message, 200)
+		}
+		var a *judgeAnswer
+		if u := out.Usage; u != nil {
+			a = &judgeAnswer{Status: out.Status, Tier: out.ServiceTier, Usage: tokenUsage{Input: u.InputTokens,
+				Output: u.OutputTokens, Cached: u.InputTokensDetails.CachedTokens,
+				CacheWrite: u.InputTokensDetails.CacheWriteTokens, Reasoning: u.OutputTokensDetails.ReasoningTokens}}
+		}
+		return a, e
+	}
+	if out.Usage == nil {
 		return nil, &bedrockError{Status: resp.StatusCode, Message: "the answer is not a Responses answer"}
 	}
 	a := &judgeAnswer{Status: out.Status, Tier: out.ServiceTier}

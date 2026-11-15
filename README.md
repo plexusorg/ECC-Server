@@ -258,7 +258,7 @@ answer is one JSON object (a Markdown code fence around it is accepted) whose `r
 case `N1`: `ruling` `nothing`, `hold` or `ban` (`not ban`, a ruling of the owner's cases, is taken as `hold`); for
 `hold` or `ban`, `by` one of the player's lines the case shows; `like` a list of at most three of the owner's case
 ids; `sure` true or false. An invalid answer is asked for again, up to three answers. A call that fails (`429`, a
-`5xx`, the `timeout`, the network) is made again after 5 seconds, then 10, 20, ..., while the failures have lasted
+`5xx`, an answer whose `status` is `failed` or `cancelled`, the `timeout`, the network) is made again after 5 seconds, then 10, 20, ..., while the failures have lasted
 less than 5 minutes; then the checkpoint is pending: it is put again 5 minutes later, and so on until the sitting ends
 (`/status` counts the pending ones). A call refused by the budget, or by Bedrock for the key (`401`, `403`) or as a
 bad request, is not made again. Each of these stops, three invalid answers on one checkpoint and a missing key send
