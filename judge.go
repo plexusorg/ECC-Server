@@ -15,46 +15,110 @@ import (
 	"ecc-server/core"
 )
 
-// bedrockJudge rules a checkpoint with one Converse call: the whole prompt as the one user message, the owner's cases
-// before the sitting so the prompt's long identical start is cached by Bedrock across calls. Each call is charged to
-// the spend budget first. An answer that fails the checks is asked for once more; a second invalid answer, a failed
-// call or a call over the budget is an error, which leaves the lines held and puts the sitting on the review queue.
+// The judge's retries. An invalid answer is asked again, up to judgeAttempts answers. A call that fails (throttling,
+// a server error, a timeout, the network) is made again after judgeBackoff, doubling each time, while the failures
+// have lasted less than judgeRetryFor; then the checkpoint is pending and the core puts it again judgeRetryAfter
+// later, until the sitting ends. A call the budget refuses, or one Bedrock refuses for the key (401, 403) or as a bad
+// request, is not made again. The rig sets shorter times ([test]).
+const (
+	judgeAttempts   = 3
+	judgeBackoff    = 5 * time.Second
+	judgeRetryFor   = 5 * time.Minute
+	judgeRetryAfter = 5 * time.Minute
+)
+
+// bedrockJudge rules a checkpoint with a Responses call: the prompt as one user message, the question and the owner's
+// cases in a first part that ends at an explicit cache breakpoint, so Bedrock caches the part every prompt shares.
+// Each call is charged to the spend budget first.
 type bedrockJudge struct {
 	ctx     context.Context
 	br      *bedrock
 	spend   *spend
 	tier    string
+	effort  string
 	maxOut  int
 	timeout time.Duration
 	// told is called when a call is refused for a budget for the first time in its day or month.
 	told func(*errOverBudget)
+	// record writes a line of the record.
+	record func(kind string, v any)
+	// backoff and retryFor: judgeBackoff and judgeRetryFor, or the rig's.
+	backoff, retryFor time.Duration
 }
 
 func (j *bedrockJudge) Rule(job *core.Job) (core.Answer, error) {
-	var invalid error
-	for attempt := 1; attempt <= 2; attempt++ {
-		text, stop, err := j.call(job)
+	invalid := 0
+	var failing time.Time
+	delay := j.backoff
+	for attempt := 1; ; attempt++ {
+		res, err := j.call(job, attempt)
 		if err != nil {
-			if invalid != nil {
-				return core.Answer{}, fmt.Errorf("the judge's answer was invalid (%v), and the call to ask again failed: %w", invalid, err)
+			if !passing(err) {
+				return core.Answer{}, err
 			}
-			return core.Answer{}, err
+			if failing.IsZero() {
+				failing = time.Now()
+			}
+			if time.Since(failing)+delay > j.retryFor {
+				return core.Answer{}, fmt.Errorf("%w for %s: %w", core.ErrPending, time.Since(failing).Round(time.Second), err)
+			}
+			slog.Warn("the judge's call failed; trying again", "sitting", job.Sitting, "k", job.K, "in", delay.String(),
+				"err", err.Error())
+			select {
+			case <-j.ctx.Done():
+				return core.Answer{}, j.ctx.Err()
+			case <-time.After(delay):
+			}
+			delay *= 2
+			continue
 		}
-		a, err := parseAnswer(text, job.Mine, job.Cases)
+		failing, delay = time.Time{}, j.backoff
+		a, err := checkAnswer(res, job.Mine, job.Cases)
 		if err == nil {
 			return a, nil
 		}
-		slog.Warn("the judge's answer is invalid", "sitting", job.Sitting, "k", job.K, "attempt", attempt,
-			"why", err.Error(), "stop_reason", stop)
-		invalid = err
+		invalid++
+		slog.Warn("the judge's answer is invalid", "sitting", job.Sitting, "k", job.K, "answer", invalid, "why", err.Error())
+		if invalid == judgeAttempts {
+			return core.Answer{}, fmt.Errorf("the judge's answer was invalid %d times: %w", invalid, err)
+		}
 	}
-	return core.Answer{}, fmt.Errorf("the judge's answer was invalid twice: %w", invalid)
 }
 
-// call makes one Converse call within the budget and returns the answer's text and stop reason.
-func (j *bedrockJudge) call(job *core.Job) (string, string, error) {
+// passing tells whether a failed call may succeed later: throttling, a server error, a 200 that is not an answer, a
+// timeout or a network failure; not a refusal by the budget or for the key, a bad request, or the host stopping.
+func passing(err error) bool {
+	var be *bedrockError
+	switch {
+	case errors.Is(err, core.ErrNotSent), errors.Is(err, context.Canceled):
+		return false
+	case errors.As(err, &be):
+		return be.passing() || be.Status == 200
+	}
+	return true
+}
+
+// judgeCall is the record's line for one call: no prompt or answer text.
+type judgeCall struct {
+	Time        string      `json:"time"`
+	Sitting     string      `json:"sitting"`
+	K           int         `json:"k"`
+	Hash        string      `json:"sha256"`
+	Attempt     int         `json:"attempt"`
+	PromptBytes int         `json:"prompt_bytes"`
+	Status      string      `json:"status,omitempty"`
+	Incomplete  string      `json:"incomplete,omitempty"`
+	Tier        string      `json:"service_tier,omitempty"`
+	Usage       *tokenUsage `json:"usage,omitempty"`
+	USD         float64     `json:"usd"`
+	Seconds     float64     `json:"seconds"`
+	Error       string      `json:"error,omitempty"`
+}
+
+// call makes one Responses call within the budget.
+func (j *bedrockJudge) call(job *core.Job, attempt int) (*judgeAnswer, error) {
 	if j.br.key == "" {
-		return "", "", fmt.Errorf("%w: no Bedrock key is set; set one with sudo ecc-server bedrock login", core.ErrNotSent)
+		return nil, fmt.Errorf("%w: no Bedrock key is set; set one with sudo ecc-server bedrock login", core.ErrNotSent)
 	}
 	r, told, err := j.spend.reserve(j.spend.worst(len(job.Prompt), j.maxOut))
 	var over *errOverBudget
@@ -62,26 +126,44 @@ func (j *bedrockJudge) call(job *core.Job) (string, string, error) {
 		if told {
 			j.told(over)
 		}
-		return "", "", fmt.Errorf("%w: %w", core.ErrNotSent, err)
+		return nil, fmt.Errorf("%w: %w", core.ErrNotSent, err)
 	}
 	ctx, cancel := context.WithTimeout(j.ctx, j.timeout)
 	defer cancel()
 	start := time.Now()
-	res, err := j.br.converse(ctx, "", job.Prompt, j.maxOut, j.tier)
+	res, err := j.br.respond(ctx, job.Prompt, job.Split, j.maxOut, j.effort, j.tier)
 	cost := r.usd // no answer: the call may have run
 	var be *bedrockError
 	switch {
 	case err == nil:
 		cost = j.spend.cost(res.Usage)
-	case errors.As(err, &be):
+	case errors.As(err, &be) && be.Status != 200:
 		cost = 0 // Bedrock refused the request
 	}
 	j.spend.settle(r, cost)
-	j.br.record(err, len(job.Prompt), res, cost, time.Since(start))
+	took := time.Since(start)
+	j.br.record(err, len(job.Prompt), res, cost, took)
+	rec := judgeCall{Time: stamp(time.Now()), Sitting: job.Sitting, K: job.K, Hash: job.Hash, Attempt: attempt,
+		PromptBytes: len(job.Prompt), USD: cost, Seconds: took.Seconds()}
 	if err != nil {
-		return "", "", err
+		rec.Error = err.Error()
+	} else {
+		rec.Status, rec.Incomplete, rec.Tier, rec.Usage = res.Status, res.Incomplete, res.Tier, &res.Usage
 	}
-	return res.Text, res.StopReason, nil
+	j.record("judge_call", rec)
+	return res, err
+}
+
+// checkAnswer takes an answer: an incomplete one (its output cut at max_output_tokens, or stopped otherwise) is
+// invalid; a completed one's text must pass parseAnswer.
+func checkAnswer(res *judgeAnswer, mine []string, cases int) (core.Answer, error) {
+	switch res.Status {
+	case "completed":
+		return parseAnswer(res.Text, mine, cases)
+	case "incomplete":
+		return core.Answer{}, fmt.Errorf("the answer is incomplete (%s)", res.Incomplete)
+	}
+	return core.Answer{}, fmt.Errorf("the answer's status is %q", res.Status)
 }
 
 // fence is an answer wrapped in a Markdown code fence.
@@ -90,7 +172,8 @@ var fence = regexp.MustCompile("(?s)^```(?:json)?\\s*(.*?)\\s*```$")
 // parseAnswer checks the judge's answer as the measured runs did: one JSON object, optionally fenced, whose
 // "rulings" list holds one entry for the one new case, with a ruling of nothing, hold or ban, for hold or ban "by" one
 // of the player's lines the case shows, "like" a list of at most three of the owner's case ids, and "sure" true or
-// false.
+// false. "not ban", a ruling of the owner's cases, is taken as hold; its "by", when given, must be one of the
+// player's lines.
 func parseAnswer(raw string, mine []string, cases int) (core.Answer, error) {
 	raw = strings.TrimSpace(raw)
 	if m := fence.FindStringSubmatch(raw); m != nil {
@@ -116,12 +199,20 @@ func parseAnswer(raw string, mine []string, cases int) (core.Answer, error) {
 	}
 	var a core.Answer
 	a.Ruling, _ = e["ruling"].(string)
-	if a.Ruling != core.RulingNothing && a.Ruling != core.RulingHold && a.Ruling != core.RulingBan {
-		return core.Answer{}, fmt.Errorf("bad ruling: %v", e["ruling"])
-	}
 	a.By, _ = e["by"].(string)
-	if a.Ruling != core.RulingNothing && !slices.Contains(mine, a.By) {
-		return core.Answer{}, fmt.Errorf("by %v is not one of the player's lines", e["by"])
+	switch a.Ruling {
+	case core.RulingNothing:
+	case core.RulingHold, core.RulingBan:
+		if !slices.Contains(mine, a.By) {
+			return core.Answer{}, fmt.Errorf("by %v is not one of the player's lines", e["by"])
+		}
+	case core.RulingNotBan:
+		if e["by"] != nil && !slices.Contains(mine, a.By) {
+			return core.Answer{}, fmt.Errorf("by %v is not one of the player's lines", e["by"])
+		}
+		a.Ruling, a.Given = core.RulingHold, core.RulingNotBan
+	default:
+		return core.Answer{}, fmt.Errorf("bad ruling: %v", e["ruling"])
 	}
 	like, ok := e["like"].([]any)
 	if !ok || len(like) > 3 {

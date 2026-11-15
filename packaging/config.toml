@@ -34,14 +34,18 @@ call_timeout = "800ms"
 max_wait = "900ms"
 threshold = ""
 
-# The judge: the Amazon Bedrock region and model (a model or inference profile ID) it calls, the service tier (flex,
-# default or priority), the most output tokens a call may produce, and how long a call may take. The API key is not
-# set here: `sudo ecc-server bedrock login` stores it encrypted for the service.
+# The judge: the Amazon Bedrock region and model (a model or inference profile ID) it calls through the Responses API,
+# the service tier (flex, default or priority), the reasoning effort (none, low, medium, high, xhigh or max; every
+# judge measurement used medium), the most output tokens a call may produce, reasoning included, and how long a call
+# may take. A failed call (throttling, a server error, a timeout) is tried again from 5 s, doubling, for up to 5
+# minutes; its checkpoint is then put again every 5 minutes until the sitting ends. The API key is not set here:
+# `sudo ecc-server bedrock login` stores it encrypted for the service.
 [judge]
 region = "us-east-1"
 model = "us.moonshotai.kimi-k3.1"
 service_tier = "flex"
-max_output_tokens = 8000
+reasoning_effort = "medium"
+max_output_tokens = 16000
 timeout = "10m"
 
 # What the judge may spend, in US dollars, per UTC day and per UTC month. Prices are the standard tier's, per million
@@ -51,8 +55,8 @@ timeout = "10m"
 # with the alert permission are told once a day (or month). A prompt longer than max_prompt_chars is not sent, and no
 # more than max_calls_per_day calls are made in a UTC day.
 [budget]
-daily_usd = 10.0
-monthly_usd = 150.0
+daily_usd = 25.0
+monthly_usd = 250.0
 input_per_million = 4.40
 output_per_million = 22.00
 cache_read_per_million = 0.22

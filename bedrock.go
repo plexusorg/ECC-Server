@@ -9,7 +9,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -17,15 +16,16 @@ import (
 
 const bedrockCredential = "ecc-server.bedrock-api-key"
 
-// A login check asks for the least output the model accepts (Kimi rejects fewer than 16).
+// A login check asks for the least output and no reasoning.
 const loginCheckMaxTokens = 16
 
-// bedrock calls Amazon Bedrock's Converse API with the Bedrock API key, a bearer token. Each call is one attempt.
+// bedrock calls the OpenAI-compatible Responses API of Amazon Bedrock's runtime endpoint
+// (POST <endpoint>/openai/v1/responses) with the Bedrock API key, a bearer token. Each call is one attempt.
 type bedrock struct {
 	key      string
 	region   string
 	model    string
-	endpoint string // https://bedrock-runtime.<region>.amazonaws.com, or the rig's fake
+	endpoint string // https://bedrock-runtime.<region>.amazonaws.com, or the rig's stub
 	client   *http.Client
 
 	mu          sync.Mutex
@@ -38,8 +38,18 @@ type bedrockStatus struct {
 	Region   string    `json:"region"`
 	Model    string    `json:"model"`
 	Tier     string    `json:"service_tier"`
+	Effort   string    `json:"reasoning_effort"`
 	LastCall time.Time `json:"last_call,omitzero"`
 	Result   string    `json:"result,omitempty"` // "ok", or the failure
+	// LastUsage is the last answered call's usage; Totals sums every answered call since the host started.
+	LastUsage *tokenUsage `json:"last_usage,omitempty"`
+	Totals    callTotals  `json:"since_start"`
+}
+
+type callTotals struct {
+	Calls    int `json:"calls"`
+	Answered int `json:"answered"`
+	tokenUsage
 }
 
 func newBedrock(key string, cfg Config) *bedrock {
@@ -53,7 +63,8 @@ func newBedrock(key string, cfg Config) *bedrock {
 		model:    cfg.Judge.Model,
 		endpoint: strings.TrimSuffix(endpoint, "/"),
 		client:   &http.Client{},
-		st:       bedrockStatus{KeySet: key != "", Region: cfg.Judge.Region, Model: cfg.Judge.Model, Tier: cfg.Judge.ServiceTier},
+		st: bedrockStatus{KeySet: key != "", Region: cfg.Judge.Region, Model: cfg.Judge.Model,
+			Tier: cfg.Judge.ServiceTier, Effort: cfg.Judge.ReasoningEffort},
 	}
 }
 
@@ -61,54 +72,80 @@ func (b *bedrock) status() *bedrockStatus {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	st := b.st
+	if st.LastUsage != nil {
+		u := *st.LastUsage
+		st.LastUsage = &u
+	}
 	return &st
 }
 
-type textBlock struct {
-	Text string `json:"text"`
+// The Responses request: one user message whose input_text parts, joined, are the prompt. The first part ends at an
+// explicit cache breakpoint; with the explicit cache mode only that breakpoint is cached.
+type responsesRequest struct {
+	Model           string           `json:"model"`
+	Input           []responsesInput `json:"input"`
+	MaxOutputTokens int              `json:"max_output_tokens"`
+	Reasoning       *struct {
+		Effort string `json:"effort"`
+	} `json:"reasoning,omitempty"`
+	ServiceTier        string     `json:"service_tier,omitempty"`
+	PromptCacheOptions *cacheMode `json:"prompt_cache_options,omitempty"`
+	Store              bool       `json:"store"`
 }
 
-type converseMessage struct {
-	Role    string      `json:"role"`
-	Content []textBlock `json:"content"`
+type responsesInput struct {
+	Type    string          `json:"type"`
+	Role    string          `json:"role"`
+	Content []responsesPart `json:"content"`
 }
 
-type converseRequest struct {
-	System          []textBlock       `json:"system,omitempty"`
-	Messages        []converseMessage `json:"messages"`
-	InferenceConfig struct {
-		MaxTokens int `json:"maxTokens"`
-	} `json:"inferenceConfig"`
-	ServiceTier *struct {
-		Type string `json:"type"`
-	} `json:"serviceTier,omitempty"`
+type responsesPart struct {
+	Type       string     `json:"type"`
+	Text       string     `json:"text"`
+	Breakpoint *cacheMode `json:"prompt_cache_breakpoint,omitempty"`
 }
 
-type converseResponse struct {
-	Output struct {
-		Message struct {
-			Content []struct {
-				Text string `json:"text"` // empty for a block that is not text, such as reasoning
-			} `json:"content"`
-		} `json:"message"`
+type cacheMode struct {
+	Mode string `json:"mode"`
+}
+
+type responsesResponse struct {
+	Status            string `json:"status"`
+	IncompleteDetails *struct {
+		Reason string `json:"reason"`
+	} `json:"incomplete_details"`
+	Output []struct {
+		Type    string `json:"type"`
+		Content []struct {
+			Type    string `json:"type"`
+			Text    string `json:"text"`
+			Refusal string `json:"refusal"`
+		} `json:"content"`
 	} `json:"output"`
-	StopReason string `json:"stopReason"`
-	Usage      struct {
-		InputTokens           int `json:"inputTokens"`
-		OutputTokens          int `json:"outputTokens"`
-		CacheReadInputTokens  int `json:"cacheReadInputTokens"`
-		CacheWriteInputTokens int `json:"cacheWriteInputTokens"`
+	Usage *struct {
+		InputTokens        int `json:"input_tokens"`
+		OutputTokens       int `json:"output_tokens"`
+		InputTokensDetails struct {
+			CachedTokens     int  `json:"cached_tokens"`
+			CacheWriteTokens *int `json:"cache_write_tokens"`
+		} `json:"input_tokens_details"`
+		OutputTokensDetails struct {
+			ReasoningTokens int `json:"reasoning_tokens"`
+		} `json:"output_tokens_details"`
 	} `json:"usage"`
+	ServiceTier string `json:"service_tier"`
 }
 
-// converseAnswer is a 200 from Bedrock. A refusal or a token cap is still an answer; the judge checks Text.
-type converseAnswer struct {
-	StopReason string
-	Text       string // every text block of the output message, joined
+// judgeAnswer is a 200 from Bedrock. An incomplete answer is still an answer; the judge checks it.
+type judgeAnswer struct {
+	Status     string // "completed", "incomplete", ...
+	Incomplete string // incomplete_details.reason
+	Text       string // every output_text part of the output messages, joined
 	Usage      tokenUsage
+	Tier       string // the service tier that served it
 }
 
-// bedrockError is an answer from Bedrock other than 200, or a 200 whose body is not a Converse response.
+// bedrockError is an answer from Bedrock other than 200, or a 200 whose body is not a Responses answer.
 type bedrockError struct {
 	Status  int
 	Type    string // the x-amzn-ErrorType, such as ThrottlingException
@@ -127,23 +164,32 @@ func (e *bedrockError) auth() bool {
 	return e.Status == http.StatusUnauthorized || e.Status == http.StatusForbidden
 }
 
-// converse sends one user message to the model, with system as the system prompt when it is not empty, on the
-// given service tier ("" for the account's default).
-func (b *bedrock) converse(ctx context.Context, system, user string, maxTokens int, tier string) (*converseAnswer, error) {
-	var body converseRequest
-	if system != "" {
-		body.System = []textBlock{{Text: system}}
+// passing reports a failure that a later attempt may not meet: throttling or a server error.
+func (e *bedrockError) passing() bool {
+	return e.Status == http.StatusTooManyRequests || e.Status >= 500
+}
+
+// respond sends the prompt as one user message of two input_text parts, split at the byte offset split (0: one part,
+// not cached): the first part carries an explicit cache breakpoint. effort "" leaves the model's default reasoning,
+// tier "" the account's default tier.
+func (b *bedrock) respond(ctx context.Context, prompt string, split, maxTokens int, effort, tier string) (*judgeAnswer, error) {
+	body := responsesRequest{Model: b.model, MaxOutputTokens: maxTokens, ServiceTier: tier}
+	msg := responsesInput{Type: "message", Role: "user"}
+	if split > 0 && split < len(prompt) {
+		body.PromptCacheOptions = &cacheMode{"explicit"}
+		msg.Content = []responsesPart{{Type: "input_text", Text: prompt[:split], Breakpoint: &cacheMode{"explicit"}},
+			{Type: "input_text", Text: prompt[split:]}}
+	} else {
+		msg.Content = []responsesPart{{Type: "input_text", Text: prompt}}
 	}
-	body.Messages = []converseMessage{{Role: "user", Content: []textBlock{{Text: user}}}}
-	body.InferenceConfig.MaxTokens = maxTokens
-	if tier != "" {
-		body.ServiceTier = &struct {
-			Type string `json:"type"`
-		}{tier}
+	body.Input = []responsesInput{msg}
+	if effort != "" {
+		body.Reasoning = &struct {
+			Effort string `json:"effort"`
+		}{effort}
 	}
 	raw, _ := json.Marshal(body)
-	endpoint := b.endpoint + "/model/" + url.PathEscape(b.model) + "/converse"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(raw))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, b.endpoint+"/openai/v1/responses", bytes.NewReader(raw))
 	if err != nil {
 		return nil, err
 	}
@@ -164,46 +210,84 @@ func (b *bedrock) converse(ctx context.Context, system, user string, maxTokens i
 		e.Type, _, _ = strings.Cut(e.Type, ":")
 		var msg struct {
 			Message string `json:"message"`
+			Error   struct {
+				Message string `json:"message"`
+				Type    string `json:"type"`
+			} `json:"error"`
 		}
-		if json.Unmarshal(data, &msg) == nil && msg.Message != "" {
+		switch {
+		case json.Unmarshal(data, &msg) == nil && msg.Message != "":
 			e.Message = msg.Message
-		} else {
+		case msg.Error.Message != "":
+			e.Message = msg.Error.Message
+			if e.Type == "" {
+				e.Type = msg.Error.Type
+			}
+		default:
 			e.Message = truncate(strings.TrimSpace(string(data)), 200)
 		}
 		return nil, e
 	}
-	var out converseResponse
-	if err := json.Unmarshal(data, &out); err != nil || out.StopReason == "" {
-		return nil, &bedrockError{Status: resp.StatusCode, Message: "the answer is not a Converse response"}
+	var out responsesResponse
+	if err := json.Unmarshal(data, &out); err != nil || out.Status == "" || out.Usage == nil {
+		return nil, &bedrockError{Status: resp.StatusCode, Message: "the answer is not a Responses answer"}
+	}
+	a := &judgeAnswer{Status: out.Status, Tier: out.ServiceTier}
+	if out.IncompleteDetails != nil {
+		a.Incomplete = out.IncompleteDetails.Reason
 	}
 	var text strings.Builder
-	for _, c := range out.Output.Message.Content {
-		text.WriteString(c.Text)
+	for _, o := range out.Output {
+		if o.Type != "message" {
+			continue // reasoning
+		}
+		for _, c := range o.Content {
+			if c.Type == "output_text" {
+				text.WriteString(c.Text)
+			}
+		}
 	}
+	a.Text = text.String()
 	u := out.Usage
-	return &converseAnswer{StopReason: out.StopReason, Text: text.String(),
-		Usage: tokenUsage{Input: u.InputTokens, Output: u.OutputTokens, CacheRead: u.CacheReadInputTokens,
-			CacheWrite: u.CacheWriteInputTokens}}, nil
+	a.Usage = tokenUsage{Input: u.InputTokens, Output: u.OutputTokens, Cached: u.InputTokensDetails.CachedTokens,
+		CacheWrite: u.InputTokensDetails.CacheWriteTokens, Reasoning: u.OutputTokensDetails.ReasoningTokens}
+	return a, nil
 }
 
 // record keeps a judge call's outcome for status and logs it: sizes, tokens and cost only, since the prompt and the
 // answer hold the owner's cases and player chat. A refused key is logged once per outage, with the fix.
-func (b *bedrock) record(err error, promptBytes int, res *converseAnswer, cost float64, took time.Duration) {
+func (b *bedrock) record(err error, promptBytes int, res *judgeAnswer, cost float64, took time.Duration) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.st.LastCall = time.Now()
+	b.st.Totals.Calls++
 	took = took.Round(time.Millisecond)
 	usd := fmt.Sprintf("%.4f", cost)
 	if err == nil {
 		b.st.Result = "ok"
+		u := res.Usage
+		b.st.LastUsage = &u
+		t := &b.st.Totals
+		t.Answered++
+		t.Input += u.Input
+		t.Output += u.Output
+		t.Cached += u.Cached
+		t.Reasoning += u.Reasoning
+		if u.CacheWrite != nil {
+			n := *u.CacheWrite
+			if t.CacheWrite != nil {
+				n += *t.CacheWrite
+			}
+			t.CacheWrite = &n
+		}
 		if b.authFailing {
 			slog.Info("Bedrock accepts the key again")
 			b.authFailing = false
 		}
-		slog.Info("judge call", "stop_reason", res.StopReason, "prompt_bytes", promptBytes, "text_bytes", len(res.Text),
-			"input_tokens", res.Usage.Input, "cache_read_tokens", res.Usage.CacheRead,
-			"cache_write_tokens", res.Usage.CacheWrite, "output_tokens", res.Usage.Output, "usd", usd,
-			"took", took.String())
+		slog.Info("judge call", "status", res.Status, "incomplete", res.Incomplete, "prompt_bytes", promptBytes,
+			"text_bytes", len(res.Text), "input_tokens", u.Input, "cached_tokens", u.Cached,
+			"cache_write_tokens", u.writeText(), "output_tokens", u.Output, "reasoning_tokens", u.Reasoning,
+			"service_tier", res.Tier, "usd", usd, "took", took.String())
 		return
 	}
 	b.st.Result = err.Error()

@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"regexp"
+	"slices"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -59,7 +60,9 @@ type JudgeConfig struct {
 	Region string `toml:"region"`
 	Model  string `toml:"model"`
 	// ServiceTier is Bedrock's service tier: flex, default or priority.
-	ServiceTier     string        `toml:"service_tier"`
+	ServiceTier string `toml:"service_tier"`
+	// ReasoningEffort is the Responses API's reasoning.effort: none, low, medium, high, xhigh or max.
+	ReasoningEffort string        `toml:"reasoning_effort"`
 	MaxOutputTokens int           `toml:"max_output_tokens"`
 	Timeout         time.Duration `toml:"timeout"`
 }
@@ -93,8 +96,13 @@ type ChatConfig struct {
 type TestConfig struct {
 	// HoldWordsFile names a file of words, one a line: the rig's scorer holds a line that contains one of them.
 	HoldWordsFile string `toml:"hold_words_file"`
-	// BedrockEndpoint replaces the Bedrock runtime endpoint (a local fake of the Converse API).
+	// BedrockEndpoint replaces the Bedrock runtime endpoint (a local stub of the Responses API).
 	BedrockEndpoint string `toml:"bedrock_endpoint"`
+	// Set, these replace the judge's first wait after a failed call (5s), how long failures are retried (5m) and when
+	// a pending checkpoint is put again (5m).
+	JudgeBackoff    time.Duration `toml:"judge_backoff"`
+	JudgeRetryFor   time.Duration `toml:"judge_retry_for"`
+	JudgeRetryAfter time.Duration `toml:"judge_retry_after"`
 }
 
 var serverName = regexp.MustCompile(`^[a-z0-9_-]{1,32}$`)
@@ -108,8 +116,8 @@ func loadConfig(path string) (Config, error) {
 		CheckInterval: 10 * time.Minute,
 		Model:         ModelConfig{Threads: 6, CallTimeout: 800 * time.Millisecond, MaxWait: 900 * time.Millisecond},
 		Judge: JudgeConfig{Region: "us-east-1", Model: "us.moonshotai.kimi-k3.1", ServiceTier: "flex",
-			MaxOutputTokens: 8000, Timeout: 10 * time.Minute},
-		Budget: BudgetConfig{DailyUSD: 10, MonthlyUSD: 150, InputPerMillion: 4.40, OutputPerMillion: 22.00,
+			ReasoningEffort: "medium", MaxOutputTokens: 16000, Timeout: 10 * time.Minute},
+		Budget: BudgetConfig{DailyUSD: 25, MonthlyUSD: 250, InputPerMillion: 4.40, OutputPerMillion: 22.00,
 			CacheReadPerMillion: 0.22, CacheWritePerMillion: 5.50, MaxPromptChars: 500000, MaxCallsPerDay: 2000}}
 	md, err := toml.DecodeFile(path, &cfg)
 	if err != nil {
@@ -153,6 +161,8 @@ func loadConfig(path string) (Config, error) {
 		return bad("judge.model is empty")
 	case j.ServiceTier != "flex" && j.ServiceTier != "default" && j.ServiceTier != "priority":
 		return bad("judge.service_tier must be flex, default or priority")
+	case !slices.Contains([]string{"none", "low", "medium", "high", "xhigh", "max"}, j.ReasoningEffort):
+		return bad("judge.reasoning_effort must be none, low, medium, high, xhigh or max")
 	case j.MaxOutputTokens < 16:
 		return bad("judge.max_output_tokens must be at least 16")
 	case j.Timeout < 10*time.Second:

@@ -11,6 +11,7 @@ import (
 	"slices"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -20,17 +21,20 @@ import (
 )
 
 const replayUsage = `ecc-server replay -config FILE -lines FILE -fold DIR -out DIR [-mode parity|live]
-                    [-bundle DIR [-threads 6] [-threshold NAME]]
+                    [-judge-delay 15s] [-bundle DIR [-threads 6] [-threshold NAME]]
 
 Feeds recorded lines through the decision core on a virtual clock, with the fast model's recorded verdicts (or, with
 -bundle, the bundle's models scoring every line) and the judge's saved answers, and writes the record, one line per
-sitting and a summary to DIR.
+sitting and a summary to DIR. The core's timers run at their time; a ruling arrives -judge-delay after its checkpoint
+(after the call is put, for a call that waited for another), as an event of its own, the lines before it handled
+first.
 
   -config  the core's settings (TOML: the [core] table of the server's config)
-  -lines   the lines, one JSON event a line: {"type":"stream",...} or {"type":"line",...}
+  -lines   the lines, one JSON event a line: {"type":"stream", "name", "day"}, {"type":"line",...} or
+           {"type":"presence", "kind": "join"|"leave", "account", "time"}; text and names prepared
   -fold    question.md, format.md, cases.json, answers.json (sha256 of the prompt -> answer), expected.json
   -mode    parity: sittings and the sitting-end checkpoint as the lines name them, no waiting-time or every-n-th
-           checkpoint; checkpoints of sittings not in
+           checkpoint, rulings at once (as the measured replay ruled); checkpoints of sittings not in
            expected.json's judged_sittings are built and not sent, and a prompt with no saved answer stops the replay.
            live: sittings from presence and silence, the waiting-time checkpoint; a prompt with no saved answer is
            counted and its lines stay held.
@@ -39,6 +43,7 @@ sitting and a summary to DIR.
 // replayEvent is one line of the replay's input.
 type replayEvent struct {
 	Type          string `json:"type"`
+	Kind          string `json:"kind"`
 	Name          string `json:"name"`
 	Day           string `json:"day"`
 	ID            string `json:"id"`
@@ -185,9 +190,10 @@ func replay(args []string) error {
 	bundle := fs.String("bundle", "", "")
 	threads := fs.Int("threads", 6, "")
 	threshold := fs.String("threshold", "", "")
+	judgeDelay := fs.Duration("judge-delay", 15*time.Second, "")
 	_ = fs.Parse(args)
 	if *configPath == "" || *linesPath == "" || *foldDir == "" || *outDir == "" || fs.NArg() != 0 ||
-		(*mode != "parity" && *mode != "live") {
+		(*mode != "parity" && *mode != "live") || *judgeDelay < 0 {
 		fs.Usage()
 		os.Exit(2)
 	}
@@ -202,9 +208,10 @@ func replay(args []string) error {
 		return fmt.Errorf("config %s: unknown keys %v", *configPath, keys)
 	}
 	cfg := rc.Core
-	cfg.Zone = time.UTC
+	delay := *judgeDelay
 	if parity {
 		cfg.DriverSittings, cfg.LastHeldView, cfg.Wait, cfg.Every = true, true, 0, 0
+		delay = 0
 	} else {
 		cfg.DriverSittings, cfg.LastHeldView = false, false
 	}
@@ -272,26 +279,49 @@ func replay(args []string) error {
 			lastOf[ev.Sitting] = i
 		}
 	}
+
+	// A judge call put at time t is answered at the later of t and its checkpoint's time plus the delay, as an event of
+	// its own: the lines and timers before then are handled first.
+	type ruling struct {
+		job *core.Job
+		due time.Time
+		a   core.Answer
+		err error
+	}
+	var pending []ruling
 	var stop error
 	notSent := 0
-	run := func(r core.Result) {
-		jobs := r.Jobs
-		for len(jobs) > 0 && stop == nil {
-			j := jobs[0]
-			jobs = jobs[1:]
-			var res core.Result
+	put := func(r core.Result, at time.Time) {
+		for _, j := range r.Jobs {
+			p := ruling{job: j, due: later(j.At, at).Add(delay)}
 			if parity && !judged[j.Sitting] {
 				notSent++
-				res = eng.Rule(j, core.Answer{}, core.ErrNotSent)
+				p.due, p.err = later(j.At, at), core.ErrNotSent
 			} else {
-				a, err := judge.Rule(j)
-				if err != nil && parity {
-					stop = fmt.Errorf("checkpoint %s#%d (sha256 %s): %w", j.Sitting, j.K, j.Hash, err)
-					return
+				p.a, p.err = judge.Rule(j)
+				if p.err != nil && parity && stop == nil {
+					stop = fmt.Errorf("checkpoint %s#%d (sha256 %s): %w", j.Sitting, j.K, j.Hash, p.err)
 				}
-				res = eng.Rule(j, a, err)
 			}
-			jobs = append(jobs, res.Jobs...)
+			i := sort.Search(len(pending), func(i int) bool { return pending[i].due.After(p.due) })
+			pending = slices.Insert(pending, i, p)
+		}
+	}
+	// until runs the rulings and timers due by t, in time order, a ruling before a timer of the same time.
+	until := func(t time.Time) {
+		for stop == nil {
+			due, timer := eng.NextDue()
+			switch {
+			case len(pending) > 0 && !pending[0].due.After(t) && (!timer || !pending[0].due.After(due)):
+				p := pending[0]
+				pending = pending[1:]
+				put(eng.Tick(p.due), p.due)
+				put(eng.Rule(p.job, p.a, p.err), p.due)
+			case timer && !due.After(t):
+				put(eng.Tick(due), due)
+			default:
+				return
+			}
 		}
 	}
 	var last time.Time
@@ -311,16 +341,26 @@ func replay(args []string) error {
 					scorer.verdicts[x.ID] = core.Verdict{Hold: x.Verdict == "hold", Kinds: x.Kinds}
 				}
 			}
-			if day.Before(last) {
-				day = last
+			day = later(day, last)
+			until(day)
+			put(eng.Start(ev.Name, day), day)
+		case "presence":
+			t, err := time.Parse(time.RFC3339, ev.Time)
+			if err != nil {
+				return fmt.Errorf("presence of %s: %w", ev.Account, err)
 			}
-			run(eng.Start(ev.Name, day))
+			if ev.Kind != "join" && ev.Kind != "leave" {
+				return fmt.Errorf("presence of %s: kind %q is not join or leave", ev.Account, ev.Kind)
+			}
+			last = later(last, t)
+			until(t)
+			put(eng.Presence(ev.Account, ev.Kind == "join", t), t)
 		case "line":
 			t, err := time.Parse(time.RFC3339, ev.Time)
 			if err != nil {
 				return fmt.Errorf("line %s: %w", ev.ID, err)
 			}
-			last = t
+			last = later(last, t)
 			if *bundle != "" && ev.Speaker == "" {
 				return fmt.Errorf("line %s has no speaker, which the models need", ev.ID)
 			}
@@ -328,12 +368,17 @@ func replay(args []string) error {
 			if !parity {
 				sit = ""
 			}
-			r := eng.Line(core.Line{ID: ev.ID, Time: t, Channel: ev.Channel, Conversation: ev.Conversation,
-				Private: ev.Private, Account: ev.Account, Name: ev.Shown, Speaker: ev.Speaker, TargetAccount: ev.TargetAccount,
-				Target: ev.Target, Text: ev.Text, Sent: ev.Sent, Context: ev.Context || ev.Trusted, Sitting: sit})
-			run(r)
+			until(t)
+			// the input's text and names are prepared already; the repeat key is the text and the name as the
+			// dossiers keyed them
+			put(eng.Line(core.Line{ID: ev.ID, Time: t, Channel: ev.Channel, Conversation: ev.Conversation,
+				Private: ev.Private, Account: ev.Account, Name: ev.Shown, Speaker: ev.Speaker, RawName: ev.Shown,
+				TargetAccount: ev.TargetAccount, Target: ev.Target, Text: ev.Text, Raw: ev.Text, Key: ev.Text,
+				KeyName: core.KeyName(ev.Channel, ev.Shown, strings.TrimPrefix(ev.Speaker, "discord:")), Sent: ev.Sent,
+				Context: ev.Context || ev.Trusted, Sitting: sit}), t)
 			if parity && ev.Sitting != "" && lastOf[ev.Sitting] == i {
-				run(eng.End(ev.Sitting, t))
+				until(t)
+				put(eng.End(ev.Sitting, t), t)
 			}
 		default:
 			return fmt.Errorf("unknown event type %q", ev.Type)
@@ -342,9 +387,15 @@ func replay(args []string) error {
 			return stop
 		}
 	}
-	run(eng.Close(last.Add(24 * time.Hour)))
+	end := last.Add(24 * time.Hour)
+	until(end)
+	put(eng.Close(end), end)
+	until(end.Add(24 * time.Hour))
 	if stop != nil {
 		return stop
+	}
+	if len(pending) > 0 {
+		return fmt.Errorf("%d judge calls left unanswered at the end", len(pending))
 	}
 	if err := rec.w.Flush(); err != nil {
 		return err
@@ -374,6 +425,13 @@ func replay(args []string) error {
 	}
 	fmt.Println(string(b))
 	return nil
+}
+
+func later(a, b time.Time) time.Time {
+	if b.After(a) {
+		return b
+	}
+	return a
 }
 
 // parityHeldSets is each input sitting's held lines, keyed as summarize keys a replayed sitting's.

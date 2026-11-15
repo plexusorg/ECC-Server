@@ -5,6 +5,7 @@
 package model
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -77,9 +78,17 @@ type Spec struct {
 	} `json:"thresholds"`
 }
 
-// rulesSHA256 is the sha256 of the rules bundle.json states in words (rules()), as this package implements them. A
-// bundle that states other rules is refused rather than scored by the wrong ones.
-const rulesSHA256 = "f9a5b2eae3d9c926dcc1d780cb68024517f69791521c997b8e7b6e4a04d7ad6b"
+// RulesSHA256 is the sha256 of the rules bundle.json states in words and patterns, at the paths of Rules, as this
+// server implements them (the models' inputs here, the channels, the text preparation and the link rule in core). A
+// bundle that states other rules is refused rather than served by the wrong ones.
+const RulesSHA256 = "09bed914c65a59282c887272dff4b70222f91c78d6f981ceff5b30c164b8e74f"
+
+// Rules is the paths in bundle.json of the rules RulesSHA256 covers, in order.
+var Rules = []string{"context.rule", "sh.line_string", "sh.line_tokens", "sh.slot", "sh.gap", "sh.pos", "c.roles",
+	"c.line_string", "c.input_ids", "channels", "text.rule", "text.whitespace", "text.patterns.section",
+	"text.patterns.codes", "text.patterns.url", "text.patterns.ipv4", "text.patterns.ipv6", "text.patterns.not_secure",
+	"text.patterns.icons", "text.patterns.discord_tags", "text.shown", "text.discord_name", "text.names", "text.repeat",
+	"links.pattern", "links.rule"}
 
 // The rules that bundle.json states in words, with the numbers in them this package uses: SH keeps the first
 // shLineIDs ids of a line string, and a gap is at most maxGap.
@@ -88,15 +97,63 @@ const (
 	maxGap    = 11
 )
 
-func (s *Spec) rules() string {
-	return strings.Join([]string{s.Context.Rule, s.SH.LineString, s.SH.LineTokens, s.SH.Slot, s.SH.Gap, s.SH.Pos,
-		s.C.Roles, s.C.LineString, s.C.InputIDs}, "\x00")
+// RulesHash is the sha256 of the UTF-8 of the values at the paths of Rules in bundle.json, joined by U+0000; a list
+// is its items joined by one space, numbers in decimal (bundle.json rules.how).
+func RulesHash(bundleJSON []byte) (string, error) {
+	d := json.NewDecoder(bytes.NewReader(bundleJSON))
+	d.UseNumber()
+	var b map[string]any
+	if err := d.Decode(&b); err != nil {
+		return "", fmt.Errorf("bundle.json: %w", err)
+	}
+	vals := make([]string, 0, len(Rules))
+	for _, p := range Rules {
+		var v any = b
+		for _, k := range strings.Split(p, ".") {
+			m, _ := v.(map[string]any)
+			v = m[k]
+		}
+		s, err := ruleText(v)
+		if err != nil {
+			return "", fmt.Errorf("bundle.json %s: %w", p, err)
+		}
+		vals = append(vals, s)
+	}
+	h := sha256.Sum256([]byte(strings.Join(vals, "\x00")))
+	return hex.EncodeToString(h[:]), nil
 }
 
-// RulesHash is the sha256 of the rules a bundle states in words.
-func (s *Spec) RulesHash() string {
-	h := sha256.Sum256([]byte(s.rules()))
-	return hex.EncodeToString(h[:])
+func ruleText(v any) (string, error) {
+	switch x := v.(type) {
+	case string:
+		return x, nil
+	case json.Number:
+		return x.String(), nil
+	case []any:
+		parts := make([]string, len(x))
+		for i, e := range x {
+			s, err := ruleText(e)
+			if err != nil {
+				return "", err
+			}
+			parts[i] = s
+		}
+		return strings.Join(parts, " "), nil
+	}
+	return "", errors.New("missing, or not text, a number or a list")
+}
+
+// CheckRules refuses a bundle.json whose rules hash differently from RulesSHA256.
+func CheckRules(bundleJSON []byte) error {
+	h, err := RulesHash(bundleJSON)
+	if err != nil {
+		return err
+	}
+	if h != RulesSHA256 {
+		return fmt.Errorf("bundle.json states rules this server does not implement (their sha256 is %s, this server's %s)",
+			h, RulesSHA256)
+	}
+	return nil
 }
 
 // ReadSpec reads bundle.json's scoring part and checks that this package can score by it.
@@ -109,8 +166,8 @@ func ReadSpec(dir string) (*Spec, error) {
 	if err := json.Unmarshal(raw, &s); err != nil {
 		return nil, fmt.Errorf("bundle.json: %w", err)
 	}
-	if h := s.RulesHash(); h != rulesSHA256 {
-		return nil, fmt.Errorf("bundle.json states scoring rules this server does not implement (their sha256 is %s)", h)
+	if err := CheckRules(raw); err != nil {
+		return nil, err
 	}
 	for _, name := range []string{"sh_line_encoder", "sh_context", "c"} {
 		g, ok := s.Graphs[name]
@@ -397,14 +454,24 @@ func (s *Scorer) remember(st *stream, e *entry) {
 	}
 }
 
+// authorKey is a speaker's key lowercased: the account name, or "discord:" and the lowercased name (lowered alone, as
+// the training pipeline lowered it: the prefix would change a final sigma's context).
+func authorKey(speaker string) string {
+	if name, ok := strings.CutPrefix(speaker, "discord:"); ok {
+		return "discord:" + core.Lower(name)
+	}
+	return core.Lower(speaker)
+}
+
 // entryOf is the line as the models see it: author and partner keys, whole seconds, SH's input ids. A line's author
-// key is Line.Speaker lowercased: the speaker's account name, or for a Discord relay "discord:" and the shown name.
+// key is Line.Speaker lowercased as Python's str.lower() does: the speaker's account name, or for a Discord relay "discord:"
+// and its prepared name.
 func (s *Scorer) entryOf(l core.Line) *entry {
-	e := &entry{id: l.ID, time: l.Time.Unix(), channel: l.Channel, author: strings.ToLower(l.Speaker),
+	e := &entry{id: l.ID, time: l.Time.Unix(), channel: l.Channel, author: authorKey(l.Speaker),
 		text: l.Text}
 
 	if l.Channel == s.spec.Context.Private {
-		e.partner = strings.ToLower(l.Target)
+		e.partner = core.Lower(l.Target)
 	}
 	str := e.text
 	if e.channel != "chat" {

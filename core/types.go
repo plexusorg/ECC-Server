@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// Line is one line as the plugin sends it, with the number the server gives it in its stream.
+// Line is one line with its text prepared (text.go), with the number the server gives it in its stream.
 type Line struct {
 	// ID is the line's number in its stream as the judge sees it ("L<n>"); Stream names the stream (set by the engine).
 	ID           string
@@ -20,14 +20,24 @@ type Line struct {
 	// Private marks a two-player conversation (a private message): the judge sees it among that conversation's lines
 	// only.
 	Private bool
-	// Account is the speaker's player key (UUID); Name is the name shown with the line; Speaker is the speaker's
-	// account name, the key the fast model knows them by (a Discord relay: "discord:" and the shown name).
+	// Account is the speaker's player key (UUID); Name is the name the judge sees with the line (the prepared shown
+	// name on chat and guild, the account name elsewhere, a Discord relay's prepared name); Speaker is the key the fast
+	// model knows the speaker by: the account name, or for a Discord relay "discord:" and its prepared name. RawName is
+	// the name as sent, for the record.
 	Account       string
 	Name          string
 	Speaker       string
+	RawName       string
 	TargetAccount string
 	Target        string
-	Text          string
+	// Text is the prepared text (steps 1-7); Raw the text as sent. Key is the text and KeyName the name a repeat is
+	// keyed by (KeyName): the text after step 6 and the name before step 7. Empty marks a text that preparation
+	// emptied: the line is delivered and dropped.
+	Text    string
+	Raw     string
+	Key     string
+	KeyName string
+	Empty   bool
 	// Sent is how many times the line was sent (1 for a single send): it and its repeats.
 	Sent int
 	// Context marks a line that is context for other lines only: no player's own (a Discord relay), or a trusted
@@ -62,14 +72,18 @@ const (
 	RulingNothing = "nothing"
 	RulingHold    = "hold"
 	RulingBan     = "ban"
+	// RulingNotBan is a ruling of the owner's cases; a judge that answers it is taken as ruling hold.
+	RulingNotBan = "not ban"
 )
 
 // Answer is the judge's answer on one checkpoint.
 type Answer struct {
-	Ruling string   `json:"ruling"`
-	By     string   `json:"by,omitempty"`
-	Like   []string `json:"like,omitempty"`
-	Sure   *bool    `json:"sure,omitempty"`
+	Ruling string `json:"ruling"`
+	// Given is the judge's own word when the core takes it as another ruling (not ban as hold).
+	Given string   `json:"given,omitempty"`
+	By    string   `json:"by,omitempty"`
+	Like  []string `json:"like,omitempty"`
+	Sure  *bool    `json:"sure,omitempty"`
 }
 
 // Judge rules one checkpoint: its Prompt, with Mine and Cases to check the answer against.

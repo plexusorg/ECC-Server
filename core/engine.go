@@ -35,8 +35,11 @@ type Config struct {
 	MaxCallsPerDay int `toml:"max_calls_per_day"`
 	// ReviewHeld puts on the review queue a sitting that ends unbanned with this many held lines.
 	ReviewHeld int `toml:"review_held"`
-	// Zone is the time zone of the case's times and day.
-	Zone *time.Location `toml:"-"`
+	// Channels is the channels a line may have (bundle.json `channels`); a line on another channel is held, never
+	// scored or shown, and puts its sitting on the review queue. Empty: any channel.
+	Channels []string `toml:"channels"`
+	// RetryAfter: a checkpoint the judge could not be reached for (ErrPending) is put again this long after.
+	RetryAfter time.Duration `toml:"retry_after"`
 }
 
 // Job is one checkpoint for the caller to put to the judge and hand back to Engine.Rule.
@@ -49,8 +52,13 @@ type Job struct {
 	// Line is the last line the checkpoint shows.
 	Line   string
 	Prompt string
-	Hash   string
-	Chars  int
+	// Split is the length in bytes of the prompt's part the owner's cases end, the part every prompt shares: the
+	// question and the cases, before SepNew.
+	Split int
+	Hash  string
+	Chars int
+	// At is when the checkpoint was made.
+	At time.Time
 	// Mine is the ids of the player's lines the case shows, the lines a hold or ban may name; Cases is how many of the
 	// owner's cases the prompt lists.
 	Mine  []string
@@ -84,12 +92,17 @@ type sitting struct {
 	kept            int
 	inFlight        *Job
 	waiting         []*Job
-	banned          bool
-	banLine         string
-	warned          bool
-	unjudged        bool
-	ending          bool
-	checkpoints     []CheckpointRecord
+	// parked: the call in flight could not reach the judge; it is put again at retryAt.
+	parked  bool
+	retryAt time.Time
+	// unknown counts the player's lines on channels outside Config.Channels.
+	unknown     int
+	banned      bool
+	banLine     string
+	warned      bool
+	unjudged    bool
+	ending      bool
+	checkpoints []CheckpointRecord
 }
 
 // Engine is the decision core. It is not safe for concurrent use; the server calls it under one lock.
@@ -115,6 +128,8 @@ type Engine struct {
 	// copies is, per speaker, channel, target and text, the last line with that text and the time of its last copy,
 	// for repeats.
 	copies map[copyKey]lastCopy
+	// unknown counts the lines taken on each channel outside Config.Channels.
+	unknown map[string]int
 }
 
 // copyKey is what a repeat shares with the line it repeats: the speaker's shown name (lower case), the channel, the
@@ -127,20 +142,15 @@ type lastCopy struct {
 }
 
 func NewEngine(cfg Config, texts Texts, scorer Scorer, rec Recorder) *Engine {
-	if cfg.Zone == nil {
-		cfg.Zone = time.UTC
-	}
 	return &Engine{cfg: cfg, texts: texts, scorer: scorer, rec: rec,
 		open: map[string]*sitting{}, live: map[string]*sitting{}, online: map[string]bool{}, left: map[string]time.Time{},
-		closed: map[string]bool{}, banned: map[string]bool{}, calls: map[string]int{}, copies: map[copyKey]lastCopy{}}
+		closed: map[string]bool{}, banned: map[string]bool{}, calls: map[string]int{}, copies: map[copyKey]lastCopy{},
+		unknown: map[string]int{}}
 }
 
 // Swap replaces the configuration, the judge's texts and the scorer (a new bundle). Open sittings keep their lines
 // and rulings; their later checkpoints use the new texts and settings.
 func (e *Engine) Swap(cfg Config, texts Texts, scorer Scorer) {
-	if cfg.Zone == nil {
-		cfg.Zone = time.UTC
-	}
 	e.cfg, e.texts, e.scorer = cfg, texts, scorer
 	e.links, _ = NewLinks(e.allow, cfg.CanonicalLink)
 }
@@ -160,24 +170,46 @@ func (e *Engine) AllowLinks(allowed []string) error {
 type Status struct {
 	Stream   string `json:"stream"`
 	Sittings int    `json:"open_sittings"`
-	// Unruled counts the held lines of open sittings that no ruling covers yet; InFlight the judge calls running.
+	// Unruled counts the held lines of open sittings that no ruling covers yet; InFlight the judge calls running;
+	// Pending the checkpoints waiting to be put again after the judge could not be reached.
 	Unruled  int `json:"held_unruled"`
 	InFlight int `json:"judge_calls_in_flight"`
+	Pending  int `json:"checkpoints_pending"`
+	// UnknownChannels counts, by channel, the lines taken on channels outside the bundle's.
+	UnknownChannels map[string]int `json:"unknown_channels"`
 }
 
 func (e *Engine) Status() Status {
-	var st Status
+	st := Status{UnknownChannels: map[string]int{}}
 	if e.st != nil {
 		st.Stream = e.st.name
 	}
 	for _, s := range e.open {
 		st.Sittings++
 		st.Unruled += len(s.held) - s.ruled
-		if s.inFlight != nil {
+		switch {
+		case s.parked:
+			st.Pending++
+		case s.inFlight != nil:
 			st.InFlight++
 		}
 	}
+	for c, n := range e.unknown {
+		st.UnknownChannels[c] = n
+	}
 	return st
+}
+
+// Known tells whether a line may have this channel (Config.Channels).
+func (e *Engine) Known(channel string) bool {
+	return len(e.cfg.Channels) == 0 || slices.Contains(e.cfg.Channels, channel)
+}
+
+// at moves the engine's clock to t, never back.
+func (e *Engine) at(t time.Time) {
+	if t.After(e.now) {
+		e.now = t
+	}
 }
 
 // Records.
@@ -190,8 +222,10 @@ type LineRecord struct {
 	Conversation string   `json:"conversation"`
 	Account      string   `json:"account"`
 	Name         string   `json:"name"`
+	RawName      string   `json:"raw_name,omitempty"`
 	Target       string   `json:"target,omitempty"`
 	Text         string   `json:"text"`
+	Raw          string   `json:"raw"`
 	Sitting      string   `json:"sitting,omitempty"`
 	Context      bool     `json:"context,omitempty"`
 	Verdict      string   `json:"verdict"`
@@ -221,6 +255,9 @@ type RulingRecord struct {
 	Hash    string `json:"sha256"`
 	Answer  Answer `json:"answer"`
 	Error   string `json:"error,omitempty"`
+	// Pending: the judge could not be reached; the checkpoint is put again at Retry.
+	Pending bool   `json:"pending,omitempty"`
+	Retry   string `json:"retry,omitempty"`
 	Covers  int    `json:"covers"`
 }
 
@@ -267,12 +304,11 @@ const (
 // Start begins a new stream (the game server started): every open sitting ends.
 func (e *Engine) Start(name string, at time.Time) Result {
 	r := e.advance(at)
-	e.now = at
+	e.at(at)
 	for _, s := range e.sortedOpen() {
 		r.add(e.endSitting(s))
 	}
-	y, m, d := at.In(e.cfg.Zone).Date()
-	e.st = newStream(name, time.Date(y, m, d, 0, 0, 0, 0, e.cfg.Zone))
+	e.st = newStream(name)
 	e.copies = map[copyKey]lastCopy{}
 	e.closed = map[string]bool{}
 	e.banned = map[string]bool{}
@@ -284,7 +320,7 @@ func (e *Engine) Start(name string, at time.Time) Result {
 // Presence records a join or leave.
 func (e *Engine) Presence(account string, join bool, at time.Time) Result {
 	r := e.advance(at)
-	e.now = at
+	e.at(at)
 	e.online[account] = join
 	if join {
 		delete(e.left, account)
@@ -297,14 +333,21 @@ func (e *Engine) Presence(account string, join bool, at time.Time) Result {
 // Tick runs what is due by now: waiting-time checkpoints and sitting ends.
 func (e *Engine) Tick(now time.Time) Result {
 	r := e.advance(now)
-	e.now = now
+	e.at(now)
 	return r
+}
+
+// NextDue is the time of the earliest timer the engine will run (a waiting-time checkpoint, a sitting's end, a
+// checkpoint to put again), if any.
+func (e *Engine) NextDue() (time.Time, bool) {
+	s, at, _ := e.due()
+	return at, s != nil
 }
 
 // End ends a sitting the driver names (Config.DriverSittings).
 func (e *Engine) End(id string, at time.Time) Result {
 	r := e.advance(at)
-	e.now = at
+	e.at(at)
 	if s := e.open[id]; s != nil && !s.ending {
 		r.add(e.endSitting(s))
 	}
@@ -314,7 +357,7 @@ func (e *Engine) End(id string, at time.Time) Result {
 // Close ends every open sitting at the given time.
 func (e *Engine) Close(at time.Time) Result {
 	r := e.advance(at)
-	e.now = at
+	e.at(at)
 	for _, s := range e.sortedOpen() {
 		if !s.ending {
 			r.add(e.endSitting(s))
@@ -353,13 +396,12 @@ func compareStrings(a, b string) int {
 // streamFor makes the first stream when a line comes before any Start.
 func (e *Engine) streamFor(at time.Time) {
 	if e.st == nil {
-		y, m, d := at.In(e.cfg.Zone).Date()
-		e.st = newStream(stamp(at), time.Date(y, m, d, 0, 0, 0, 0, e.cfg.Zone))
+		e.st = newStream(stamp(at))
 	}
 }
 
 func copyKeyOf(l Line) copyKey {
-	return copyKey{strings.ToLower(l.Name), l.Channel, l.Target, l.Text}
+	return copyKey{Lower(l.KeyName), l.Channel, l.Target, l.Key}
 }
 
 // withinRepeat tells whether a line at t is within RepeatWindow of a copy at last, in whole seconds as the logs time
@@ -390,7 +432,7 @@ func (e *Engine) barred(l Line) bool {
 // a Prepare and its LineScored.
 func (e *Engine) Prepare(l Line) (Line, bool) {
 	e.streamFor(l.Time)
-	if l.Context || e.repeatOf(l) != nil || e.barred(l) {
+	if l.Context || !e.Known(l.Channel) || l.Empty || e.repeatOf(l) != nil || e.barred(l) {
 		return Line{}, false
 	}
 	return e.scorerLine(l), true
@@ -419,9 +461,21 @@ type scored struct {
 
 func (e *Engine) line(l Line, given *scored) Result {
 	r := e.advance(l.Time)
-	e.now = l.Time
+	e.at(l.Time)
 	e.streamFor(l.Time)
 	e.arrived++
+	if !e.Known(l.Channel) {
+		r.Verdict = e.unknownLine(l)
+		return r
+	}
+	if l.Empty {
+		// preparation emptied the text: delivered, not scored, no line of the stream
+		e.rec.Record("line", LineRecord{Stream: e.st.name, Time: stamp(l.Time), Channel: l.Channel,
+			Conversation: l.Conversation, Account: l.Account, Name: l.Name, RawName: l.RawName, Target: l.Target,
+			Raw: l.Raw, Context: l.Context, Verdict: "deliver", Why: "empty after preparation"})
+		r.Verdict = "deliver"
+		return r
+	}
 	key := copyKeyOf(l)
 	if en := e.repeatOf(l); en != nil {
 		r.Verdict = e.repeat(key, en, l)
@@ -434,7 +488,8 @@ func (e *Engine) line(l Line, given *scored) Result {
 		l.Sent = 1
 	}
 	rec := LineRecord{Stream: e.st.name, ID: l.ID, Time: stamp(l.Time), Channel: l.Channel,
-		Conversation: l.Conversation, Account: l.Account, Name: l.Name, Target: l.Target, Text: l.Text, Verdict: "deliver"}
+		Conversation: l.Conversation, Account: l.Account, Name: l.Name, RawName: l.RawName, Target: l.Target,
+		Text: l.Text, Raw: l.Raw, Verdict: "deliver"}
 	en := &entry{line: l}
 	if l.Ref != "" {
 		en.refs = []lineRef{{l.Ref, e.arrived}}
@@ -505,6 +560,7 @@ type RepeatRecord struct {
 	Time    string `json:"time"`
 	Account string `json:"account"`
 	Ref     string `json:"ref,omitempty"`
+	Raw     string `json:"raw"`
 	Sent    int    `json:"sent"`
 	Verdict string `json:"verdict"`
 }
@@ -526,8 +582,26 @@ func (e *Engine) repeat(key copyKey, en *entry, l Line) string {
 		s.last = l.Time
 	}
 	e.rec.Record("repeat", RepeatRecord{Stream: e.st.name, Of: en.line.ID, Time: stamp(l.Time), Account: l.Account,
-		Ref: l.Ref, Sent: en.line.Sent, Verdict: verdict})
+		Ref: l.Ref, Raw: l.Raw, Sent: en.line.Sent, Verdict: verdict})
 	return verdict
+}
+
+// unknownLine holds a line on a channel outside Config.Channels: never scored, no line of the stream, and the
+// player's sitting goes on the review queue when it ends.
+func (e *Engine) unknownLine(l Line) string {
+	e.unknown[l.Channel]++
+	rec := LineRecord{Stream: e.st.name, Time: stamp(l.Time), Channel: l.Channel, Conversation: l.Conversation,
+		Account: l.Account, Name: l.Name, RawName: l.RawName, Target: l.Target, Text: l.Text, Raw: l.Raw,
+		Verdict: "hold", Why: "a channel this server does not know"}
+	if l.Account != "" && (!e.cfg.DriverSittings || l.Sitting != "") {
+		if s := e.sittingFor(l); s != nil {
+			s.unknown++
+			s.last = l.Time
+			rec.Sitting = s.id
+		}
+	}
+	e.rec.Record("line", rec)
+	return "hold"
 }
 
 func (e *Engine) sittingFor(l Line) *sitting {
@@ -603,7 +677,7 @@ func (e *Engine) checkpoint(s *sitting, reason string, end int) Result {
 	case err != nil:
 		cp.NotSent = err.Error()
 	default:
-		prompt := e.texts.prompt(c.text)
+		prompt, split := e.texts.prompt(c.text)
 		cp.Hash = PromptHash(prompt)
 		cp.Chars = utf8.RuneCountInString(prompt)
 		switch {
@@ -615,7 +689,8 @@ func (e *Engine) checkpoint(s *sitting, reason string, end int) Result {
 			cp.Sent = true
 			e.calls[day]++
 			job = &Job{Sitting: s.id, Account: s.account, K: covers, Reason: reason, Line: cp.Line, Prompt: prompt,
-				Hash: cp.Hash, Chars: cp.Chars, Mine: c.mine, Cases: len(e.texts.Examples), end: end, day: day}
+				Split: split, Hash: cp.Hash, Chars: cp.Chars, Mine: c.mine,
+				Cases: len(e.texts.Examples), At: e.now, end: end, day: day}
 		}
 	}
 	e.rec.Record("checkpoint", cp)
@@ -632,14 +707,25 @@ func (e *Engine) checkpoint(s *sitting, reason string, end int) Result {
 	return Result{Jobs: []*Job{job}}
 }
 
+// ErrPending is the error a driver hands to Engine.Rule when the judge could not be reached for its retry time (failed
+// calls: throttling, a server error, a timeout, the network). The checkpoint stays the sitting's call and is put
+// again Config.RetryAfter later, until the sitting ends.
+var ErrPending = errors.New("the judge could not be reached")
+
 // Rule takes the judge's answer on a job (or the error that stopped it) and carries out the ruling.
 func (e *Engine) Rule(job *Job, a Answer, err error) Result {
 	s := e.open[job.Sitting]
-	if s == nil || s.inFlight != job {
+	if s == nil || s.inFlight != job || s.parked {
 		panic(fmt.Sprintf("ruling on %s#%d, which is not the sitting's call in flight", job.Sitting, job.K))
 	}
 	var r Result
 	rr := RulingRecord{Time: stamp(e.now), Sitting: s.id, K: job.K, Hash: job.Hash, Answer: a}
+	if err != nil && errors.Is(err, ErrPending) && !s.ending {
+		s.parked, s.retryAt = true, e.now.Add(e.cfg.RetryAfter)
+		rr.Error, rr.Pending, rr.Retry = err.Error(), true, stamp(s.retryAt)
+		e.rec.Record("ruling", rr)
+		return r
+	}
 	ruling := ""
 	switch {
 	case err != nil:
@@ -698,7 +784,14 @@ func (e *Engine) Rule(job *Job, a Answer, err error) Result {
 	for _, act := range r.Actions {
 		e.rec.Record("action", act)
 	}
-	s.inFlight = nil
+	r.add(e.nextCall(s))
+	return r
+}
+
+// nextCall clears the sitting's call and starts the next waiting one, or closes an ending sitting once none is left.
+// A ban drops the waiting calls.
+func (e *Engine) nextCall(s *sitting) Result {
+	s.inFlight, s.parked = nil, false
 	if s.banned {
 		for _, w := range s.waiting {
 			e.calls[w.day]--
@@ -712,17 +805,16 @@ func (e *Engine) Rule(job *Job, a Answer, err error) Result {
 	}
 	if len(s.waiting) > 0 {
 		s.inFlight, s.waiting = s.waiting[0], s.waiting[1:]
-		r.Jobs = append(r.Jobs, s.inFlight)
-		return r
+		return Result{Jobs: []*Job{s.inFlight}}
 	}
 	if s.ending {
 		e.closeSitting(s)
 	}
-	return r
+	return Result{}
 }
 
 // endSitting puts the sitting's held lines not yet put to the judge to a last checkpoint, and closes it once no
-// call is in flight.
+// call is in flight. A checkpoint waiting to be put again is given up: the last checkpoint covers its lines.
 func (e *Engine) endSitting(s *sitting) Result {
 	s.ending = true
 	var r Result
@@ -732,6 +824,14 @@ func (e *Engine) endSitting(s *sitting) Result {
 			end = s.held[len(s.held)-1]
 		}
 		r = e.checkpoint(s, "sitting end", end)
+	}
+	if s.parked {
+		job := s.inFlight
+		s.unjudged = true
+		e.rec.Record("ruling", RulingRecord{Time: stamp(e.now), Sitting: s.id, K: job.K, Hash: job.Hash,
+			Error: "the judge could not be reached before the sitting ended"})
+		r.add(e.nextCall(s))
+		return r
 	}
 	if s.inFlight == nil {
 		e.closeSitting(s)
@@ -753,20 +853,25 @@ func (e *Engine) closeSitting(s *sitting) {
 	switch {
 	case s.banned:
 		out = OutcomeBanned
-	case s.kept > 0 || unruled > 0:
+	case s.kept > 0 || unruled > 0 || s.unknown > 0:
 		out = OutcomeHeld
 	case len(s.released) > 0:
 		out = OutcomeReleased
 	}
-	review := ""
+	var why []string
 	switch {
 	case s.banned:
-		review = "ban"
+		why = append(why, "ban")
 	case len(s.held) >= e.cfg.ReviewHeld && e.cfg.ReviewHeld > 0:
-		review = strconv.Itoa(len(s.held)) + " lines held"
-	case s.unjudged:
-		review = "the judge was not called on every checkpoint"
+		why = append(why, "lines held: "+strconv.Itoa(len(s.held)))
 	}
+	if s.unjudged {
+		why = append(why, "the judge was not called on every checkpoint")
+	}
+	if s.unknown > 0 {
+		why = append(why, "lines on a channel this server does not know: "+strconv.Itoa(s.unknown))
+	}
+	review := strings.Join(why, "; ")
 	held := make([]string, len(s.held))
 	for i, p := range s.held {
 		held[i] = s.st.get(p).line.ID
@@ -780,42 +885,67 @@ func (e *Engine) closeSitting(s *sitting) {
 	}
 }
 
-// advance runs the timers due by now, in time order: a held line that has waited Wait, and a sitting's end.
+// The timers a sitting runs.
+const (
+	timerWait = iota
+	timerEnd
+	timerRetry
+)
+
+// due is the earliest timer of the open sittings: a held line that has waited Wait, a sitting's end, a checkpoint to
+// put again.
+func (e *Engine) due() (next *sitting, at time.Time, kind int) {
+	for _, s := range e.sortedOpen() {
+		if s.ending {
+			continue
+		}
+		if s.parked && (next == nil || s.retryAt.Before(at)) {
+			next, at, kind = s, s.retryAt, timerRetry
+		}
+		if e.cfg.Wait > 0 && s.inFlight == nil && len(s.held) > s.included {
+			due := s.st.get(s.held[s.included]).line.Time.Add(e.cfg.Wait)
+			if next == nil || due.Before(at) {
+				next, at, kind = s, due, timerWait
+			}
+		}
+		if !e.cfg.DriverSittings && !e.online[s.account] {
+			from := s.last
+			if t, ok := e.left[s.account]; ok && t.After(from) {
+				from = t
+			}
+			due := from.Add(e.cfg.SittingEnd)
+			if next == nil || due.Before(at) {
+				next, at, kind = s, due, timerEnd
+			}
+		}
+	}
+	return next, at, kind
+}
+
+// advance runs the timers due by now, in time order. A timer that came due while the engine was not called runs at
+// the engine's present time.
 func (e *Engine) advance(now time.Time) Result {
 	var r Result
 	for {
-		var next *sitting
-		var at time.Time
-		wait := false
-		for _, s := range e.sortedOpen() {
-			if s.ending {
-				continue
-			}
-			if e.cfg.Wait > 0 && s.inFlight == nil && len(s.held) > s.included {
-				due := s.st.get(s.held[s.included]).line.Time.Add(e.cfg.Wait)
-				if next == nil || due.Before(at) {
-					next, at, wait = s, due, true
-				}
-			}
-			if !e.cfg.DriverSittings && !e.online[s.account] {
-				from := s.last
-				if t, ok := e.left[s.account]; ok && t.After(from) {
-					from = t
-				}
-				due := from.Add(e.cfg.SittingEnd)
-				if next == nil || due.Before(at) {
-					next, at, wait = s, due, false
-				}
-			}
-		}
-		if next == nil || at.After(now) {
+		s, at, kind := e.due()
+		if s == nil || at.After(now) {
 			return r
 		}
-		e.now = at
-		if wait {
-			r.add(e.checkpoint(next, "waited", next.st.next-1))
-		} else {
-			r.add(e.endSitting(next))
+		e.at(at)
+		switch kind {
+		case timerWait:
+			r.add(e.checkpoint(s, "waited", s.st.next-1))
+		case timerEnd:
+			r.add(e.endSitting(s))
+		case timerRetry:
+			s.parked = false
+			e.rec.Record("checkpoint_again", struct {
+				Time    string `json:"time"`
+				Sitting string `json:"sitting"`
+				K       int    `json:"k"`
+				Hash    string `json:"sha256"`
+			}{stamp(e.now), s.id, s.inFlight.K, s.inFlight.Hash})
+			r.Jobs = append(r.Jobs, s.inFlight)
 		}
 	}
 }

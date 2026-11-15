@@ -6,69 +6,80 @@ import (
 	"strings"
 )
 
-// link matches a web address as the training pipeline reads one: an optional scheme, a host of two or more labels
-// (the last one 2 to 24 letters), an optional port, then an optional path up to the next space.
-var link = regexp.MustCompile(`(?i)(?:https?://)?((?:[a-z0-9-]+\.)+[a-z]{2,24})(?::\d+)?(/[^\s]*)?`)
+// LinkPattern is bundle.json links.pattern, the training pipeline's link (truth2.LINK), as Python reads it.
+const LinkPattern = `(?i)(?:https?://)?((?:[a-z0-9-]+\.)+[a-z]{2,24})(?::\d+)?(/[^\s]*)?`
 
-// Punctuation that ends a sentence after a link. An exact URL is compared without it.
-const linkTrail = ".,!?;:)]}'\""
+// link is LinkPattern in Go's syntax, matching what Python's matches: re.IGNORECASE lets U+0130, U+0131, U+017F and
+// U+212A stand for i, i, s and k in [a-z] and s in "https", \d is any Unicode decimal digit and \s is str.isspace().
+// Go's leftmost-first matching picks the match Python's backtracking does.
+var link = regexp.MustCompile(`(?:[hH][tT][tT][pP][sS\x{17f}]?://)?` +
+	`((?:[a-zA-Z0-9\x{130}\x{131}\x{17f}\x{212a}-]+\.)+[a-zA-Z\x{130}\x{131}\x{17f}\x{212a}]{2,24})` +
+	`(?::\p{Nd}+)?(/[^\t-\r\x{1c}-\x{20}\x{85}\x{a0}\x{1680}\x{2000}-\x{200a}\x{2028}\x{2029}\x{202f}\x{205f}\x{3000}]*)?`)
+
+// host is an allowlist entry's host as a link's host: two or more labels, the last 2 to 24 letters.
+var host = regexp.MustCompile(`^(?:[a-z0-9-]+\.)+[a-z]{2,24}$`)
 
 // Links replaces each link on the plugin's allowlist with the bundle's canonical link before a line is scored: the
-// whole match, scheme, port, path and any punctuation after it included, as the models were trained. An entry is a
-// domain, which covers its subdomains and every path on them, or an exact URL (a host and a path), which covers that
-// address only. Hosts and paths compare without regard to case, and a scheme is never needed.
+// whole match, scheme, port, path and any punctuation after it included, as the models were trained (truth2.allowed).
+// An entry is host[/prefix]: it allows a link whose lowercased host is the host or ends in "." and the host, and whose
+// lowercased path, punctuation after it kept, starts with "/" and the prefix.
 type Links struct {
 	entries   []linkEntry
 	canonical string
 }
 
 type linkEntry struct {
-	host, path string // lower case; path "" for a domain
+	host, prefix string // lower case; prefix "" or "/..."
 }
 
-// NewLinks reads the allowlist's entries; an entry that is not a domain or a URL is an error.
+// NewLinks reads the allowlist's entries; an entry that is not host[/prefix] is an error.
 func NewLinks(allowed []string, canonical string) (Links, error) {
 	l := Links{canonical: canonical}
 	for _, a := range allowed {
-		a = strings.TrimSpace(a)
-		m := link.FindStringSubmatch(a)
-		if m == nil || m[0] != a {
-			return Links{}, fmt.Errorf("allowed link %q is not a domain or a URL", a)
+		e := Lower(strings.TrimSpace(a))
+		h, prefix, slash := strings.Cut(e, "/")
+		if !host.MatchString(h) {
+			return Links{}, fmt.Errorf("allowed link %q is not a host with an optional path prefix (host[/prefix])", a)
 		}
-		l.entries = append(l.entries, linkEntry{host: strings.ToLower(m[1]), path: exactPath(m[2])})
+		if slash {
+			prefix = "/" + prefix
+		}
+		l.entries = append(l.entries, linkEntry{host: h, prefix: prefix})
 	}
 	return l, nil
 }
 
-// exactPath is a path as an exact URL compares it: lower case, without the punctuation after it or a last "/".
-func exactPath(path string) string {
-	return strings.TrimSuffix(strings.TrimRight(strings.ToLower(path), linkTrail), "/")
-}
-
 func (l Links) allowed(host, path string) bool {
-	host, path = strings.ToLower(host), exactPath(path)
+	host, path = Lower(host), Lower(path)
 	for _, e := range l.entries {
-		if e.path == "" {
-			if host == e.host || strings.HasSuffix(host, "."+e.host) {
-				return true
-			}
-		} else if host == e.host && path == e.path {
+		if (host == e.host || strings.HasSuffix(host, "."+e.host)) && strings.HasPrefix(path, e.prefix) {
 			return true
 		}
 	}
 	return false
 }
 
-// Replace is the text with every allowlisted link replaced by the canonical link.
+// Replace is the prepared text with every allowlisted link replaced by the canonical link.
 func (l Links) Replace(text string) string {
 	if len(l.entries) == 0 {
 		return text
 	}
-	return link.ReplaceAllStringFunc(text, func(m string) string {
-		sub := link.FindStringSubmatch(m)
-		if l.allowed(sub[1], sub[2]) {
-			return l.canonical
+	var b strings.Builder
+	last := 0
+	for _, m := range link.FindAllStringSubmatchIndex(text, -1) {
+		path := ""
+		if m[4] >= 0 {
+			path = text[m[4]:m[5]]
 		}
-		return m
-	})
+		if l.allowed(text[m[2]:m[3]], path) {
+			b.WriteString(text[last:m[0]])
+			b.WriteString(l.canonical)
+			last = m[1]
+		}
+	}
+	if last == 0 {
+		return text
+	}
+	b.WriteString(text[last:])
+	return b.String()
 }

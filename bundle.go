@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -55,10 +56,24 @@ type Bundle struct {
 		} `json:"render"`
 	} `json:"judge"`
 	// Links: the canonical link that replaces each link on the plugin's allowlist in the text the fast model sees,
-	// the one the models were trained with.
+	// the one the models were trained with, and the link pattern (core.LinkPattern).
 	Links struct {
 		Canonical string `json:"canonical"`
+		Pattern   string `json:"pattern"`
 	} `json:"links"`
+	// Channels is the channels a line may have.
+	Channels []string `json:"channels"`
+	// Text: the numbers of the text preparation, which core/text.go implements.
+	Text struct {
+		Limits map[string]int `json:"limits"`
+		URL    struct {
+			Over, Keep int
+			Mark       string
+		} `json:"url"`
+		CutMark    string `json:"cut_mark"`
+		IPMark     string `json:"ip_mark"`
+		Whitespace []rune `json:"whitespace"`
+	} `json:"text"`
 
 	dir   string
 	texts core.Texts
@@ -101,11 +116,21 @@ func (b *Bundle) files() []string {
 
 func loadBundle(dir string) (*Bundle, error) {
 	var b Bundle
-	if err := readJSON(filepath.Join(dir, "bundle.json"), &b); err != nil {
+	raw, err := os.ReadFile(filepath.Join(dir, "bundle.json"))
+	if err != nil {
 		return nil, err
+	}
+	if err := json.Unmarshal(raw, &b); err != nil {
+		return nil, fmt.Errorf("%s: %w", filepath.Join(dir, "bundle.json"), err)
 	}
 	bad := func(format string, args ...any) (*Bundle, error) {
 		return nil, fmt.Errorf("bundle %s: "+format, append([]any{b.Version}, args...)...)
+	}
+	if err := model.CheckRules(raw); err != nil {
+		return bad("%w", err)
+	}
+	if err := b.checkText(); err != nil {
+		return bad("%w", err)
 	}
 	for _, f := range b.files() {
 		if f == "" || !filepath.IsLocal(f) {
@@ -134,6 +159,33 @@ func loadBundle(dir string) (*Bundle, error) {
 	b.dir, b.texts = dir, texts
 	b.spec, b.specErr = model.ReadSpec(dir)
 	return &b, nil
+}
+
+// checkText checks that the bundle's channels and the numbers of its text preparation are the ones core/text.go
+// implements (the rules hash covers their words).
+func (b *Bundle) checkText() error {
+	t := b.Text
+	var ws []rune
+	for _, r := range core.Whitespace {
+		for c := r[0]; c <= r[1]; c++ {
+			ws = append(ws, c)
+		}
+	}
+	switch {
+	case len(b.Channels) == 0:
+		return errors.New("channels is empty")
+	case len(t.Limits) != 3 || t.Limits["book"] != core.LimitBook || t.Limits["nick"] != core.LimitNick ||
+		t.Limits["default"] != core.LimitText:
+		return fmt.Errorf("text.limits %v are not the ones this server implements", t.Limits)
+	case t.URL.Over != core.URLOver || t.URL.Keep != core.URLKeep || t.URL.Mark != core.URLCut || t.CutMark != core.TextCut ||
+		t.IPMark != core.IPMark:
+		return errors.New("text.url, cut_mark or ip_mark are not the ones this server implements")
+	case !slices.Equal(t.Whitespace, ws):
+		return errors.New("text.whitespace is not the set this server implements")
+	case b.Links.Pattern != core.LinkPattern:
+		return errors.New("links.pattern is not the one this server implements")
+	}
+	return nil
 }
 
 // readJudgeTexts reads the judge's question and answer format from question.md's JSON block and the owner's cases
@@ -206,7 +258,9 @@ func coreConfig(cfg Config, b *Bundle) core.Config {
 		SittingEnd: sec(cp.SittingEndSeconds), ReviewHeld: cp.ReviewHeld,
 		Render: core.Render{Before: r.Before, After: r.After, MaxChars: r.MaxChars, CutBefore: r.CutBefore,
 			CutAfter: r.CutAfter, Kinds: r.Kinds},
-		CanonicalLink: b.Links.Canonical, MaxPromptChars: cfg.Budget.MaxPromptChars, MaxCallsPerDay: cfg.Budget.MaxCallsPerDay, Zone: time.UTC}
+		CanonicalLink: b.Links.Canonical, MaxPromptChars: cfg.Budget.MaxPromptChars,
+		MaxCallsPerDay: cfg.Budget.MaxCallsPerDay, Channels: b.Channels,
+		RetryAfter: orDefault(cfg.Test.JudgeRetryAfter, judgeRetryAfter)}
 	if cfg.Chat.setSchedule {
 		c.Schedule = cfg.Chat.Schedule
 	}

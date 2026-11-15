@@ -36,7 +36,6 @@ type lineRef struct {
 // since a private line's window counts that conversation's lines only.
 type stream struct {
 	name  string
-	day   time.Time // midnight of the day the stream started, in the configured zone
 	next  int
 	base  int
 	lines []*entry       // positions base..next-1
@@ -44,8 +43,8 @@ type stream struct {
 	talks map[string][]int
 }
 
-func newStream(name string, day time.Time) *stream {
-	return &stream{name: name, day: day, kept: map[int]*entry{}, talks: map[string][]int{}}
+func newStream(name string) *stream {
+	return &stream{name: name, kept: map[int]*entry{}, talks: map[string][]int{}}
 }
 
 func (s *stream) add(e *entry) {
@@ -168,11 +167,6 @@ func (v view) player() string {
 	return best
 }
 
-func hms(d time.Duration) string {
-	s := int(d / time.Second)
-	return fmt.Sprintf("%02d:%02d:%02d", s/3600, s%3600/60, s%60)
-}
-
 // shown is the case's text and the ids of the player's lines in it.
 type shown struct {
 	text string
@@ -185,7 +179,8 @@ func (r Render) text(v view, keep []int, player string) shown {
 	b.WriteString("player: ")
 	b.WriteString(player)
 	b.WriteString(" · log ")
-	b.WriteString(v.st.day.Format(time.DateOnly))
+	// the UTC date of the case's first line; each line's time is its UTC time of day
+	b.WriteString(v.st.get(keep[0]).line.Time.UTC().Format(time.DateOnly))
 	last := -1
 	for _, p := range keep {
 		e := v.st.get(p)
@@ -202,7 +197,7 @@ func (r Render) text(v view, keep []int, player string) shown {
 		l := e.line
 		b.WriteString(l.ID)
 		b.WriteByte(' ')
-		b.WriteString(hms(l.Time.Sub(v.st.day)))
+		b.WriteString(l.Time.UTC().Format(time.TimeOnly))
 		b.WriteByte(' ')
 		b.WriteString(l.Channel)
 		if l.Target != "" {
@@ -293,8 +288,9 @@ const (
 	NewCase       = "N1"
 )
 
-// prompt lays out the judge's prompt around one case.
-func (t Texts) prompt(c string) string {
+// prompt lays out the judge's prompt around one case. Its first split bytes are the question and the owner's cases,
+// the same in every prompt; the rest is SepNew, the case, SepFormat and the format.
+func (t Texts) prompt(c string) (prompt string, split int) {
 	var b strings.Builder
 	b.WriteString(QuestionHead)
 	b.WriteString(t.Question)
@@ -306,9 +302,10 @@ func (t Texts) prompt(c string) string {
 		b.WriteString("## C" + strconv.Itoa(i+1) + ": ruling: " + e.Ruling + "\n")
 		b.WriteString(e.Text)
 	}
+	split = b.Len()
 	b.WriteString(SepNew + "## " + NewCase + "\n")
 	b.WriteString(c)
 	b.WriteString(SepFormat)
 	b.WriteString(t.Format)
-	return b.String()
+	return b.String(), split
 }

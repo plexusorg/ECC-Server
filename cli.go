@@ -107,7 +107,7 @@ func wandbLogin() error {
 	return restartService()
 }
 
-// bedrockLogin checks a Bedrock API key with a small Converse call to the configured model, which proves both the
+// bedrockLogin checks a Bedrock API key with a small Responses call to the configured model, which proves both the
 // key and its access to the model, and stores it encrypted for the service.
 func bedrockLogin(cfg Config) error {
 	key, err := readKey("bedrock", "Amazon Bedrock API key: ")
@@ -117,7 +117,7 @@ func bedrockLogin(cfg Config) error {
 	b := newBedrock(key, cfg)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	if _, err := b.converse(ctx, "", "Hi", loginCheckMaxTokens, cfg.Judge.ServiceTier); err != nil {
+	if _, err := b.respond(ctx, "Hi", 0, loginCheckMaxTokens, "none", cfg.Judge.ServiceTier); err != nil {
 		return fmt.Errorf("checking the key with a call to %s in %s: %w", cfg.Judge.Model, cfg.Judge.Region, err)
 	}
 	if err := storeCredential(bedrockCredential, key); err != nil {
@@ -176,13 +176,20 @@ func status(cfg Config) error {
 		if !b.KeySet {
 			key = "no key set (sudo ecc-server bedrock login)"
 		}
-		fmt.Printf("judge: %s in %s, %s tier, %s\n", b.Model, b.Region, b.Tier, key)
+		fmt.Printf("judge: %s in %s, %s tier, reasoning effort %s, %s\n", b.Model, b.Region, b.Tier, b.Effort, key)
 		if b.LastCall.IsZero() {
 			fmt.Println("last judge call: none since the host started")
 		} else {
 			fmt.Printf("last judge call: %s (%s ago): %s\n", b.LastCall.Format(time.DateTime),
 				time.Since(b.LastCall).Round(time.Second), b.Result)
 		}
+		if u := b.LastUsage; u != nil {
+			fmt.Printf("last answered call: %d input tokens (%d cached, cache writes %s), %d output (%d reasoning)\n",
+				u.Input, u.Cached, u.writeText(), u.Output, u.Reasoning)
+		}
+		t := b.Totals
+		fmt.Printf("since start: %d calls, %d answered; %d input tokens (%d cached, cache writes %s), %d output\n",
+			t.Calls, t.Answered, t.Input, t.Cached, t.writeText(), t.Output)
 	}
 	sp := h.Spend
 	fmt.Printf("spend: %s $%.4f of $%.2f (%d calls); %s $%.4f of $%.2f", sp.Day, sp.DayUSD, sp.DailyBudget, sp.Calls,
@@ -192,7 +199,11 @@ func status(cfg Config) error {
 	}
 	fmt.Println()
 	st := h.Sittings
-	fmt.Printf("sittings: %d open, %d held lines unruled, %d judge calls in flight\n", st.Sittings, st.Unruled, st.InFlight)
+	fmt.Printf("sittings: %d open, %d held lines unruled, %d judge calls in flight, %d checkpoints pending\n",
+		st.Sittings, st.Unruled, st.InFlight, st.Pending)
+	for c, n := range st.UnknownChannels {
+		fmt.Printf("lines on a channel this server does not know: %s %d\n", c, n)
+	}
 	fmt.Printf("unacknowledged actions: %d\n", h.Unacknowledged)
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("the host is not ready")

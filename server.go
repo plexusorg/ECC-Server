@@ -103,7 +103,9 @@ func run(cfg Config) error {
 		return err
 	}
 	s.judge = &bedrockJudge{ctx: ctx, br: s.br, spend: s.spend, tier: cfg.Judge.ServiceTier,
-		maxOut: cfg.Judge.MaxOutputTokens, timeout: cfg.Judge.Timeout, told: s.budgetUsedUp}
+		effort: cfg.Judge.ReasoningEffort, maxOut: cfg.Judge.MaxOutputTokens, timeout: cfg.Judge.Timeout,
+		told: s.budgetUsedUp, record: s.rec.append, backoff: orDefault(cfg.Test.JudgeBackoff, judgeBackoff),
+		retryFor: orDefault(cfg.Test.JudgeRetryFor, judgeRetryFor)}
 	st, err := readState(cfg)
 	if err != nil {
 		return err
@@ -145,8 +147,8 @@ func run(cfg Config) error {
 	if brKey == "" {
 		slog.Warn("no Bedrock key is set; checkpoints are not judged until one is set with sudo ecc-server bedrock login")
 	} else {
-		slog.Info("the judge calls Bedrock", "model", cfg.Judge.Model, "region", cfg.Judge.Region,
-			"service_tier", cfg.Judge.ServiceTier, "endpoint", s.br.endpoint)
+		slog.Info("the judge calls Bedrock's Responses API", "model", cfg.Judge.Model, "region", cfg.Judge.Region,
+			"service_tier", cfg.Judge.ServiceTier, "reasoning_effort", cfg.Judge.ReasoningEffort, "endpoint", s.br.endpoint)
 	}
 	go s.tick()
 	go s.scoreLines()
@@ -173,6 +175,13 @@ func run(cfg Config) error {
 	case <-shutdown.Done():
 	}
 	return err
+}
+
+func orDefault(d, def time.Duration) time.Duration {
+	if d > 0 {
+		return d
+	}
+	return def
 }
 
 // scorerFor loads the bundle's models, or gives the rig's scorer when one is set.
@@ -326,24 +335,9 @@ func writeError(w http.ResponseWriter, status int, err error) {
 
 var errNoBundle = errors.New("no bundle is being served")
 
-// lineRequest is one line from the plugin. A line with no speaker_uuid (a Discord relay) or from a trusted player,
-// which the plugin delivered at once, is context only.
-type lineRequest struct {
-	ID           string `json:"id"`
-	Channel      string `json:"channel"`
-	Conversation string `json:"conversation"`
-	Private      bool   `json:"private"`
-	SpeakerUUID  string `json:"speaker_uuid"`
-	Speaker      string `json:"speaker"`
-	TargetUUID   string `json:"target_uuid"`
-	Target       string `json:"target"`
-	Text         string `json:"text"`
-	Trusted      bool   `json:"trusted"`
-}
-
-// lineJob is one line waiting for its verdict.
+// lineJob is one line waiting for its verdict, timed when it arrived.
 type lineJob struct {
-	req     lineRequest
+	req     wireLine
 	arrived time.Time
 	done    chan struct{}
 	verdict string
@@ -352,13 +346,13 @@ type lineJob struct {
 // handleLine gives a line its verdict. Lines are scored one at a time, in the order they arrive, by scoreLines; a
 // resent id gets the verdict its line got (or waits for it) and is not counted twice.
 func (s *server) handleLine(w http.ResponseWriter, r *http.Request) {
-	var req lineRequest
+	var req wireLine
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	if req.ID == "" || req.Channel == "" || req.Conversation == "" || req.Speaker == "" {
-		writeError(w, http.StatusBadRequest, errors.New("id, channel, conversation and speaker are required"))
+	if err := req.check(); err != nil {
+		writeError(w, http.StatusBadRequest, err)
 		return
 	}
 	s.mu.Lock()
@@ -374,7 +368,8 @@ func (s *server) handleLine(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusServiceUnavailable, errNoBundle)
 			return
 		}
-		j = &lineJob{req: req, arrived: time.Now(), done: make(chan struct{})}
+		// the line's time is when it arrived, not when the worker takes it
+		j = &lineJob{req: req, arrived: s.now(), done: make(chan struct{})}
 		select {
 		case s.queue <- j:
 			s.pending[req.ID] = j
@@ -407,14 +402,12 @@ func (s *server) scoreLines() {
 		case j = <-s.queue:
 		}
 		req := j.req
+		l := req.coreLine(j.arrived)
 		s.mu.Lock()
-		speaker := req.Speaker
-		if req.SpeakerUUID == "" {
-			speaker = "discord:" + speaker
+		if !s.eng.Known(l.Channel) {
+			slog.Error("a line on a channel this server does not know is held; its sitting goes on the review queue",
+				"channel", l.Channel, "id", req.ID)
 		}
-		l := core.Line{Ref: req.ID, Time: s.now(), Channel: req.Channel, Conversation: req.Conversation,
-			Private: req.Private, Account: req.SpeakerUUID, Name: req.Speaker, Speaker: speaker, TargetAccount: req.TargetUUID,
-			Target: req.Target, Text: req.Text, Context: req.SpeakerUUID == "" || req.Trusted}
 		var res core.Result
 		scored, score := s.eng.Prepare(l)
 		if m := s.models; score && m != nil {

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -140,16 +141,34 @@ func (s *spend) reserve(usd float64) (r reservation, told bool, err error) {
 	return reservation{s.st.Day, s.st.Month, usd}, false, nil
 }
 
-// tokenUsage is Bedrock's token counts for one call.
+// tokenUsage is the Responses API's token counts for one call. Input counts every input token, the ones read from
+// and written to the cache among them; CacheWrite is nil when the answer does not state it (Bedrock documents
+// cache_write_tokens for its OpenAI models only).
 type tokenUsage struct {
-	Input      int `json:"input_tokens"`
-	Output     int `json:"output_tokens"`
-	CacheRead  int `json:"cache_read_input_tokens"`
-	CacheWrite int `json:"cache_write_input_tokens"`
+	Input      int  `json:"input_tokens"`
+	Cached     int  `json:"cached_tokens"`
+	CacheWrite *int `json:"cache_write_tokens"`
+	Output     int  `json:"output_tokens"`
+	Reasoning  int  `json:"reasoning_tokens"`
 }
 
+func (u tokenUsage) writeText() string {
+	if u.CacheWrite == nil {
+		return "not stated"
+	}
+	return strconv.Itoa(*u.CacheWrite)
+}
+
+// cost is a call's cost: the input tokens neither read from nor written to the cache at the input price, the cached
+// ones at the cache-read price, the written ones at the cache-write price, and the output (reasoning included). With
+// no cache_write_tokens stated, written tokens are counted at the input price.
 func (s *spend) cost(u tokenUsage) float64 {
-	return float64(u.Input)*s.in + float64(u.Output)*s.out + float64(u.CacheRead)*s.cr + float64(u.CacheWrite)*s.cw
+	write := 0
+	if u.CacheWrite != nil {
+		write = *u.CacheWrite
+	}
+	plain := max(0, u.Input-u.Cached-write)
+	return float64(plain)*s.in + float64(u.Output)*s.out + float64(u.Cached)*s.cr + float64(write)*s.cw
 }
 
 // settle replaces a reservation with the call's cost: its usage when Bedrock answered, nothing when Bedrock refused
