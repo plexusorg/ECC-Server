@@ -4,7 +4,8 @@
 #
 # The package carries the five OpenVINO shared libraries the models run on, from OpenVINO's release archive: the
 # release the bundles are exported with, checked against its published SHA-256. The archive is kept in dist/ for the
-# next build.
+# next build. The binary is dynamically linked against glibc (it loads OpenVINO through purego), so the package is for
+# glibc systems such as Debian and Ubuntu, not musl ones such as Alpine.
 set -eu
 cd "$(dirname "$0")"
 version=${1:-$(tr -d '[:space:]' < VERSION)}

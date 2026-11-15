@@ -14,9 +14,10 @@ description: |
   a spend budget, keeps the daily record, and tells Module-ECC over
   token-protected HTTP whom to ban or warn and which held lines to deliver.
   Fetches the bundle promoted to production from Weights & Biases, and runs its
-  models on the CPU with the OpenVINO runtime it carries.
+  models on the CPU with the OpenVINO runtime it carries. Needs glibc (Debian, Ubuntu).
 depends:
   - ca-certificates
+  - libc6
   - libstdc++6
 contents:
   - src: dist/ecc-server

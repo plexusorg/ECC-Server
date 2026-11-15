@@ -15,7 +15,7 @@ it on the host's clock, and `ecc-server replay` drives it on a virtual clock ove
 
 **The fast model.** Two models score each line on the host's CPU: SH, a small model, on every line, and C, a large
 model, on the lines SH passes; C's score decides `hold` or `deliver`. They run in the server's process through
-OpenVINO's C API (no cgo: the binary loads `/usr/lib/ecc-server/openvino` at start), on Linux only. They take about
+OpenVINO's C API, on Linux only. The binary is built without cgo and loads `/usr/lib/ecc-server/openvino` through purego at start, so it is dynamically linked against glibc: it runs on glibc systems (Debian, Ubuntu) and not on musl systems such as Alpine, and a container image for it is a Debian one. They take about
 4 GB of memory, 2.7 GB of it the graphs' weights mapped from the bundle's files. On another system `ecc-server run`
 starts only with the test rig's scorer (`[test] hold_words_file`, see Configuration), which holds a line that contains
 one of a file's words and logs a warning at every start that the server filters nothing; it exists for the end-to-end
@@ -23,8 +23,8 @@ rig, never for a game server with players.
 
 ## Install (Debian, Ubuntu)
 
-ECC-Server is packaged as an amd64 `.deb` that depends on `ca-certificates` (the HTTPS calls to W&B and Bedrock) and
-`libstdc++6` (OpenVINO). The package installs:
+ECC-Server is packaged as an amd64 `.deb` that depends on `ca-certificates` (the HTTPS calls to W&B and Bedrock), `libc6` (glibc, which the
+binary and OpenVINO link against) and `libstdc++6` (OpenVINO). The package installs:
 
 - `/usr/bin/ecc-server`, the binary
 - `/usr/lib/ecc-server/openvino/`, the five OpenVINO 2026.4.1 libraries the models run on (77 MB, from OpenVINO's
@@ -278,7 +278,7 @@ is: its lines stay held, its sitting goes to the review queue, and the first ref
 
 `./package.sh [version]` (needs Go, curl, GNU tar and sha256sum; nothing is installed) fetches OpenVINO's pinned
 release archive into `dist/` (once; checked against its published SHA-256) and takes the five libraries from it,
-builds the binary (`CGO_ENABLED=0`, from any system) and runs nfpm, pinned to a version, into `dist/ecc-server_<version>_amd64.deb`, then prints the `telesphorepo publish` command for it. The version
+builds the binary (`CGO_ENABLED=0`, a glibc-linked binary, from any system) and runs nfpm, pinned to a version, into `dist/ecc-server_<version>_amd64.deb`, then prints the `telesphorepo publish` command for it. The version
 is the argument, or else the `VERSION` file; `ecc-server version` prints it. Write a Debian version: `0.1.0` is a
 release, `0.1.0~dev.3` a pre-release that sorts before it. `telesphorepo.toml` sends versions containing `~` to
 `ecc-server-dev` and the rest to `ecc-server`.
