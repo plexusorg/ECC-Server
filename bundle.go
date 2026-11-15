@@ -70,9 +70,11 @@ type Bundle struct {
 			Over, Keep int
 			Mark       string
 		} `json:"url"`
-		CutMark    string `json:"cut_mark"`
-		IPMark     string `json:"ip_mark"`
-		Whitespace []rune `json:"whitespace"`
+		FoldSeconds int    `json:"fold_seconds"`
+		NameLimit   int    `json:"discord_name_limit"`
+		CutMark     string `json:"cut_mark"`
+		IPMark      string `json:"ip_mark"`
+		Whitespace  []rune `json:"whitespace"`
 	} `json:"text"`
 
 	dir   string
@@ -182,6 +184,8 @@ func (b *Bundle) checkText() error {
 		return errors.New("text.url, cut_mark or ip_mark are not the ones this server implements")
 	case !slices.Equal(t.Whitespace, ws):
 		return errors.New("text.whitespace is not the set this server implements")
+	case t.FoldSeconds != int(core.RepeatWindow/time.Second) || t.NameLimit != core.LimitDiscord:
+		return errors.New("text.fold_seconds or discord_name_limit is not the one this server implements")
 	case b.Links.Pattern != core.LinkPattern:
 		return errors.New("links.pattern is not the one this server implements")
 	}

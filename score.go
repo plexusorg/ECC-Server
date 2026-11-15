@@ -125,7 +125,10 @@ func scoreLines(args []string) error {
 	var times []float64
 	n, cRuns := 0, 0
 	start := time.Now()
+	// a stream's times are whole seconds of its own; each stream is moved after the last one, since the core's clock
+	// only goes forward
 	stream, seen := "", map[string]bool{}
+	var offset, last int64
 	for r.Scan() {
 		var x scoreIn
 		if err := json.Unmarshal(r.Bytes(), &x); err != nil {
@@ -135,14 +138,16 @@ func scoreLines(args []string) error {
 		if err := x.check(); err != nil {
 			return fmt.Errorf("%s:%d: %w", *in, n, err)
 		}
-		at := time.Unix(x.Time, 0)
 		if x.Stream != stream {
 			if seen[x.Stream] {
 				return fmt.Errorf("%s:%d: stream %s comes back after another; give each stream's lines together", *in, n, x.Stream)
 			}
 			seen[x.Stream], stream = true, x.Stream
-			eng.Start(x.Stream, at)
+			offset = max(0, last+86400-x.Time)
+			eng.Start(x.Stream, time.Unix(x.Time+offset, 0))
 		}
+		at := time.Unix(x.Time+offset, 0)
+		last = max(last, x.Time+offset)
 		l := x.coreLine(at)
 		l.ID = x.ID
 		out := map[string]any{"stream": x.Stream, "id": x.ID}
