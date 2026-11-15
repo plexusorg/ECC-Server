@@ -23,15 +23,13 @@ wandb_artifact = "classifier-bundle"
 # How often the host checks W&B's production alias (at least 1m).
 check_interval = "10m"
 
-# The bundle's models run on this host's CPU: threads per model call (one call runs at a time), how long a call may
-# take before it is cut off and its line held, and how long a line may wait for its verdict in all before it is held
-# (a line held before its models ran is scored as soon as no line is waiting, and released if they would deliver it).
-# Keep max_wait a little under Module-ECC's chat_safety.verdict_timeout_ms
-# (1000 ms by default): a line the plugin has stopped waiting for is held by the plugin anyway. threshold names the
-# bundle's hold threshold to use; empty is the bundle's default.
+# The bundle's models run on this host's CPU: threads per model call (one call runs at a time, always to its end), and
+# how long a line may wait for its verdict before it is answered hold. Its models still run: their verdict is applied
+# when they end, and a line they would deliver is released. Keep max_wait a little under Module-ECC's
+# chat_safety.verdict_timeout_ms (1000 ms by default): a line the plugin has stopped waiting for is held by the plugin
+# anyway. threshold names the bundle's hold threshold to use; empty is the bundle's default.
 [model]
 threads = 6
-call_timeout = "800ms"
 max_wait = "900ms"
 threshold = ""
 

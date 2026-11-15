@@ -46,10 +46,8 @@ type Config struct {
 type ModelConfig struct {
 	// Threads is each model's CPU threads.
 	Threads int `toml:"threads"`
-	// CallTimeout cuts off a model call that takes longer; its line is held.
-	CallTimeout time.Duration `toml:"call_timeout"`
-	// MaxWait: a line still waiting for its verdict this long after it arrived is held; if its models have not run, it
-	// is scored when no line is waiting (core.ErrLater).
+	// MaxWait: a line still waiting for its verdict this long after it arrived is answered hold (core.ErrLater). Its
+	// models run to their end, when the worker comes to it if they had not started, and their verdict is applied then.
 	MaxWait time.Duration `toml:"max_wait"`
 	// Threshold names the bundle's hold threshold to use; empty is the bundle's default.
 	Threshold string `toml:"threshold"`
@@ -105,6 +103,11 @@ type TestConfig struct {
 	JudgeRetryAfter time.Duration `toml:"judge_retry_after"`
 	// NoticeEvery, set, replaces how often a notice of one cause may be sent (1h).
 	NoticeEvery time.Duration `toml:"notice_every"`
+	// SlowWord and SlowFor: the rig's scorer takes SlowFor to score a line that contains SlowWord, as a slow model call.
+	SlowWord string        `toml:"slow_word"`
+	SlowFor  time.Duration `toml:"slow_for"`
+	// SlowCall, set, replaces how long a model call runs before it is logged and staff are told (10s).
+	SlowCall time.Duration `toml:"slow_call"`
 }
 
 var serverName = regexp.MustCompile(`^[a-z0-9_-]{1,32}$`)
@@ -116,7 +119,7 @@ func loadConfig(path string) (Config, error) {
 	cfg := Config{Listen: "127.0.0.1:8790", Data: "/var/lib/ecc-server", RecordRetentionDays: 180,
 		WandbEntity: "telesphoreo-telesphoreo", WandbProject: "ecc", WandbArtifact: "classifier-bundle",
 		CheckInterval: 10 * time.Minute,
-		Model:         ModelConfig{Threads: 6, CallTimeout: 800 * time.Millisecond, MaxWait: 900 * time.Millisecond},
+		Model:         ModelConfig{Threads: 6, MaxWait: 900 * time.Millisecond},
 		Judge: JudgeConfig{Region: "us-east-1", Model: "us.moonshotai.kimi-k3.1", ServiceTier: "flex",
 			ReasoningEffort: "medium", MaxOutputTokens: 16000, Timeout: 10 * time.Minute},
 		Budget: BudgetConfig{DailyUSD: 25, MonthlyUSD: 250, InputPerMillion: 4.40, OutputPerMillion: 22.00,
@@ -152,8 +155,11 @@ func loadConfig(path string) (Config, error) {
 	if cfg.RecordRetentionDays < 3 {
 		return bad("record_retention_days must be at least 3")
 	}
-	if m := cfg.Model; m.Threads < 1 || m.CallTimeout < 10*time.Millisecond || m.MaxWait < 10*time.Millisecond {
-		return bad("model.threads must be at least 1, model.call_timeout and model.max_wait at least 10ms")
+	if m := cfg.Model; m.Threads < 1 || m.MaxWait < 10*time.Millisecond {
+		return bad("model.threads must be at least 1, model.max_wait at least 10ms")
+	}
+	if t := cfg.Test; (t.SlowWord != "") != (t.SlowFor > 0) || t.SlowWord != "" && t.HoldWordsFile == "" {
+		return bad("test.slow_word and test.slow_for are set together, with test.hold_words_file")
 	}
 	j := cfg.Judge
 	switch {

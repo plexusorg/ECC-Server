@@ -17,7 +17,6 @@ import (
 	"slices"
 	"strings"
 	"sync"
-	"time"
 
 	"ecc-server/core"
 )
@@ -217,8 +216,6 @@ func ReadSpec(dir string) (*Spec, error) {
 type Options struct {
 	// Threads is each graph's INFERENCE_NUM_THREADS.
 	Threads int
-	// CallLimit cancels a model call that takes longer; its line is held. 0: no limit.
-	CallLimit time.Duration
 	// Threshold names the hold threshold of thresholds.hold; "" is the bundle's default.
 	Threshold string
 }
@@ -532,20 +529,6 @@ func (s *Scorer) streamFor(name string) *stream {
 
 // ---------------------------------------------------------------- scoring
 
-// ErrBusy is the error for a line whose time to be scored ran out before its models ran (core.ErrLater): the error
-// ScoreBy gives is then a *Later, which ScoreLater scores.
-var ErrBusy = core.ErrLater
-
-// Later is a line whose time to be scored ran out: the line and the context it had when it came, for ScoreLater.
-type Later struct {
-	s   *Scorer
-	e   *entry
-	ctx []*entry
-}
-
-func (p *Later) Error() string        { return ErrBusy.Error() }
-func (p *Later) Is(target error) bool { return target == ErrBusy }
-
 // Detail is everything about one line's score.
 type Detail struct {
 	Verdict    core.Verdict
@@ -569,75 +552,68 @@ func (s *Scorer) See(l core.Line) {
 	s.remember(st, s.entryOf(l))
 }
 
-// Score scores a line with no time limit but the per-call one.
+// Score scores a line (core.Scorer).
 func (s *Scorer) Score(l core.Line) (core.Verdict, error) {
-	d, err := s.ScoreBy(l, time.Time{})
+	d, err := s.Detail(l)
 	return d.Verdict, err
 }
 
-// ScoreBy scores a line within the deadline (none when zero): each model call is cancelled at the deadline or after
-// Options.CallLimit, whichever is sooner. The line becomes context for later lines whether or not its models ran.
-// When the deadline cuts it, the error is a *Later (errors.Is ErrBusy): ScoreLater scores the line then with the
-// context it has now.
-func (s *Scorer) ScoreBy(l core.Line, deadline time.Time) (Detail, error) {
+// Detail scores a line and gives everything about its score.
+func (s *Scorer) Detail(l core.Line) (Detail, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	c, err := s.take(l)
+	if err != nil {
+		return Detail{}, err
+	}
+	return s.run(c.e, c.ctx)
+}
+
+// Call is a line taken as context for later lines, with the context it had then, for Run to score.
+type Call struct {
+	s   *Scorer
+	e   *entry
+	ctx []*entry
+}
+
+var errClosed = errors.New("the models are closed")
+
+// Take makes the line context for later lines at once and gives the call that scores it with the context it has now:
+// a driver can answer the line before its models end, or score it after later lines, and its score is the same.
+func (s *Scorer) Take(l core.Line) (*Call, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.take(l)
+}
+
+// take is Take. The caller holds mu.
+func (s *Scorer) take(l core.Line) (*Call, error) {
 	if s.enc == nil {
-		return Detail{}, errors.New("the models are closed")
+		return nil, errClosed
 	}
 	st := s.streamFor(l.Stream)
 	e := s.entryOf(l)
 	ctx := s.context(st, e)
 	s.remember(st, e)
-	d, err := s.run(e, ctx, deadline)
-	if errors.Is(err, errDeadline) {
-		err = &Later{s, e, ctx}
-	}
-	return d, err
+	return &Call{s, e, ctx}, nil
 }
 
-// ScoreLater scores a line whose time ran out (ScoreBy's *Later), with the context it had when it came and the
-// per-call limit only. A line of models since replaced (a bundle switch) is not scored.
-func (s *Scorer) ScoreLater(p *Later) (Detail, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if p.s != s || s.enc == nil {
-		return Detail{}, errors.New("the models that took the line were replaced before it was scored")
+// Run runs the models on the call's line to their end, after the call in progress, if any.
+func (c *Call) Run() (Detail, error) {
+	c.s.mu.Lock()
+	defer c.s.mu.Unlock()
+	if c.s.enc == nil {
+		return Detail{}, errClosed
 	}
-	return s.run(p.e, p.ctx, time.Time{})
+	return c.s.run(c.e, c.ctx)
 }
-
-// errDeadline is run's error when the deadline, not the per-call limit, stopped the models.
-var errDeadline = errors.New("the deadline passed")
 
 // run runs the models on the line e with its context ctx. The caller holds mu.
-func (s *Scorer) run(e *entry, ctx []*entry, deadline time.Time) (Detail, error) {
+func (s *Scorer) run(e *entry, ctx []*entry) (Detail, error) {
 	var d Detail
 	d.SHIDs = e.toks
 	for _, c := range ctx {
 		d.ContextIDs = append(d.ContextIDs, c.id)
-	}
-	// limit is the next call's time: the per-call limit, or less when the deadline comes first (cut reports which)
-	cut := false
-	limit := func() (time.Duration, error) {
-		lim := s.opt.CallLimit
-		cut = false
-		if !deadline.IsZero() {
-			left := time.Until(deadline)
-			if left <= 0 {
-				return 0, errDeadline
-			}
-			if lim <= 0 || left < lim {
-				lim, cut = left, true
-			}
-		}
-		return lim, nil
-	}
-	failed := func(err error) error {
-		if cut && errors.Is(err, errTimeout) {
-			return errDeadline
-		}
-		return err
 	}
 	seq := append(slices.Clip(ctx), e)
 	n := len(seq)
@@ -645,14 +621,10 @@ func (s *Scorer) run(e *entry, ctx []*entry, deadline time.Time) (Detail, error)
 		if c.vec != nil {
 			continue
 		}
-		lim, err := limit()
+		shape := []int64{1, int64(len(c.toks))}
+		v, err := s.enc.run([]tensor{{i64: c.toks, shape: shape}, {i64: ones(len(c.toks)), shape: shape}})
 		if err != nil {
 			return d, err
-		}
-		shape := []int64{1, int64(len(c.toks))}
-		v, err := s.enc.run([]tensor{{i64: c.toks, shape: shape}, {i64: ones(len(c.toks)), shape: shape}}, lim)
-		if err != nil {
-			return d, failed(err)
 		}
 		c.vec = v
 	}
@@ -693,16 +665,13 @@ func (s *Scorer) run(e *entry, ctx []*entry, deadline time.Time) (Detail, error)
 		vec = append(vec, c.vec...)
 	}
 	d.Slot, d.Addr, d.Chan, d.Gap = f[0], f[1], f[2], f[3]
-	lim, err := limit()
-	if err != nil {
-		return d, err
-	}
 	in := []tensor{{f32: vec, shape: []int64{1, int64(n), int64(len(e.vec))}}}
 	for _, x := range f {
 		in = append(in, tensor{i64: x, shape: []int64{1, int64(n)}})
 	}
-	if d.SH, err = s.ctx.run(in, lim); err != nil {
-		return d, failed(err)
+	var err error
+	if d.SH, err = s.ctx.run(in); err != nil {
+		return d, err
 	}
 	sh := float64(d.SH[s.holdAt])
 	d.Verdict.SH = &sh
@@ -748,12 +717,9 @@ func (s *Scorer) run(e *entry, ctx []*entry, deadline time.Time) (Detail, error)
 		body = body[len(body)-max:]
 	}
 	d.CIDs = append([]int64{s.bos}, body...)
-	if lim, err = limit(); err != nil {
-		return d, err
-	}
 	shape := []int64{1, int64(len(d.CIDs))}
-	if d.C, err = s.c.run([]tensor{{i64: d.CIDs, shape: shape}, {i64: ones(len(d.CIDs)), shape: shape}}, lim); err != nil {
-		return d, failed(err)
+	if d.C, err = s.c.run([]tensor{{i64: d.CIDs, shape: shape}, {i64: ones(len(d.CIDs)), shape: shape}}); err != nil {
+		return d, err
 	}
 	c := float64(d.C[s.holdAt])
 	d.Verdict.C = &c
@@ -783,5 +749,3 @@ type tensor struct {
 	f32   []float32
 	shape []int64
 }
-
-var errTimeout = errors.New("timed out")

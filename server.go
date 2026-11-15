@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	goruntime "runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -40,11 +42,15 @@ type server struct {
 	// scoreMu is held while the scoring worker takes a line, so a bundle switch comes between two lines.
 	scoreMu sync.Mutex
 	jobs    sync.WaitGroup
-	// noticed is when a notice of each kind was last sent (notifyStop).
+	// noticed is when a notice of each kind was last sent (notify).
 	noticeMu sync.Mutex
 	noticed  map[string]time.Time
 	// queue holds the lines waiting for the scoring worker, in arrival order.
 	queue chan *lineJob
+	// callStart is when the model call in progress started (Unix nanoseconds; 0 when none); slowCalls counts the
+	// calls since start that ran slowCall or longer.
+	callStart atomic.Int64
+	slowCalls atomic.Int64
 
 	// mu guards the engine and what follows; the engine is not safe for concurrent use.
 	mu       sync.Mutex
@@ -69,7 +75,7 @@ func run(cfg Config) error {
 		queue: make(chan *lineJob, queueCap)}
 	var err error
 	if cfg.Test.HoldWordsFile != "" {
-		if s.words, err = newWordScorer(cfg.Test.HoldWordsFile); err != nil {
+		if s.words, err = newWordScorer(cfg.Test); err != nil {
 			return err
 		}
 	} else if goruntime.GOOS != "linux" {
@@ -112,7 +118,7 @@ func run(cfg Config) error {
 	}
 	s.judge = &bedrockJudge{ctx: ctx, br: s.br, spend: s.spend, tier: cfg.Judge.ServiceTier,
 		effort: cfg.Judge.ReasoningEffort, maxOut: cfg.Judge.MaxOutputTokens, timeout: cfg.Judge.Timeout,
-		stopped: s.notifyStop, record: s.rec.append, backoff: orDefault(cfg.Test.JudgeBackoff, judgeBackoff),
+		stopped: s.notify, record: s.rec.append, backoff: orDefault(cfg.Test.JudgeBackoff, judgeBackoff),
 		retryFor: orDefault(cfg.Test.JudgeRetryFor, judgeRetryFor)}
 	st, err := readState(cfg)
 	if err != nil {
@@ -202,7 +208,7 @@ func (s *server) scorerFor(b *Bundle) (core.Scorer, error) {
 	}
 	m := s.cfg.Model
 	t0 := time.Now()
-	sc, err := model.Open(b.dir, b.spec, model.Options{Threads: m.Threads, CallLimit: m.CallTimeout, Threshold: m.Threshold})
+	sc, err := model.Open(b.dir, b.spec, model.Options{Threads: m.Threads, Threshold: m.Threshold})
 	if err != nil {
 		return nil, fmt.Errorf("bundle %s: the models: %w", b.Version, err)
 	}
@@ -313,9 +319,10 @@ func (s *server) runJob(j *core.Job) {
 // A notice of one cause is sent at most this often.
 const noticeEvery = time.Hour
 
-// notifyStop tells staff with the alert permission that judging stopped, and why: a notice of each kind at most once
-// per [test] notice_every (an hour). The budget's notice comes once per UTC day or month (spend), within that.
-func (s *server) notifyStop(kind, text string) {
+// notify tells staff with the alert permission that judging stopped, and why, or that a model call is slow: a notice
+// of each kind at most once per [test] notice_every (an hour). The budget's notice comes once per UTC day or month
+// (spend), within that.
+func (s *server) notify(kind, text string) {
 	now := time.Now()
 	s.noticeMu.Lock()
 	last, ok := s.noticed[kind]
@@ -327,7 +334,7 @@ func (s *server) notifyStop(kind, text string) {
 	if !send {
 		return
 	}
-	slog.Error("judging stopped; staff are told", "cause", kind)
+	slog.Error("staff are told", "notice", kind, "text", text)
 	s.acts.add(action{Type: actionNotice, Kind: kind, Text: text})
 }
 
@@ -415,10 +422,11 @@ func (s *server) handleLine(w http.ResponseWriter, r *http.Request) {
 }
 
 // scoreLines is the scoring worker: it takes the queued lines in arrival order, one at a time, so that each line's
-// context is the lines before it and one model call runs at a time. A line that has waited [model] max_wait is held
-// (its model call is cut off at that point; a call is also cut after [model] call_timeout, and its line held): it is
-// context for later lines at once, and is scored, with the context it had, when no line is waiting (rescore). The
-// engine's lock is not held while the models run.
+// context is the lines before it and one model call runs at a time. A model call always runs to its end. A line still
+// waiting for its verdict [model] max_wait after it arrived is answered hold and is context for later lines at once:
+// when its models are running then, their verdict is applied when they end; when the worker comes to it later than
+// that, it is scored, with the context it had, when no line is waiting (rescore). The engine's lock is not held while
+// the models run.
 func (s *server) scoreLines() {
 	var later []laterLine
 	for {
@@ -445,72 +453,175 @@ func (s *server) scoreLines() {
 	}
 }
 
-// laterLine is a line held when its time to be scored ran out, to score when no line is waiting.
+// laterLine is a line answered hold before its models ran, to score when no line is waiting: its call, and the models
+// that took it (nil for the rig's scorer).
 type laterLine struct {
-	line core.Line
-	p    *model.Later
+	ref  string
+	call scoreCall
+	by   *model.Scorer
 }
 
-// rescore scores a line held when its time ran out and hands its verdict to the engine, unless its sitting settled it
-// meanwhile.
+// scoreCall scores one line taken by the scorer, with the context the line had when it was taken.
+type scoreCall func() (core.Verdict, error)
+
+// The worker's errors for a line answered hold before its verdict (errors.Is core.ErrLater).
+type laterError string
+
+func (e laterError) Error() string        { return string(e) }
+func (e laterError) Is(target error) bool { return target == core.ErrLater }
+
+const (
+	errQueued  laterError = "max_wait passed before its models ran; scored when no line is waiting"
+	errRunning laterError = "max_wait passed while its models ran; scored when they end"
+)
+
+// A model call that runs this long is logged and staff are told, since every line behind it waits; it is not cut.
+const slowCall = 10 * time.Second
+
+// Notice kind of a slow model call.
+const noticeSlowModel = "slow_model"
+
+// rescore scores a line answered hold before its models ran and hands its verdict to the engine, unless its sitting
+// settled it meanwhile. A line the models since replaced took (a bundle switch) is held without a score.
 func (s *server) rescore(l laterLine) {
 	s.scoreMu.Lock()
 	defer s.scoreMu.Unlock()
 	s.mu.Lock()
-	m := s.models
-	waiting := s.eng.Unscored(l.line.Ref)
+	waiting, current := s.eng.Unscored(l.ref), s.models == l.by
 	s.mu.Unlock()
 	if !waiting {
 		return
 	}
-	var d model.Detail
-	err := errors.New("the models are closed")
-	if m != nil {
-		d, err = m.ScoreLater(l.p)
+	v, err := core.Verdict{}, errors.New("the models that took the line were replaced before it was scored")
+	if current {
+		v, err = s.call(l.ref, l.call, time.Time{}, nil)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.now()
-	s.dispatch(s.eng.Rescored(l.line.Ref, d.Verdict, err))
+	s.dispatch(s.eng.Rescored(l.ref, v, err))
 }
 
-// scoreLine gives one queued line its verdict; ok when the line is held to be scored later.
+// scoreLine gives one queued line its verdict; ok when the line was answered hold before its models ran, to be scored
+// when no line is waiting.
 func (s *server) scoreLine(j *lineJob) (later laterLine, ok bool) {
 	s.scoreMu.Lock()
-	req := j.req
-	l := req.coreLine(j.arrived)
+	defer s.scoreMu.Unlock()
+	l := j.req.coreLine(j.arrived)
+	deadline := j.arrived.Add(s.cfg.Model.MaxWait)
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !s.eng.Known(l.Channel) {
 		slog.Error("a line on a channel this server does not know is held; its sitting goes on the review queue",
-			"channel", l.Channel, "id", req.ID)
+			"channel", l.Channel, "id", j.req.ID)
 	}
-	var res core.Result
-	scored, score := s.eng.Prepare(l)
-	if m := s.models; score && m != nil {
+	var call scoreCall
+	if scored, score := s.eng.Prepare(l); score {
+		call = s.take(scored)
+	}
+	switch {
+	case call == nil:
+		s.answer(j, s.eng.Line(l))
+	case !time.Now().Before(deadline):
+		s.answer(j, s.eng.LineScored(l, core.Verdict{}, errQueued))
+		later, ok = laterLine{l.Ref, call, s.models}, s.eng.Unscored(l.Ref)
+	default:
 		s.mu.Unlock()
-		d, err := m.ScoreBy(scored, j.arrived.Add(s.cfg.Model.MaxWait))
+		answered := false
+		v, err := s.call(l.Ref, call, deadline, func() {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			s.answer(j, s.eng.LineScored(l, core.Verdict{}, errRunning))
+			answered = true
+		})
 		s.mu.Lock()
-		res = s.eng.LineScored(l, d.Verdict, err)
-		var p *model.Later
-		if errors.As(err, &p) && s.eng.Unscored(l.Ref) {
-			later, ok = laterLine{scored, p}, true
+		if answered {
+			s.now()
+			s.dispatch(s.eng.Rescored(l.Ref, v, err))
+		} else {
+			s.answer(j, s.eng.LineScored(l, v, err))
 		}
-	} else {
-		res = s.eng.Line(l)
 	}
+	return later, ok
+}
+
+// take makes a line the engine scores context for later lines and gives the call that scores it. The caller holds mu.
+func (s *server) take(l core.Line) scoreCall {
+	if s.words != nil {
+		return func() (core.Verdict, error) { return s.words.Score(l) }
+	}
+	if s.models == nil {
+		return nil
+	}
+	c, err := s.models.Take(l)
+	if err != nil {
+		return func() (core.Verdict, error) { return core.Verdict{}, err }
+	}
+	return func() (core.Verdict, error) {
+		d, err := c.Run()
+		return d.Verdict, err
+	}
+}
+
+// call runs one model call to its end and gives its verdict. When late is set and the call has not ended at the time
+// at, late runs then, while the call goes on. A call that has run slowCall ([test] slow_call) is logged as an error
+// and staff are told (notice slow_model), at most once an hour; it is not cut, and the lines behind it wait.
+func (s *server) call(ref string, f scoreCall, at time.Time, late func()) (core.Verdict, error) {
+	type result struct {
+		v   core.Verdict
+		err error
+	}
+	done := make(chan result, 1)
+	start := time.Now()
+	s.callStart.Store(start.UnixNano())
+	defer s.callStart.Store(0)
+	go func() {
+		v, err := f()
+		done <- result{v, err}
+	}()
+	var lateC <-chan time.Time
+	if late != nil {
+		t := time.NewTimer(time.Until(at))
+		defer t.Stop()
+		lateC = t.C
+	}
+	slowAfter := orDefault(s.cfg.Test.SlowCall, slowCall)
+	slow := time.NewTimer(slowAfter)
+	defer slow.Stop()
+	reported := false
+	for {
+		select {
+		case r := <-done:
+			if reported {
+				slog.Warn("the slow model call ended", "id", ref, "seconds", fmt.Sprintf("%.1f", time.Since(start).Seconds()))
+			}
+			return r.v, r.err
+		case <-lateC:
+			lateC = nil
+			late()
+		case <-slow.C:
+			reported = true
+			s.slowCalls.Add(1)
+			slog.Error("a model call has run without ending; it is not cut, and the lines behind it wait", "id", ref,
+				"seconds", fmt.Sprintf("%.1f", time.Since(start).Seconds()), "lines_waiting", len(s.queue))
+			s.notify(noticeSlowModel, fmt.Sprintf("ECC: one line's model call has run for %s without ending, so every "+
+				"chat line waits behind it and is held. Check the ECC-Server host's CPU and memory.", slowAfter))
+		}
+	}
+}
+
+// answer gives the line its verdict and hands the engine's actions on. The caller holds mu.
+func (s *server) answer(j *lineJob, res core.Result) {
 	s.dispatch(res)
 	j.verdict = res.Verdict
-	s.seen[req.ID] = res.Verdict
-	s.seenLog = append(s.seenLog, req.ID)
+	s.seen[j.req.ID] = res.Verdict
+	s.seenLog = append(s.seenLog, j.req.ID)
 	if len(s.seenLog) > seenIDs {
 		delete(s.seen, s.seenLog[0])
 		s.seenLog = s.seenLog[1:]
 	}
-	delete(s.pending, req.ID)
-	s.mu.Unlock()
-	s.scoreMu.Unlock()
+	delete(s.pending, j.req.ID)
 	close(j.done)
-	return later, ok
 }
 
 // handlePresence takes the plugin's start (a new stream: every open sitting ends; the allowlist of links) and
@@ -619,7 +730,9 @@ type hostStatus struct {
 	Version        string         `json:"version,omitempty"`
 	Scorer         string         `json:"scorer"`
 	Waiting        int            `json:"lines_waiting"`
-	Wandb          *wandbStatus   `json:"wandb"` // null when no W&B key is set
+	ModelCall      float64        `json:"model_call_seconds"` // how long the model call in progress has run; 0: none
+	SlowCalls      int64          `json:"slow_model_calls"`   // calls since start that ran slowCall or longer
+	Wandb          *wandbStatus   `json:"wandb"`              // null when no W&B key is set
 	Judge          *bedrockStatus `json:"judge"`
 	Spend          spendStatus    `json:"spend"`
 	Sittings       core.Status    `json:"sittings"`
@@ -629,7 +742,10 @@ type hostStatus struct {
 // handleStatus is 200 when a bundle is served, otherwise 503, with the same body.
 func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	h := hostStatus{Status: "ready", Boot: s.boot, Judge: s.br.status(), Spend: s.spend.status(), Unacknowledged: s.acts.count(),
-		Waiting: len(s.queue)}
+		Waiting: len(s.queue), SlowCalls: s.slowCalls.Load()}
+	if t := s.callStart.Load(); t != 0 {
+		h.ModelCall = math.Round(time.Since(time.Unix(0, t)).Seconds()*1000) / 1000
+	}
 	if s.upd != nil {
 		h.Wandb = s.upd.status()
 	}

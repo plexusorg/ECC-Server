@@ -582,7 +582,6 @@ func (e *Engine) line(l Line, given *scored) Result {
 	switch {
 	case later:
 		rec.Verdict = "hold"
-		rec.Why += "; scored when no line is waiting"
 		en.unscored = true
 		s.unscored = append(s.unscored, en.pos)
 		e.later[l.Ref] = en

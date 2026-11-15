@@ -91,10 +91,10 @@ type Judge interface {
 	Rule(job *Job) (Answer, error)
 }
 
-// ErrLater is the scorer's error for a line whose time to be scored ran out under load (errors.Is): the driver scores
-// it when no line is waiting and hands the verdict to Engine.Rescored. Until then the line is held but none of its
-// sitting's held lines for the judge, and the sitting's checkpoints wait for it.
-var ErrLater = errors.New("no time left to score the line")
+// ErrLater is the driver's error for a line it answered hold before its score (errors.Is): it hands the verdict to
+// Engine.Rescored once the line is scored. Until then the line is held but none of its sitting's held lines for the
+// judge, and the sitting's checkpoints wait for it.
+var ErrLater = errors.New("answered before its score")
 
 // ErrNotSent is the error a driver hands to Engine.Rule for a checkpoint whose prompt it chose not to send.
 var ErrNotSent = errors.New("the checkpoint was not sent to the judge")

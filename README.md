@@ -146,14 +146,17 @@ holds the bypass permission) is kept as context for other players' lines only: n
 sitting. A private message is a `msg` line; its conversation is the pair of the two account names. Every other line is
 scored by the fast model with the lines before it that the bundle's `context` names (the public lines, a private
 message's earlier messages between the same two players, a placed line's author's earlier placed lines: the last 30
-within 30 minutes); a line the scorer cannot score is held. Lines are scored one at a time, in the order they arrive. A
-line still waiting for its verdict `[model] max_wait` after it arrived is answered hold before its models have run (a
-burst of lines is held rather than queued past the time Module-ECC waits; a model call is cut off at that point, and
-after `[model] call_timeout`). It is context for later lines at once, and is scored, with the context it had, as soon
-as no line is waiting: a line the models would hold becomes one of its sitting's held lines, with its kinds; a line
-they would deliver is released with its repeats (`release`). Until then its sitting's checkpoints wait for it, so the
-judge never sees it unscored; only when the sitting ends, or the line has waited `[core] wait`, first is it put to the
-judge as held without a kind. `/status` counts such lines (`held_unscored`). A bundle switch comes between two lines: the new models take the lists of earlier lines
+within 30 minutes); a line the scorer cannot score is held. Lines are scored one at a time, in the order they arrive,
+and a model call always runs to its end. A line still waiting for its verdict `[model] max_wait` after it arrived is
+answered hold, so neither a burst nor a slow call keeps Module-ECC waiting past its own timeout, and is context for
+later lines at once. If its models are running then, their verdict is applied when they end; if they had not started,
+the line is scored, with the context it had, as soon as no line is waiting. Either way a line the models would hold
+becomes one of its sitting's held lines, with its kinds, and a line they would deliver is released with its repeats
+(`release`). Until then its sitting's checkpoints wait for it, so the judge never sees it unscored; only when the
+sitting ends, or the line has waited `[chat] wait`, first is it put to the judge as held without a kind. `/status`
+counts such lines (`held_unscored`). A model call that has run 10 seconds is logged as an error and staff are told
+(notice `slow_model`); `/status` shows how long the call in progress has run (`model_call_seconds`). The lines behind
+it wait in the queue, and Module-ECC holds each one it got no verdict for and asks again. A bundle switch comes between two lines: the new models take the lists of earlier lines
 the old models kept, so a line's context is the same across the switch. After a restart, the first lines are scored
 with only the lines since as their context.
 
@@ -219,7 +222,7 @@ acknowledged.
 **The record.** `<data>/record/YYYY-MM-DD.jsonl` (UTC days), one JSON line per event, each with `type` and `server`
 (the config's `server`): every `line` (stream, id, ref: Module-ECC's id for it, time, channel, conversation, account, name and the raw name,
 target, the prepared and the raw text, sitting, verdict, kinds, score), `rescored` (the verdict, kinds and scores of a
-line held before its models ran), `unscored` (such a line put to the judge without a score), `repeat`,
+line answered hold at `max_wait`, once its models end), `unscored` (such a line put to the judge without a score), `repeat`,
 `sitting_start`, `checkpoint` (the
 held-line count it covers, why it was made, the prompt's size and SHA-256, whether it was sent), `judge_call` (each
 call: attempt, status, the usage's input, cached, cache-write, output and reasoning tokens, cost, duration, or the
@@ -311,8 +314,7 @@ A TOML file, `/etc/ecc-server/config.toml` unless `-config` names another. Unkno
 | `wandb_artifact` | `classifier-bundle` | the artifact whose `production` alias names the bundle to serve |
 | `check_interval` | `"10m"` | time between W&B checks, at least `1m` |
 | `model.threads` | `6` | CPU threads of each model call (one runs at a time) |
-| `model.call_timeout` | `"800ms"` | a model call that takes longer is cut off and its line held |
-| `model.max_wait` | `"900ms"` | a line still waiting this long after it arrived is held; keep it under Module-ECC's `verdict_timeout_ms` |
+| `model.max_wait` | `"900ms"` | a line still waiting this long after it arrived is answered hold, and its verdict applied when its models end; keep it under Module-ECC's `verdict_timeout_ms` |
 | `model.threshold` | the bundle's default | the name of the bundle's hold threshold to use (`thresholds.hold`) |
 | `judge.region` | `us-east-1` | AWS region of the Bedrock endpoint |
 | `judge.model` | `us.moonshotai.kimi-k3.1` | Bedrock model or inference profile ID |
@@ -329,6 +331,8 @@ A TOML file, `/etc/ecc-server/config.toml` unless `-config` names another. Unkno
 | `test.bedrock_endpoint` | (none) | replaces the Bedrock runtime endpoint, for the rig's stub |
 | `test.judge_backoff`, `test.judge_retry_for`, `test.judge_retry_after` | `5s`, `5m`, `5m` | for the rig: the first wait after a failed call, how long failures are retried, when a pending checkpoint is put again |
 | `test.notice_every` | `1h` | for the rig: how often a notice of one cause may be sent |
+| `test.slow_word`, `test.slow_for` | (none) | for the rig: its scorer takes `slow_for` to score a line containing `slow_word`, as a slow model call |
+| `test.slow_call` | `10s` | for the rig: how long a model call runs before it is logged and staff are told |
 
 The API keys are not config keys; see Updates from W&B and The judge on Amazon Bedrock. On a machine without systemd
 (development), the host reads them from the files `ecc-server.wandb-api-key` and `ecc-server.bedrock-api-key` in the
@@ -433,7 +437,8 @@ holds without a verdict again.
 | `notice` | `kind`, `text` | show `text` to staff with the alert permission |
 
 `uuid` and `account` are the sitting's player as Module-ECC sent them, `speaker_uuid` and `speaker`: the UUID and the
-account name, never the shown name. A notice tells staff that judging stopped, and why (`kind`):
+account name, never the shown name. A notice tells staff that judging stopped, and why, or that a model call is slow
+(`kind`):
 
 | kind | cause | sent |
 | --- | --- | --- |
@@ -442,13 +447,15 @@ account name, never the shown name. A notice tells staff that judging stopped, a
 | `bad_request` | Bedrock refused the request (`400` or another `4xx` but `429`) | at most once an hour |
 | `invalid_answers` | the judge's answer was invalid three times on one checkpoint | at most once an hour |
 | `no_key` | no Bedrock key is set | at most once an hour |
+| `slow_model` | a model call has run 10 seconds without ending; every line behind it waits | at most once an hour |
 
 `POST /actions/ack` with `{"id": "...", "ok": true, "detail": "..."}` once an action is carried out: `200 {}`. Only
 `ok: true` ends an action; after `ok: false` it stays and is served again. Every acknowledgement is recorded; a
 repeated or unknown id changes nothing.
 
 `GET /status` is `200` when a bundle is served, otherwise `503`; the body is the same either way: `status`, `boot`, `version`
-(the bundle), `scorer`, `lines_waiting` (lines queued for the models), `wandb` (`null` without a key, otherwise `artifact`, `last_check`, `result`, `production`,
+(the bundle), `scorer`, `lines_waiting` (lines queued for the models), `model_call_seconds` (how long the model call in
+progress has run, `0` when none), `slow_model_calls` (calls since start that ran 10 seconds or longer), `wandb` (`null` without a key, otherwise `artifact`, `last_check`, `result`, `production`,
 `production_digest`, and `download` with `file`, `done` and `total` bytes while one runs), `judge` (`key_set`,
 `region`, `model`, `service_tier`, `reasoning_effort`, `since_start` (calls, answered calls and their summed usage), and
 after the first call `last_call`, `result` and `last_usage`: `input_tokens`, `cached_tokens`, `cache_write_tokens`,

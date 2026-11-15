@@ -2,10 +2,7 @@
 
 package model
 
-import (
-	"errors"
-	"time"
-)
+import "errors"
 
 // RuntimeDir is where the Debian package installs OpenVINO on a Linux host; the models run on Linux hosts only.
 const RuntimeDir = "/usr/lib/ecc-server/openvino"
@@ -28,4 +25,4 @@ func (c *ovCore) load(string, string, []string, map[string]string) (*graph, erro
 
 func (g *graph) close() {}
 
-func (g *graph) run([]tensor, time.Duration) ([]float32, error) { return nil, errNotLinux }
+func (g *graph) run([]tensor) ([]float32, error) { return nil, errNotLinux }

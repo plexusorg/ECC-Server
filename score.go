@@ -179,7 +179,7 @@ func scoreLines(args []string) error {
 			}
 		default:
 			t1 := time.Now()
-			d, err := sc.ScoreBy(scored, time.Time{})
+			d, err := sc.Detail(scored)
 			if err != nil {
 				return fmt.Errorf("line %s/%s: %w", x.Stream, x.ID, err)
 			}

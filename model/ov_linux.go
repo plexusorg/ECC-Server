@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"runtime"
 	"sync"
-	"time"
 	"unsafe"
 
 	"github.com/ebitengine/purego"
@@ -41,9 +40,6 @@ var (
 	ovSetTensor      func(req uintptr, name string, t uintptr) int32
 	ovTensorFree     func(t uintptr)
 	ovInfer          func(req uintptr) int32
-	ovStartAsync     func(req uintptr) int32
-	ovWait           func(req uintptr) int32
-	ovCancel         func(req uintptr) int32
 	ovOutputByIndex  func(req uintptr, idx uintptr, t *uintptr) int32
 	ovTensorSize     func(t uintptr, n *uintptr) int32
 	ovTensorData     func(t uintptr, data *unsafe.Pointer) int32
@@ -73,9 +69,7 @@ func loadRuntime() error {
 			"ov_compiled_model_free": &ovCompiledFree, "ov_compiled_model_create_infer_request": &ovCreateRequest,
 			"ov_infer_request_free": &ovRequestFree, "ov_tensor_create_from_host_ptr": &ovTensorFromHost,
 			"ov_infer_request_set_tensor": &ovSetTensor, "ov_tensor_free": &ovTensorFree,
-			"ov_infer_request_infer": &ovInfer, "ov_infer_request_start_async": &ovStartAsync,
-			"ov_infer_request_wait": &ovWait, "ov_infer_request_cancel": &ovCancel,
-			"ov_infer_request_get_output_tensor_by_index": &ovOutputByIndex, "ov_tensor_get_size": &ovTensorSize,
+			"ov_infer_request_infer": &ovInfer, "ov_infer_request_get_output_tensor_by_index": &ovOutputByIndex, "ov_tensor_get_size": &ovTensorSize,
 			"ov_tensor_data": &ovTensorData, "ov_get_error_info": &ovErrorInfo, "ov_get_last_err_msg": &ovLastErr,
 			"ov_get_openvino_version": &ovGetVersion, "ov_version_free": &ovVersionFree,
 		} {
@@ -175,10 +169,10 @@ func (g *graph) close() {
 	g.pin.Unpin()
 }
 
-// run sets the inputs (in the order of g.inputs), runs the graph and returns output 0. With a limit above 0 the call
-// is cancelled after that long and returns an error wrapping errTimeout. The input buffers are Go memory pinned for
-// the graph's life: the request keeps their address.
-func (g *graph) run(in []tensor, limit time.Duration) ([]float32, error) {
+// run sets the inputs (in the order of g.inputs), runs the graph to its end and returns output 0. A call is never
+// cancelled: after ov_infer_request_cancel, later calls of the graph fail OpenVINO's shape inference. The input buffers
+// are Go memory pinned for the graph's life: the request keeps their address.
+func (g *graph) run(in []tensor) ([]float32, error) {
 	for i, x := range in {
 		n, typ := len(x.i64)*8, int32(elemI64)
 		if x.f32 != nil {
@@ -208,28 +202,8 @@ func (g *graph) run(in []tensor, limit time.Duration) ([]float32, error) {
 			return nil, err
 		}
 	}
-	if limit <= 0 {
-		if err := ovStatus(ovInfer(g.req), "infer "+g.name); err != nil {
-			return nil, err
-		}
-	} else {
-		if err := ovStatus(ovStartAsync(g.req), "start "+g.name); err != nil {
-			return nil, err
-		}
-		done := make(chan int32, 1)
-		go func() { done <- ovWait(g.req) }()
-		timer := time.NewTimer(limit)
-		select {
-		case s := <-done:
-			timer.Stop()
-			if err := ovStatus(s, "infer "+g.name); err != nil {
-				return nil, err
-			}
-		case <-timer.C:
-			ovCancel(g.req)
-			<-done
-			return nil, fmt.Errorf("%s: %w after %s", g.name, errTimeout, limit)
-		}
+	if err := ovStatus(ovInfer(g.req), "infer "+g.name); err != nil {
+		return nil, err
 	}
 	var t uintptr
 	if err := ovStatus(ovOutputByIndex(g.req, 0, &t), "output"); err != nil {
