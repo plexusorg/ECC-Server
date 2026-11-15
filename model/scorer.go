@@ -360,9 +360,10 @@ func (s *Scorer) MarksKinds() bool { return len(s.kinds) > 0 }
 
 // ---------------------------------------------------------------- the context
 
-// entry is a line kept as context for later lines.
+// entry is a line kept as context for later lines; n is its place in the order its stream took lines.
 type entry struct {
 	id                       string
+	n                        int
 	time                     int64
 	channel, author, partner string
 	text                     string
@@ -428,6 +429,7 @@ func trim(l []*entry, n int) []*entry {
 // remember appends the line to its list: a private message to its pair's, a placed line to its author's, a public
 // channel's line to the public list; any other channel's line to none.
 func (s *Scorer) remember(st *stream, e *entry) {
+	e.n = st.adds
 	n := s.spec.Context.Lines
 	switch {
 	case e.channel == s.spec.Context.Private:
@@ -469,10 +471,15 @@ func AuthorKey(speaker string) string {
 func (s *Scorer) entryOf(l core.Line) *entry {
 	e := &entry{id: l.ID, time: l.Time.Unix(), channel: l.Channel, author: AuthorKey(l.Speaker),
 		text: l.Text}
-
 	if l.Channel == s.spec.Context.Private {
 		e.partner = core.Lower(l.Target)
 	}
+	s.encode(e)
+	return e
+}
+
+// encode gives the entry SH's input ids.
+func (s *Scorer) encode(e *entry) {
 	str := e.text
 	if e.channel != "chat" {
 		str = "[" + e.channel + "] " + e.text
@@ -487,7 +494,32 @@ func (s *Scorer) entryOf(l core.Line) *entry {
 		e.toks = append(e.toks, int64(id))
 	}
 	e.toks = append(e.toks, s.eos)
-	return e
+}
+
+// TakeContext gives the scorer the context of the scorer it replaces (a bundle switch), so that the next line's
+// context is the one it had with the old models: each line the old lists keep, taken again in the order it came, with
+// this bundle's input ids. A line's vector is made when a later line first needs it.
+func (s *Scorer) TakeContext(old *Scorer) {
+	old.mu.Lock()
+	src := old.st
+	all := slices.Clone(src.public)
+	for _, l := range src.pairs {
+		all = append(all, l...)
+	}
+	for _, l := range src.placed {
+		all = append(all, l...)
+	}
+	old.mu.Unlock()
+	slices.SortFunc(all, func(a, b *entry) int { return a.n - b.n })
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st := newStream(src.name)
+	for _, o := range all {
+		e := &entry{id: o.id, time: o.time, channel: o.channel, author: o.author, partner: o.partner, text: o.text}
+		s.encode(e)
+		s.remember(st, e)
+	}
+	s.st = st
 }
 
 // streamFor is the state of the line's stream; a new stream starts with no context.

@@ -149,8 +149,9 @@ message's earlier messages between the same two players, a placed line's author'
 within 30 minutes); a line the scorer cannot score is held. Lines are scored one at a time, in the order they arrive. A
 line still waiting for its verdict `[model] max_wait` after it arrived is held, unscored if its models have not run (a
 burst of lines is held rather than queued past the time Module-ECC waits), and a model call is cut off at that point or
-after `[model] call_timeout`. After a restart or a bundle switch, the first lines are scored with only the lines since
-as their context.
+after `[model] call_timeout`. A bundle switch comes between two lines: the new models take the lists of earlier lines
+the old models kept, so a line's context is the same across the switch. After a restart, the first lines are scored
+with only the lines since as their context.
 
 **Text preparation.** On arrival the host prepares the text as the training pipeline prepared its lines
 (`bundle.json` `text`): `§` codes and `&` colour codes removed, a CR made a space and a line break ` / `, whitespace

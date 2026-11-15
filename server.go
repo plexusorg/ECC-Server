@@ -37,7 +37,9 @@ type server struct {
 	words    *wordScorer // the rig's scorer, in place of the bundle's models
 	upd      *updater    // nil without a W&B key
 	switchMu sync.Mutex
-	jobs     sync.WaitGroup
+	// scoreMu is held while the scoring worker takes a line, so a bundle switch comes between two lines.
+	scoreMu sync.Mutex
+	jobs    sync.WaitGroup
 	// noticed is when a notice of each kind was last sent (notifyStop).
 	noticeMu sync.Mutex
 	noticed  map[string]time.Time
@@ -213,10 +215,12 @@ func (s *server) scorerFor(b *Bundle) (core.Scorer, error) {
 }
 
 // use serves a bundle's judge texts, settings and scorer: the engine is made with the first bundle and takes later
-// ones in place, keeping its sittings. The previous bundle's models are freed once the line they are scoring, if any,
-// is done; the new models start with no context.
+// ones in place, keeping its sittings. The switch waits for the line being scored, if any; the new models take the
+// previous models' context, and the previous models are freed.
 func (s *server) use(b *Bundle, sc core.Scorer) {
 	cc := coreConfig(s.cfg, b)
+	s.scoreMu.Lock()
+	defer s.scoreMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	old := s.models
@@ -225,6 +229,9 @@ func (s *server) use(b *Bundle, sc core.Scorer) {
 	if m, ok := sc.(*model.Scorer); ok {
 		s.models = m
 		s.scorerIs = "the bundle's models, hold threshold " + m.Threshold()
+		if old != nil {
+			m.TakeContext(old)
+		}
 	}
 	if old != nil {
 		go old.Close()
@@ -419,6 +426,7 @@ func (s *server) scoreLines() {
 			return
 		case j = <-s.queue:
 		}
+		s.scoreMu.Lock()
 		req := j.req
 		l := req.coreLine(j.arrived)
 		s.mu.Lock()
@@ -446,6 +454,7 @@ func (s *server) scoreLines() {
 		}
 		delete(s.pending, req.ID)
 		s.mu.Unlock()
+		s.scoreMu.Unlock()
 		close(j.done)
 	}
 }
