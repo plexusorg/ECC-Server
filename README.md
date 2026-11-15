@@ -1,6 +1,7 @@
 # ECC-Server
 
-The chat-safety decision maker for Module-ECC. It is one Go binary beside the game server, with the OpenVINO runtime\nits models run on. Module-ECC asks it
+The chat-safety decision maker for Module-ECC. It is one Go binary beside the game server, with the OpenVINO runtime its models
+run on. Module-ECC asks it
 for a verdict on every line a player writes before the line is delivered, and carries out the actions it gives; every
 decision is made here: the verdict on each line (`deliver` or `hold`), each player's sitting and its held lines, the
 checkpoints at which a judge (a model on Amazon Bedrock) reads the sitting and rules `nothing`, `hold` or `ban`, the
@@ -66,8 +67,12 @@ reads:
 
 - `graphs`, `tokenizers`, `special_tokens`, `outputs`, `kinds`, `openvino` (the release and the compile
   settings), `context` (the lists of earlier lines a line is scored with), `sh` and `c` (the models' inputs): how a
-  line is scored. The rules `bundle.json` states in words must be the ones this host implements (it compares their
-  SHA-256), or the bundle is refused;
+  line is scored;
+- `channels`: the channels a line may have;
+- `text`: how a line's raw text and names are prepared (see A line), with its limits, marks, whitespace and patterns;
+- `rules`: the paths of every rule the host implements in code, from `context.rule` to `links.rule`. The host hashes
+  the values at those paths as `rules.how` states; a bundle whose rules hash differently from the ones this host
+  implements is refused, and so is one whose text limits, marks, whitespace or link pattern differ;
 - `thresholds`: `sh_pass`, `hold` (by name) and `default`, the hold threshold to use, and, when set, `kinds`
   (a threshold per kind on C's logits; without them no line is marked with a kind);
 - `judge.question`: `question.md`, whose `json` block holds the prompt's fixed strings (`QUESTION`, `ADDED`, `FORMAT`
@@ -78,7 +83,8 @@ reads:
   checkpoints);
 - `judge.render`: how a sitting is shown to the judge: `before`, `after`, `max_chars`, `cut_before`, `cut_after`, and
   `kinds`, the name the judge reads for each kind the fast model marks;
-- `links.canonical`: the link the models were trained with in place of an allowed link (see A line).
+- `links`: `canonical`, the link the models were trained with in place of an allowed link, and the link `pattern` and
+  `rule` (see A line).
 
 The config replaces only the checkpoint schedule, `every` and the wait when it sets them (see Configuration).
 
@@ -130,31 +136,46 @@ the earlier version in W&B also switches the host back, at its next check. With 
 
 ## Chat safety
 
-**A line.** Module-ECC sends each line (`POST /line`) and waits for the verdict. The host times it by its own clock
-on arrival and numbers it `L<n>` in the current stream (a stream runs from one game server start to the next). A line
-with no speaker UUID (a Discord relay) or marked `trusted` (Module-ECC delivered it at once: its speaker is in one of
-the module's trusted groups or holds the bypass permission) is kept as context for other players' lines only: never
-scored, held or judged, and in no sitting. Every other line is scored by the fast model with the lines before it
-that the bundle's `context` names (the public lines, a private message's earlier messages between the same two players,
-a sign's or book's author's earlier placed lines: the last 30 within 30 minutes); a line the scorer cannot score is
-held. Lines are scored one at a time, in the order they arrive. A line still waiting for its verdict `[model] max_wait`
-after it arrived is held, unscored if its models have not run (a burst of lines is held rather than queued past the
-time Module-ECC waits), and a model call is cut off at that point or after `[model] call_timeout`. After a restart or
-a bundle switch, the first lines are scored with only the lines since as their context. In the text the scorer sees, the line's and
-its context's, each link on the allowlist Module-ECC sends with `start` is replaced by the bundle's `links.canonical`,
-the whole link with its scheme, port, path and the punctuation after it, as the models were trained: a domain covers
-its subdomains and every path on them, an exact URL only itself (with or without a scheme, a last `/` or punctuation
-after it); hosts and paths compare without regard to case. The record and the judge see the
-original text. The host keeps the last allowlist in `<data>/links.json` for its next start; before any `start`, no link
-is replaced.
+**A line.** Module-ECC sends each line (`POST /line`) as it was written: the raw text, the account name, on chat the
+name the console shows. The host times it when the request arrives and numbers it `L<n>` in the current stream (a
+stream runs from one game server start to the next). A line on a channel `bundle.json` does not name is held, never
+scored and never context; the host logs it with the channel's name, counts it in `/status` (`unknown_channels`) and
+puts the player's sitting on the review queue when it ends. A Discord relay line (channel `discord`, no speaker UUID)
+or a line marked `trusted` (Module-ECC delivered it at once: its speaker is in one of the module's trusted groups or
+holds the bypass permission) is kept as context for other players' lines only: never scored, held or judged, and in no
+sitting. A private message is a `msg` line; its conversation is the pair of the two account names. Every other line is
+scored by the fast model with the lines before it that the bundle's `context` names (the public lines, a private
+message's earlier messages between the same two players, a placed line's author's earlier placed lines: the last 30
+within 30 minutes); a line the scorer cannot score is held. Lines are scored one at a time, in the order they arrive. A
+line still waiting for its verdict `[model] max_wait` after it arrived is held, unscored if its models have not run (a
+burst of lines is held rather than queued past the time Module-ECC waits), and a model call is cut off at that point or
+after `[model] call_timeout`. After a restart or a bundle switch, the first lines are scored with only the lines since
+as their context.
 
-**Repeats.** A line with the same speaker name (in any case), channel, target and text as an earlier line, within 60
-seconds of that line's last copy (whole seconds), is a repeat of it, whatever lines came between, as the training
-pipeline folds repeats: it is not scored and is no context for later lines, it gets the verdict of the line it
-repeats (a copy of a held line is held, and delivered with it if a ruling releases it; a copy of a line a ruling
-already released is delivered), the judge sees the line once with "(sent N times)", and it is no new held line for
-the checkpoints. A release lists the held lines and their repeats in the order they arrived.
+**Text preparation.** On arrival the host prepares the text as the training pipeline prepared its lines
+(`bundle.json` `text`): `§` codes and `&` colour codes removed, a CR made a space and a line break ` / `, whitespace
+collapsed, a link over 60 characters cut to its first 50 and `[...]`, a text over its channel's limit (book 1000, nick
+80, any other 400) cut with ` [...]`, and IPv4 and IPv6 addresses made `[ip]`. Lengths count code points, and the
+rules match as the pipeline's Python patterns do (Unicode whitespace and digits, Python's case folding). A text that
+preparation empties is delivered and dropped: it is not scored and is no context. A chat name loses its codes, the
+client's `[Not Secure]` mark and its icon codes, a Discord name its tags; the judge sees the prepared shown name on chat,
+the prepared Discord name on discord and the account name on every other channel. The models, the context and the
+judge read the prepared text; the record keeps the raw text and name beside it. In the text the scorer sees, the
+line's and its context's, each link the allowlist allows is replaced by the bundle's `links.canonical`, the whole
+match of `links.pattern` with its scheme, port and path: an entry `host` or `host/prefix` (Module-ECC sends the list
+with `start`) allows a link whose host is the host or one of its subdomains and whose path, any case, starts with the
+prefix (punctuation after the link counts as path). The record and the judge see the link. The host keeps the last
+allowlist in `<data>/links.json` for its next start; before any `start`, no link is replaced.
 
+**Repeats.** A line is a repeat of an earlier line of the stream with the same name, channel and text within 60
+seconds (whole seconds) of that line's last copy, whatever lines came between, as the training pipeline folded
+repeats (`bundle.json` `text.repeat`): the name is, on chat, the shown name followed by `=` and the account when it
+does not contain the account; on discord the Discord name; elsewhere the account; the channel carries the recipient on
+msg and mail and the player named on nick; the text is the prepared text before addresses become `[ip]`. A repeat is
+not scored and is no context for later lines, it gets the verdict of the line it repeats (a copy of a held line is
+held, and delivered with it if a ruling releases it; a copy of a line a ruling already released is delivered), the
+judge sees the line once with "(sent N times)", and it is no new held line for the checkpoints. A release lists the
+held lines and their repeats in the order they arrived.
 **Kinds.** On a line C scores, the fast model marks each kind whose logit is at or over its `thresholds.kinds` value.
 The judge sees the player's marked lines with the kinds' names from `judge.render.kinds`, and a marked line, held or
 not, is shown with the lines around it.
@@ -163,8 +184,9 @@ not, is shown with the lines around it.
 `sitting_end_seconds` after they leave (with no leave known, after their last line); a game server start ends every
 sitting. The judge is called at a sitting's checkpoints: after each held-line count in the schedule, then every
 `every`-th held line; when a held line has waited the wait without a ruling; and at the sitting's end while held lines
-are unruled. One call per sitting is in flight; a later checkpoint waits for its answer. A ruling covers the held
-lines up to its checkpoint's last line:
+are unruled. One call per sitting is in flight; a later checkpoint waits for its answer. The case the judge reads is
+headed with the UTC date of its first line and shows each line at its UTC time of day. A ruling covers the held lines
+up to its checkpoint's last line:
 
 | ruling | action |
 | --- | --- |
@@ -172,12 +194,13 @@ lines up to its checkpoint's last line:
 | `hold` | the lines stay held; `warn` the player, once a sitting |
 | `ban` | `ban`: an indefinite ban and an immediate kick; the player's held lines are dropped and the sitting ends |
 
-A checkpoint the judge does not rule (a failed call, two invalid answers, a prompt over `max_prompt_chars`, the day's
-calls or a budget used up, no Bedrock key) leaves its lines held.
+A checkpoint the judge does not rule (three invalid answers, a refusal by Bedrock, a prompt over `max_prompt_chars`,
+the day's calls or a budget used up, no Bedrock key, or a judge it could not reach before the sitting ended) leaves
+its lines held.
 
 **The review queue.** `<data>/review/queue.jsonl` gets one JSON line for each ban, each sitting that ends with
-`review_held` or more held lines and no ban, each sitting with a checkpoint the judge did not rule, and each sitting a
-restart ended with held lines no ruling covered.
+`review_held` or more held lines and no ban, each sitting with a checkpoint the judge did not rule, each sitting with a
+line on a channel the bundle does not name, and each sitting a restart ended with held lines no ruling covered.
 
 **Restart.** Nothing about a sitting is reloaded. At start the host reads the last two days' record for sittings that
 started and did not end, records each one's end, and puts each with held lines no ruling covered on the review queue.
@@ -189,10 +212,12 @@ after `ok: false` the action stays and is served again. A restart of either prog
 acknowledged.
 
 **The record.** `<data>/record/YYYY-MM-DD.jsonl` (UTC days), one JSON line per event, each with `type` and `server`
-(the config's `server`): every `line` (stream, id, time, channel, conversation, account, name, target, text, sitting,
-verdict, kinds, score), `repeat`, `sitting_start`, `checkpoint` (the held-line count it covers, why it was made, the
-prompt's size and SHA-256, whether it was sent), `ruling` (the judge's answer or the error), `action` (the core's, by
-line id), `action_sent` (as Module-ECC gets it), `ack`, `presence`, `sitting_end` (outcome, held, released and unruled
+(the config's `server`): every `line` (stream, id, time, channel, conversation, account, name and the raw name,
+target, the prepared and the raw text, sitting, verdict, kinds, score), `repeat`, `sitting_start`, `checkpoint` (the
+held-line count it covers, why it was made, the prompt's size and SHA-256, whether it was sent), `judge_call` (each
+call: attempt, status, the usage's input, cached, cache-write, output and reasoning tokens, cost, duration, or the
+error), `ruling` (the judge's answer, the error, or `pending` with the time it is put again), `checkpoint_again`,
+`action` (the core's, by line id), `action_sent` (as Module-ECC gets it), `ack`, `presence`, `sitting_end` (outcome, held, released and unruled
 lines, the checkpoints) and `review`. Lines are flushed one at a time. Just after midnight UTC the day's file is
 compressed to `YYYY-MM-DD.jsonl.zst`; compressed files older than `record_retention_days` are deleted.
 
@@ -203,7 +228,8 @@ record has the text and the rulings.
 ## The judge on Amazon Bedrock
 
 **The key.** `sudo ecc-server bedrock login` reads an Amazon Bedrock API key from a hidden prompt (or from standard
-input when piped) and checks it with a small Converse call (16 output tokens) to `judge.model` in `judge.region`,
+input when piped) and checks it with a small Responses call (16 output tokens, no reasoning) to `judge.model` in
+`judge.region`,
 which proves both the key and its access to the model. A key Bedrock rejects, or any failed check, is not stored. A
 key that passes is stored the way the W&B key is: encrypted with `systemd-creds` into
 `/etc/credstore.encrypted/ecc-server.bedrock-api-key`, loaded by the unit's
@@ -212,23 +238,34 @@ key the service starts and gives verdicts, and no checkpoint is judged. `sudo ec
 key and restarts the service. Bedrock API keys expire; when Bedrock refuses the key, the host logs it once, with the
 fix, until a call succeeds again.
 
-**The call.** Each checkpoint is one Converse request, `POST
-https://bedrock-runtime.<region>.amazonaws.com/model/<model>/converse` with `Authorization: Bearer <key>`:
+**The call.** Each checkpoint is one Responses request, `POST
+https://bedrock-runtime.<region>.amazonaws.com/openai/v1/responses` with `Authorization: Bearer <key>`:
 
 ```json
-{"messages": [{"role": "user", "content": [{"text": "<the prompt>"}]}], "inferenceConfig": {"maxTokens": 8000}, "serviceTier": {"type": "flex"}}
+{"model": "us.moonshotai.kimi-k3.1", "max_output_tokens": 16000, "reasoning": {"effort": "medium"},
+ "service_tier": "flex", "prompt_cache_options": {"mode": "explicit"}, "store": false,
+ "input": [{"type": "message", "role": "user", "content": [
+   {"type": "input_text", "text": "<the question and the owner's cases>", "prompt_cache_breakpoint": {"mode": "explicit"}},
+   {"type": "input_text", "text": "<the new case and the answer format>"}]}]}
 ```
 
-The prompt is one text: the question, the owner's cases, the sitting so far with the held lines marked `[held]`, and
-the answer format. Every call's prompt starts with the same question and cases, so Bedrock serves that start from its
-prompt cache. The answer must be one JSON object (a Markdown code fence around it is accepted) whose `rulings` list
-holds one entry for the case `N1`: `ruling` `nothing`, `hold` or `ban`; for `hold` or `ban`, `by` one of the player's
-lines the case shows; `like` a list of at most three of the owner's case ids; `sure` true or false. An answer that
-fails these checks is asked for once more; a second invalid answer, a failed call, a refusal by Bedrock or the
-`timeout` leaves the lines held.
-
-**The budget.** The host adds up each call's cost from the token counts Bedrock returns (input, output, cache read,
-cache write) at the configured prices, halved on the flex tier, into the UTC day's and the UTC month's totals in
+The two parts, joined, are the prompt: the question, the owner's cases, the sitting so far with the held lines marked
+`[held]`, and the answer format. The first part is the same in every call and ends at an explicit cache breakpoint, so
+Bedrock serves it from its prompt cache (at least 30 minutes; a hit resets the time, and a request another server takes
+writes a new entry). `store` is false: Bedrock keeps no copy of the prompt or the answer. The answer is the output
+message's text; an answer whose `status` is `incomplete` (its output cut at `max_output_tokens`) is invalid. A valid
+answer is one JSON object (a Markdown code fence around it is accepted) whose `rulings` list holds one entry for the
+case `N1`: `ruling` `nothing`, `hold` or `ban` (`not ban`, a ruling of the owner's cases, is taken as `hold`); for
+`hold` or `ban`, `by` one of the player's lines the case shows; `like` a list of at most three of the owner's case
+ids; `sure` true or false. An invalid answer is asked for again, up to three answers. A call that fails (`429`, a
+`5xx`, the `timeout`, the network) is made again after 5 seconds, then 10, 20, ..., while the failures have lasted
+less than 5 minutes; then the checkpoint is pending: it is put again 5 minutes later, and so on until the sitting ends
+(`/status` counts the pending ones). A call refused by the budget, or by Bedrock for the key (`401`, `403`) or as a
+bad request, is not made again.
+**The budget.** The host adds up each call's cost from the usage Bedrock returns at the configured prices, halved on
+the flex tier: the input tokens neither read from nor written to the cache at the input price, `cached_tokens` at the
+cache-read price, `cache_write_tokens` at the cache-write price (Bedrock documents that field for its OpenAI models; when
+an answer does not state it, those tokens count at the input price), and the output, reasoning included, into the UTC day's and the UTC month's totals in
 `<data>/spend.json`, which a restart keeps. Before each call it reserves the call's worst case: every byte of the
 prompt a token at the dearest input price, plus `max_output_tokens` at the output price. The reservation counts as
 spent at once and is saved, so a call cut off by a crash or a restart stays charged its worst case; when the call
@@ -272,15 +309,17 @@ A TOML file, `/etc/ecc-server/config.toml` unless `-config` names another. Unkno
 | `judge.region` | `us-east-1` | AWS region of the Bedrock endpoint |
 | `judge.model` | `us.moonshotai.kimi-k3.1` | Bedrock model or inference profile ID |
 | `judge.service_tier` | `flex` | Bedrock service tier: `flex`, `default` or `priority` |
-| `judge.max_output_tokens` | `8000` | the most output tokens a call may produce |
+| `judge.reasoning_effort` | `medium` | `reasoning.effort`: `none`, `low`, `medium`, `high`, `xhigh` or `max` (the model's own default is `max`) |
+| `judge.max_output_tokens` | `16000` | the most output tokens a call may produce, reasoning included |
 | `judge.timeout` | `"10m"` | how long a call may take |
-| `budget.daily_usd`, `budget.monthly_usd` | `10`, `150` | what the judge may spend in a UTC day and a UTC month |
+| `budget.daily_usd`, `budget.monthly_usd` | `25`, `250` | what the judge may spend in a UTC day and a UTC month |
 | `budget.input_per_million`, `output_per_million`, `cache_read_per_million`, `cache_write_per_million` | `4.40`, `22.00`, `0.22`, `5.50` | standard-tier prices in dollars per million tokens; halved on `flex` |
 | `budget.max_prompt_chars` | `500000` | a longer prompt is not sent |
 | `budget.max_calls_per_day` | `2000` | the most calls in a UTC day |
 | `chat.schedule`, `chat.every`, `chat.wait` | the bundle's | set, they replace the bundle's checkpoint schedule, every-n-th held line and wait |
 | `test.hold_words_file` | (none) | the test rig's scorer: a file of words, one a line; a line containing one is held |
-| `test.bedrock_endpoint` | (none) | replaces the Bedrock runtime endpoint, for the rig's fake |
+| `test.bedrock_endpoint` | (none) | replaces the Bedrock runtime endpoint, for the rig's stub |
+| `test.judge_backoff`, `test.judge_retry_for`, `test.judge_retry_after` | `5s`, `5m`, `5m` | for the rig: the first wait after a failed call, how long failures are retried, when a pending checkpoint is put again |
 
 The API keys are not config keys; see Updates from W&B and The judge on Amazon Bedrock. On a machine without systemd
 (development), the host reads them from the files `ecc-server.wandb-api-key` and `ecc-server.bedrock-api-key` in the
@@ -348,22 +387,22 @@ All bodies are JSON. Module-ECC uses the first four; every endpoint needs the to
 `POST /line` with one line answers its verdict:
 
 ```json
-{"id": "<uuid>", "channel": "chat", "conversation": "chat", "private": false, "speaker_uuid": "<uuid>", "speaker": "Name", "target_uuid": "", "target": "", "text": "...", "trusted": false}
+{"id": "<uuid>", "channel": "chat", "speaker_uuid": "<uuid>", "speaker": "Name", "shown": "[Mod] ~Nick",
+ "target_uuid": null, "target": null, "text": "<the raw text>", "trusted": false}
 ```
 
 `{"verdict": "deliver"}` or `{"verdict": "hold"}`. `id` is Module-ECC's own id for the line: Module-ECC keeps a held
 line by it until a `release` names it or a `ban` drops it, and a line sent again with the same id gets the same verdict
-and is not counted twice. `private` marks a two-player conversation; `target_uuid` and `target` are set for private
-messages and mail. `speaker` is the player's account name, not a display name: the models tell players apart by it (a
-Discord relay's shown name). A line with no `speaker_uuid`, or with `trusted: true`, is context only. `400`
-names what is malformed; `503` while no bundle is served, or while 10,000 lines wait to be scored (Module-ECC asks
-again).
+and is not counted twice. `channel` is one of `bundle.json` `channels` (another is held, see A line). `speaker` is the
+account name (the models tell players apart by it), and on `discord` the Discord name; `speaker_uuid` is `null` only
+on `discord`. `shown` is the chat line's name as the console shows it. `target_uuid` and `target` are set for private
+messages and mail (the recipient) and for a nickname set on another player. `text` is the text as written; the host
+prepares it. A line with `trusted: true`, or on `discord`, is context only. `400` names what is malformed; `503` while
+no bundle is served, or while 10,000 lines wait to be scored (Module-ECC asks again).
 
-`POST /presence` with `{"kind": "start", "allowed_links": ["example.org", "https://discord.gg/<code>"]}` when Module-ECC
-starts (a new stream: every open sitting ends; the allowlist of links, `400` naming an entry that is not a domain or
-a URL), or
-`{"kind": "join" | "leave", "uuid": "<uuid>", "name": "Name"}`: `200 {}`.
-
+`POST /presence` with `{"kind": "start", "allowed_links": ["example.org", "discord.gg/<code>"]}` when Module-ECC starts
+(a new stream: every open sitting ends; the allowlist of links, each `host` or `host/prefix`, `400` naming an entry
+that is not), or `{"kind": "join" | "leave", "uuid": "<uuid>", "name": "Name"}`: `200 {}`.
 `GET /actions` long-polls: it answers as soon as there is an unacknowledged action, or after 30 seconds, with every
 unacknowledged action, oldest first:
 
@@ -385,9 +424,12 @@ repeated or unknown id changes nothing.
 `GET /status` is `200` when a bundle is served, otherwise `503`; the body is the same either way: `status`, `version`
 (the bundle), `scorer`, `lines_waiting` (lines queued for the models), `wandb` (`null` without a key, otherwise `artifact`, `last_check`, `result`, `production`,
 `production_digest`, and `download` with `file`, `done` and `total` bytes while one runs), `judge` (`key_set`,
-`region`, `model`, `service_tier`, and after the first call `last_call` and `result`), `spend` (`day`, `day_usd`,
+`region`, `model`, `service_tier`, `reasoning_effort`, `since_start` (calls, answered calls and their summed usage), and
+after the first call `last_call`, `result` and `last_usage`: `input_tokens`, `cached_tokens`, `cache_write_tokens`,
+`output_tokens`, `reasoning_tokens`), `spend` (`day`, `day_usd`,
 `daily_budget_usd`, `day_calls`, `month`, `month_usd`, `monthly_budget_usd`, `in_flight_reserved_usd`), `sittings`
-(`stream`, `open_sittings`, `held_unruled`, `judge_calls_in_flight`) and `unacknowledged_actions`.
+(`stream`, `open_sittings`, `held_unruled`, `judge_calls_in_flight`, `checkpoints_pending`, `unknown_channels` by
+channel) and `unacknowledged_actions`.
 
 `POST /switch` with `{"version": "..."}` switches to an installed bundle; `use` and `rollback` call it.
 
@@ -396,14 +438,17 @@ without a key; `update` calls it.
 
 ## Replay
 
-`ecc-server replay -config FILE -lines FILE -fold DIR -out DIR [-mode parity|live]` feeds recorded lines through the
-decision core on a virtual clock, with the fast model's recorded verdicts and the judge's saved answers (by the
-SHA-256 of the prompt), and writes the record, one line per sitting and a summary to `DIR`. `-config` is a TOML file
-with the core's settings in a `[core]` table. Parity mode takes the sittings from the lines and checks every prompt
+`ecc-server replay -config FILE -lines FILE -fold DIR -out DIR [-mode parity|live] [-judge-delay 15s]` feeds recorded
+lines (prepared already, with presence events) through the decision core on a virtual clock, with the fast model's
+recorded verdicts and the judge's saved answers (by the SHA-256 of the prompt), and writes the record, one line per
+sitting and a summary to `DIR`. `-config` is a TOML file with the core's settings in a `[core]` table. The core's
+timers run at their time, and a ruling arrives `-judge-delay` after its checkpoint, as an event of its own: the lines
+before then are handled first. Parity mode takes the sittings from the lines, rules at once, and checks every prompt
 and every sitting's outcome against the measured run; live mode makes sittings from presence and silence and uses the
 waiting-time checkpoint. With `-bundle DIR` (`-threads`, `-threshold`) the bundle's models score every line in place
 of the recorded verdicts (Linux only). `ecc-server replay -h` describes the inputs.
 
-`ecc-server score -bundle DIR -in FILE -out FILE [-ids]` scores a file of lines with the bundle's models as the host
-does and writes the format of the training pipeline's reference scorer (`ecc.reference`), token ids and features
-included with `-ids`, to check the host against it (Linux only). `ecc-server score -h` describes the formats.
+`ecc-server score -bundle DIR -in FILE -out FILE [-ids] [-allow FILE]` takes lines as Module-ECC sends them, handles
+each as the host does (prepared, refused, dropped, folded, links replaced, scored) and writes the format of the
+training pipeline's reference scorer (`ecc.reference`), the prepared texts, keys, token ids and features included with
+`-ids`, to check the host against it (Linux only). `ecc-server score -h` describes the formats.

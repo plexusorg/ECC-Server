@@ -454,9 +454,9 @@ func (s *Scorer) remember(st *stream, e *entry) {
 	}
 }
 
-// authorKey is a speaker's key lowercased: the account name, or "discord:" and the lowercased name (lowered alone, as
+// AuthorKey is a speaker's key lowercased: the account name, or "discord:" and the lowercased name (lowered alone, as
 // the training pipeline lowered it: the prefix would change a final sigma's context).
-func authorKey(speaker string) string {
+func AuthorKey(speaker string) string {
 	if name, ok := strings.CutPrefix(speaker, "discord:"); ok {
 		return "discord:" + core.Lower(name)
 	}
@@ -467,7 +467,7 @@ func authorKey(speaker string) string {
 // key is Line.Speaker lowercased as Python's str.lower() does: the speaker's account name, or for a Discord relay "discord:"
 // and its prepared name.
 func (s *Scorer) entryOf(l core.Line) *entry {
-	e := &entry{id: l.ID, time: l.Time.Unix(), channel: l.Channel, author: authorKey(l.Speaker),
+	e := &entry{id: l.ID, time: l.Time.Unix(), channel: l.Channel, author: AuthorKey(l.Speaker),
 		text: l.Text}
 
 	if l.Channel == s.spec.Context.Private {

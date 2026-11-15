@@ -282,9 +282,13 @@ func (s *server) dispatch(r core.Result) {
 func (s *server) runJob(j *core.Job) {
 	defer s.jobs.Done()
 	a, err := s.judge.Rule(j)
-	if err != nil {
+	switch {
+	case errors.Is(err, core.ErrPending):
+		slog.Warn("the judge could not be reached; the checkpoint is put again later", "sitting", j.Sitting, "k", j.K,
+			"err", err.Error())
+	case err != nil:
 		slog.Warn("checkpoint not ruled; its lines stay held", "sitting", j.Sitting, "k", j.K, "err", err.Error())
-	} else {
+	default:
 		slog.Info("ruling", "sitting", j.Sitting, "k", j.K, "ruling", a.Ruling, "by", a.By)
 	}
 	s.mu.Lock()

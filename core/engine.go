@@ -400,8 +400,31 @@ func (e *Engine) streamFor(at time.Time) {
 	}
 }
 
+// RepeatKey is a line's repeat key as bundle.json text.repeat writes it: the name lowercased, the channel (with
+// ">" and the target where the target counts), the text after step 6.
+func RepeatKey(l Line) [3]string {
+	k := copyKeyOf(l)
+	ch := k.channel
+	if k.target != "" {
+		ch += ">" + k.target
+	}
+	return [3]string{k.speaker, ch, k.text}
+}
+
+// copyKeyOf is a line's repeat key (bundle.json text.repeat): the target counts on msg and mail ("unknown" when there
+// is none, as the dossiers wrote it) and on nick, on no other channel.
 func copyKeyOf(l Line) copyKey {
-	return copyKey{Lower(l.KeyName), l.Channel, l.Target, l.Key}
+	target := ""
+	switch l.Channel {
+	case "msg", "mail":
+		target = l.Target
+		if target == "" {
+			target = "unknown"
+		}
+	case "nick":
+		target = l.Target
+	}
+	return copyKey{Lower(l.KeyName), l.Channel, target, l.Key}
 }
 
 // withinRepeat tells whether a line at t is within RepeatWindow of a copy at last, in whole seconds as the logs time
