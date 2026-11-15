@@ -23,22 +23,23 @@ const (
 	actionNotice  = "notice"  // show staff with the alert permission Text
 )
 
-// action is one action as GET /actions returns it. UUID and Name are the player's (ban, warn, release); IDs are the
-// plugin's ids of the lines a release delivers; Kind and Text are a notice's.
+// action is one action as GET /actions returns it. UUID and Account are the player's UUID and account name, as the
+// plugin sent them as speaker_uuid and speaker (ban, warn, release); IDs are the plugin's ids of the lines a release
+// delivers; Kind and Text are a notice's.
 type action struct {
-	ID   string   `json:"id"`
-	Type string   `json:"type"`
-	UUID string   `json:"uuid,omitempty"`
-	Name string   `json:"name,omitempty"`
-	IDs  []string `json:"ids,omitempty"`
-	Kind string   `json:"kind,omitempty"`
-	Text string   `json:"text,omitempty"`
+	ID      string   `json:"id"`
+	Type    string   `json:"type"`
+	UUID    string   `json:"uuid,omitempty"`
+	Account string   `json:"account,omitempty"`
+	IDs     []string `json:"ids,omitempty"`
+	Kind    string   `json:"kind,omitempty"`
+	Text    string   `json:"text,omitempty"`
 }
 
 // fromCore is the action the plugin carries out for one of the core's; a release whose lines have no plugin id has
 // nothing for the plugin to deliver.
 func fromCore(a core.Action) (action, bool) {
-	out := action{Type: a.Kind, UUID: a.Account, Name: a.Name}
+	out := action{Type: a.Kind, UUID: a.Account, Account: a.Speaker}
 	switch a.Kind {
 	case core.ActionBan, core.ActionWarn:
 	case core.ActionRelease:
@@ -97,14 +98,15 @@ func (a *actionStore) add(act action) {
 	a.wake = make(chan struct{})
 	a.mu.Unlock()
 	a.rec.append("action_sent", struct {
-		TS     string   `json:"ts"`
-		ID     string   `json:"id"`
-		Action string   `json:"action"`
-		UUID   string   `json:"uuid,omitempty"`
-		IDs    []string `json:"ids,omitempty"`
-		Kind   string   `json:"kind,omitempty"`
-	}{stamp(time.Now()), act.ID, act.Type, act.UUID, act.IDs, act.Kind})
-	slog.Info("action", "type", act.Type, "player", act.Name, "uuid", act.UUID, "lines", len(act.IDs), "kind", act.Kind,
+		TS      string   `json:"ts"`
+		ID      string   `json:"id"`
+		Action  string   `json:"action"`
+		UUID    string   `json:"uuid,omitempty"`
+		Account string   `json:"account,omitempty"`
+		IDs     []string `json:"ids,omitempty"`
+		Kind    string   `json:"kind,omitempty"`
+	}{stamp(time.Now()), act.ID, act.Type, act.UUID, act.Account, act.IDs, act.Kind})
+	slog.Info("action", "type", act.Type, "account", act.Account, "uuid", act.UUID, "lines", len(act.IDs), "kind", act.Kind,
 		"id", act.ID)
 }
 

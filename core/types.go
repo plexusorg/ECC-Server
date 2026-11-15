@@ -106,12 +106,13 @@ const (
 	ActionRelease = "release" // deliver these held lines late, in order
 )
 
-// Action is one thing the plugin is told to do. A release names its lines by stream id (Lines) and by the driver's
-// refs (Refs: the lines' own and their repeats', in the order they arrived).
+// Action is one thing the plugin is told to do, for the sitting's player: Account is their key (Line.Account) and
+// Speaker their account name (Line.Speaker), never a shown name. A release names its lines by stream id (Lines) and by
+// the driver's refs (Refs: the lines' own and their repeats', in the order they arrived).
 type Action struct {
 	Kind    string   `json:"kind"`
 	Account string   `json:"account"`
-	Name    string   `json:"name"`
+	Speaker string   `json:"speaker"`
 	Sitting string   `json:"sitting"`
 	Lines   []string `json:"lines,omitempty"`
 	Refs    []string `json:"refs,omitempty"`

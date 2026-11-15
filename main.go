@@ -103,6 +103,8 @@ type TestConfig struct {
 	JudgeBackoff    time.Duration `toml:"judge_backoff"`
 	JudgeRetryFor   time.Duration `toml:"judge_retry_for"`
 	JudgeRetryAfter time.Duration `toml:"judge_retry_after"`
+	// NoticeEvery, set, replaces how often a notice of one cause may be sent (1h).
+	NoticeEvery time.Duration `toml:"notice_every"`
 }
 
 var serverName = regexp.MustCompile(`^[a-z0-9_-]{1,32}$`)

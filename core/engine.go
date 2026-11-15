@@ -80,12 +80,14 @@ func (r *Result) add(o Result) {
 }
 
 type sitting struct {
-	id, account, name string
-	st                *stream
-	start, last, left time.Time
-	online            bool
-	first             int
-	mine, held        []int
+	// name is the judge's name for the player (their first line's); speaker their account name (Line.Speaker), which
+	// actions carry.
+	id, account, name, speaker string
+	st                         *stream
+	start, last, left          time.Time
+	online                     bool
+	first                      int
+	mine, held                 []int
 	// included held lines (a prefix of held) have been put to a checkpoint; ruled ones have a ruling.
 	included, ruled int
 	released        []string
@@ -654,7 +656,7 @@ func (e *Engine) sittingFor(l Line) *sitting {
 }
 
 func (e *Engine) newSitting(id string, l Line) *sitting {
-	s := &sitting{id: id, account: l.Account, name: l.Name, st: e.st, start: l.Time, last: l.Time, first: e.st.next}
+	s := &sitting{id: id, account: l.Account, name: l.Name, speaker: l.Speaker, st: e.st, start: l.Time, last: l.Time, first: e.st.next}
 	e.open[id] = s
 	if !e.cfg.DriverSittings {
 		e.live[l.Account] = s
@@ -788,19 +790,19 @@ func (e *Engine) Rule(job *Job, a Answer, err error) Result {
 			}
 			if len(ids) > 0 {
 				s.released = append(s.released, ids...)
-				r.Actions = append(r.Actions, Action{Kind: ActionRelease, Account: s.account, Name: s.name,
+				r.Actions = append(r.Actions, Action{Kind: ActionRelease, Account: s.account, Speaker: s.speaker,
 					Sitting: s.id, Lines: ids, Refs: refs})
 			}
 		case RulingHold:
 			s.kept += len(covered)
 			if !s.warned {
 				s.warned = true
-				r.Actions = append(r.Actions, Action{Kind: ActionWarn, Account: s.account, Name: s.name, Sitting: s.id})
+				r.Actions = append(r.Actions, Action{Kind: ActionWarn, Account: s.account, Speaker: s.speaker, Sitting: s.id})
 			}
 		case RulingBan:
 			s.kept += len(covered)
 			s.banned, s.banLine, s.ending = true, job.Line, true
-			r.Actions = append(r.Actions, Action{Kind: ActionBan, Account: s.account, Name: s.name, Sitting: s.id})
+			r.Actions = append(r.Actions, Action{Kind: ActionBan, Account: s.account, Speaker: s.speaker, Sitting: s.id})
 		}
 	}
 	for i := range s.checkpoints {

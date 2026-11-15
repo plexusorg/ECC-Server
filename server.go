@@ -23,7 +23,10 @@ import (
 const seenIDs = 50000
 
 type server struct {
-	cfg      Config
+	cfg Config
+	// boot is a random id made at start: GET /actions, POST /presence and /status return it, so the plugin sees a
+	// restart (a new id) and sends its start, its players and the lines it holds without a verdict again.
+	boot     string
 	ctx      context.Context // cancelled when the host stops
 	rec      *recordLog
 	recorder *recorder
@@ -35,6 +38,9 @@ type server struct {
 	upd      *updater    // nil without a W&B key
 	switchMu sync.Mutex
 	jobs     sync.WaitGroup
+	// noticed is when a notice of each kind was last sent (notifyStop).
+	noticeMu sync.Mutex
+	noticed  map[string]time.Time
 	// queue holds the lines waiting for the scoring worker, in arrival order.
 	queue chan *lineJob
 
@@ -57,7 +63,7 @@ const queueCap = 10000
 func run(cfg Config) error {
 	ctx, stopped := context.WithCancel(context.Background())
 	defer stopped()
-	s := &server{cfg: cfg, ctx: ctx, seen: map[string]string{}, pending: map[string]*lineJob{},
+	s := &server{cfg: cfg, ctx: ctx, boot: newUUID(), noticed: map[string]time.Time{}, seen: map[string]string{}, pending: map[string]*lineJob{},
 		queue: make(chan *lineJob, queueCap)}
 	var err error
 	if cfg.Test.HoldWordsFile != "" {
@@ -104,7 +110,7 @@ func run(cfg Config) error {
 	}
 	s.judge = &bedrockJudge{ctx: ctx, br: s.br, spend: s.spend, tier: cfg.Judge.ServiceTier,
 		effort: cfg.Judge.ReasoningEffort, maxOut: cfg.Judge.MaxOutputTokens, timeout: cfg.Judge.Timeout,
-		told: s.budgetUsedUp, record: s.rec.append, backoff: orDefault(cfg.Test.JudgeBackoff, judgeBackoff),
+		stopped: s.notifyStop, record: s.rec.append, backoff: orDefault(cfg.Test.JudgeBackoff, judgeBackoff),
 		retryFor: orDefault(cfg.Test.JudgeRetryFor, judgeRetryFor)}
 	st, err := readState(cfg)
 	if err != nil {
@@ -157,7 +163,7 @@ func run(cfg Config) error {
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	errc := make(chan error, 1)
 	go func() { errc <- srv.ListenAndServe() }()
-	slog.Info("listening", "addr", cfg.Listen)
+	slog.Info("listening", "addr", cfg.Listen, "boot", s.boot)
 	select {
 	case err = <-errc:
 	case sig := <-stop:
@@ -297,17 +303,25 @@ func (s *server) runJob(j *core.Job) {
 	s.dispatch(s.eng.Rule(j, a, err))
 }
 
-// budgetUsedUp tells staff that a budget stops the judge's calls, once per day or month.
-func (s *server) budgetUsedUp(e *errOverBudget) {
-	until := "the next UTC day"
-	if e.period == "monthly" {
-		until = "the next UTC month"
+// A notice of one cause is sent at most this often.
+const noticeEvery = time.Hour
+
+// notifyStop tells staff with the alert permission that judging stopped, and why: a notice of each kind at most once
+// per [test] notice_every (an hour). The budget's notice comes once per UTC day or month (spend), within that.
+func (s *server) notifyStop(kind, text string) {
+	now := time.Now()
+	s.noticeMu.Lock()
+	last, ok := s.noticed[kind]
+	send := !ok || now.Sub(last) >= orDefault(s.cfg.Test.NoticeEvery, noticeEvery)
+	if send {
+		s.noticed[kind] = now
 	}
-	slog.Error("the judge's budget is used up; held lines wait for review", "budget", e.period,
-		"usd", fmt.Sprintf("%.2f", e.budget))
-	s.acts.add(action{Type: actionNotice, Kind: "budget",
-		Text: fmt.Sprintf("ECC: the judge's %s budget of $%.2f is used up. Until %s, held lines stay held and their "+
-			"sittings go to the review queue.", e.period, e.budget, until)})
+	s.noticeMu.Unlock()
+	if !send {
+		return
+	}
+	slog.Error("judging stopped; staff are told", "cause", kind)
+	s.acts.add(action{Type: actionNotice, Kind: kind, Text: text})
 }
 
 // The plugin's allowlist of links from its last start, in <data>/links.json, so a restart of this server replaces the
@@ -483,7 +497,18 @@ func (s *server) handlePresence(w http.ResponseWriter, r *http.Request) {
 		Name         string   `json:"name,omitempty"`
 		AllowedLinks []string `json:"allowed_links,omitempty"`
 	}{stamp(now), req.Kind, req.UUID, req.Name, req.AllowedLinks})
-	writeJSON(w, http.StatusOK, struct{}{})
+	writeJSON(w, http.StatusOK, bootOnly{s.boot})
+}
+
+// bootOnly is POST /presence's answer.
+type bootOnly struct {
+	Boot string `json:"boot"`
+}
+
+// actionsAnswer is GET /actions's answer.
+type actionsAnswer struct {
+	Boot    string   `json:"boot"`
+	Actions []action `json:"actions"`
 }
 
 // handleActions answers with every unacknowledged action, oldest first, as soon as there is one, or with none after
@@ -494,18 +519,18 @@ func (s *server) handleActions(w http.ResponseWriter, r *http.Request) {
 	for {
 		acts, wake := s.acts.unacknowledged()
 		if len(acts) > 0 {
-			writeJSON(w, http.StatusOK, acts)
+			writeJSON(w, http.StatusOK, actionsAnswer{s.boot, acts})
 			return
 		}
 		select {
 		case <-wake:
 		case <-timeout.C:
-			writeJSON(w, http.StatusOK, []action{})
+			writeJSON(w, http.StatusOK, actionsAnswer{s.boot, []action{}})
 			return
 		case <-r.Context().Done():
 			return
 		case <-s.ctx.Done():
-			writeJSON(w, http.StatusOK, []action{})
+			writeJSON(w, http.StatusOK, actionsAnswer{s.boot, []action{}})
 			return
 		}
 	}
@@ -527,6 +552,7 @@ func (s *server) handleAck(w http.ResponseWriter, r *http.Request) {
 
 type hostStatus struct {
 	Status         string         `json:"status"`
+	Boot           string         `json:"boot"`
 	Version        string         `json:"version,omitempty"`
 	Scorer         string         `json:"scorer"`
 	Waiting        int            `json:"lines_waiting"`
@@ -539,7 +565,7 @@ type hostStatus struct {
 
 // handleStatus is 200 when a bundle is served, otherwise 503, with the same body.
 func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
-	h := hostStatus{Status: "ready", Judge: s.br.status(), Spend: s.spend.status(), Unacknowledged: s.acts.count(),
+	h := hostStatus{Status: "ready", Boot: s.boot, Judge: s.br.status(), Spend: s.spend.status(), Unacknowledged: s.acts.count(),
 		Waiting: len(s.queue)}
 	if s.upd != nil {
 		h.Wandb = s.upd.status()

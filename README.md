@@ -261,7 +261,8 @@ ids; `sure` true or false. An invalid answer is asked for again, up to three ans
 `5xx`, the `timeout`, the network) is made again after 5 seconds, then 10, 20, ..., while the failures have lasted
 less than 5 minutes; then the checkpoint is pending: it is put again 5 minutes later, and so on until the sitting ends
 (`/status` counts the pending ones). A call refused by the budget, or by Bedrock for the key (`401`, `403`) or as a
-bad request, is not made again.
+bad request, is not made again. Each of these stops, three invalid answers on one checkpoint and a missing key send
+staff a `notice` naming the cause, a notice of one cause at most once an hour (see HTTP interface).
 **The budget.** The host adds up each call's cost from the usage Bedrock returns at the configured prices, halved on
 the flex tier: the input tokens neither read from nor written to the cache at the input price, `cached_tokens` at the
 cache-read price, `cache_write_tokens` at the cache-write price (Bedrock documents that field for its OpenAI models; when
@@ -320,6 +321,7 @@ A TOML file, `/etc/ecc-server/config.toml` unless `-config` names another. Unkno
 | `test.hold_words_file` | (none) | the test rig's scorer: a file of words, one a line; a line containing one is held |
 | `test.bedrock_endpoint` | (none) | replaces the Bedrock runtime endpoint, for the rig's stub |
 | `test.judge_backoff`, `test.judge_retry_for`, `test.judge_retry_after` | `5s`, `5m`, `5m` | for the rig: the first wait after a failed call, how long failures are retried, when a pending checkpoint is put again |
+| `test.notice_every` | `1h` | for the rig: how often a notice of one cause may be sent |
 
 The API keys are not config keys; see Updates from W&B and The judge on Amazon Bedrock. On a machine without systemd
 (development), the host reads them from the files `ecc-server.wandb-api-key` and `ecc-server.bedrock-api-key` in the
@@ -402,26 +404,43 @@ no bundle is served, or while 10,000 lines wait to be scored (Module-ECC asks ag
 
 `POST /presence` with `{"kind": "start", "allowed_links": ["example.org", "discord.gg/<code>"]}` when Module-ECC starts
 (a new stream: every open sitting ends; the allowlist of links, each `host` or `host/prefix`, `400` naming an entry
-that is not), or `{"kind": "join" | "leave", "uuid": "<uuid>", "name": "Name"}`: `200 {}`.
+that is not), or `{"kind": "join" | "leave", "uuid": "<uuid>", "name": "Name"}`: `200 {"boot": "<boot id>"}`.
 `GET /actions` long-polls: it answers as soon as there is an unacknowledged action, or after 30 seconds, with every
 unacknowledged action, oldest first:
 
 ```json
-[{"id": "<uuid>", "type": "release", "uuid": "<player uuid>", "name": "Name", "ids": ["<line id>", "<line id>"]}]
+{"boot": "<boot id>",
+ "actions": [{"id": "<uuid>", "type": "release", "uuid": "<player uuid>", "account": "Name", "ids": ["<line id>", "<line id>"]}]}
 ```
+
+**The boot id** is a random id the host makes each time it starts; `GET /actions`, `POST /presence` and `GET /status`
+return it. The host keeps no sitting, presence or verdict across a restart, so when Module-ECC sees a boot id other
+than the last one it sends `start` (with its `allowed_links`), a `join` for every online player, then every line it
+holds without a verdict again.
 
 | type | fields | what Module-ECC does |
 | --- | --- | --- |
-| `ban` | `uuid`, `name` | ban the player indefinitely, kick them at once, drop their held lines |
-| `warn` | `uuid`, `name` | show the player the warning; their held lines stay held |
-| `release` | `uuid`, `name`, `ids` | deliver the held lines with these ids in the order they were written (the host lists the lines and their repeats in the order they arrived) |
-| `notice` | `kind`, `text` | show `text` to staff with the alert permission (`kind` `budget`: a judge budget is used up) |
+| `ban` | `uuid`, `account` | ban the player with this UUID indefinitely, kick them at once, drop their held lines |
+| `warn` | `uuid`, `account` | show the player the warning; their held lines stay held |
+| `release` | `uuid`, `account`, `ids` | deliver the held lines with these ids in the order they were written (the host lists the lines and their repeats in the order they arrived) |
+| `notice` | `kind`, `text` | show `text` to staff with the alert permission |
+
+`uuid` and `account` are the sitting's player as Module-ECC sent them, `speaker_uuid` and `speaker`: the UUID and the
+account name, never the shown name. A notice tells staff that judging stopped, and why (`kind`):
+
+| kind | cause | sent |
+| --- | --- | --- |
+| `budget` | a call's worst case would pass the daily or monthly budget | once per UTC day (or month) |
+| `bedrock_key` | Bedrock refused the key (`401`, `403`) | at most once an hour |
+| `bad_request` | Bedrock refused the request (`400` or another `4xx` but `429`) | at most once an hour |
+| `invalid_answers` | the judge's answer was invalid three times on one checkpoint | at most once an hour |
+| `no_key` | no Bedrock key is set | at most once an hour |
 
 `POST /actions/ack` with `{"id": "...", "ok": true, "detail": "..."}` once an action is carried out: `200 {}`. Only
 `ok: true` ends an action; after `ok: false` it stays and is served again. Every acknowledgement is recorded; a
 repeated or unknown id changes nothing.
 
-`GET /status` is `200` when a bundle is served, otherwise `503`; the body is the same either way: `status`, `version`
+`GET /status` is `200` when a bundle is served, otherwise `503`; the body is the same either way: `status`, `boot`, `version`
 (the bundle), `scorer`, `lines_waiting` (lines queued for the models), `wandb` (`null` without a key, otherwise `artifact`, `last_check`, `result`, `production`,
 `production_digest`, and `download` with `file`, `done` and `total` bytes while one runs), `judge` (`key_set`,
 `region`, `model`, `service_tier`, `reasoning_effort`, `since_start` (calls, answered calls and their summed usage), and

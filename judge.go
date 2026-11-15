@@ -38,8 +38,8 @@ type bedrockJudge struct {
 	effort  string
 	maxOut  int
 	timeout time.Duration
-	// told is called when a call is refused for a budget for the first time in its day or month.
-	told func(*errOverBudget)
+	// stopped tells staff that judging stopped: kind names the cause (the README's notice kinds), text says it.
+	stopped func(kind, text string)
 	// record writes a line of the record.
 	record func(kind string, v any)
 	// backoff and retryFor: judgeBackoff and judgeRetryFor, or the rig's.
@@ -54,6 +54,7 @@ func (j *bedrockJudge) Rule(job *core.Job) (core.Answer, error) {
 		res, err := j.call(job, attempt)
 		if err != nil {
 			if !passing(err) {
+				j.stop(err)
 				return core.Answer{}, err
 			}
 			if failing.IsZero() {
@@ -80,8 +81,33 @@ func (j *bedrockJudge) Rule(job *core.Job) (core.Answer, error) {
 		invalid++
 		slog.Warn("the judge's answer is invalid", "sitting", job.Sitting, "k", job.K, "answer", invalid, "why", err.Error())
 		if invalid == judgeAttempts {
+			j.stopped("invalid_answers", fmt.Sprintf("ECC: the judge's answer was invalid %d times on one checkpoint "+
+				"(the last: %s). Its held lines stay held and its sitting goes to the review queue.", invalid,
+				truncate(err.Error(), 160)))
 			return core.Answer{}, fmt.Errorf("the judge's answer was invalid %d times: %w", invalid, err)
 		}
+	}
+}
+
+// errNoKey: no Bedrock key is set.
+var errNoKey = errors.New("no Bedrock key is set; set one with sudo ecc-server bedrock login")
+
+const stillHeld = "Held lines stay held and their sittings go to the review queue."
+
+// stop tells staff why a call that is not made again stopped judging: no key, the key or the request refused. The
+// budget's notice is sent by call; the host stopping sends none.
+func (j *bedrockJudge) stop(err error) {
+	var be *bedrockError
+	switch {
+	case errors.Is(err, errNoKey):
+		j.stopped("no_key", "ECC: no Bedrock key is set, so the judge is not called. "+stillHeld+
+			" Set one with sudo ecc-server bedrock login.")
+	case errors.As(err, &be) && be.auth():
+		j.stopped("bedrock_key", fmt.Sprintf("ECC: Bedrock refused the judge's key (%d). %s Set a valid key with "+
+			"access to the model with sudo ecc-server bedrock login.", be.Status, stillHeld))
+	case errors.As(err, &be):
+		j.stopped("bad_request", fmt.Sprintf("ECC: Bedrock refused the judge's request (%s). %s",
+			truncate(be.Error(), 200), stillHeld))
 	}
 }
 
@@ -118,13 +144,20 @@ type judgeCall struct {
 // call makes one Responses call within the budget.
 func (j *bedrockJudge) call(job *core.Job, attempt int) (*judgeAnswer, error) {
 	if j.br.key == "" {
-		return nil, fmt.Errorf("%w: no Bedrock key is set; set one with sudo ecc-server bedrock login", core.ErrNotSent)
+		return nil, fmt.Errorf("%w: %w", core.ErrNotSent, errNoKey)
 	}
 	r, told, err := j.spend.reserve(j.spend.worst(len(job.Prompt), j.maxOut))
 	var over *errOverBudget
 	if errors.As(err, &over) {
 		if told {
-			j.told(over)
+			until := "the next UTC day"
+			if over.period == "monthly" {
+				until = "the next UTC month"
+			}
+			slog.Error("the judge's budget is used up; held lines wait for review", "budget", over.period,
+				"usd", fmt.Sprintf("%.2f", over.budget))
+			j.stopped("budget", fmt.Sprintf("ECC: the judge's %s budget of $%.2f is used up. Until %s, held lines "+
+				"stay held and their sittings go to the review queue.", over.period, over.budget, until))
 		}
 		return nil, fmt.Errorf("%w: %w", core.ErrNotSent, err)
 	}
