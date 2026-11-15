@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 	"unicode/utf8"
 )
@@ -109,11 +110,16 @@ type Engine struct {
 	banned map[string]bool // accounts banned in this stream
 	calls  map[string]int
 	lines  int
-	// copies is each speaker's last line in each conversation and the time of its last copy, for repeats.
+	// arrived counts every line taken, repeats included: the order a release lists its refs in.
+	arrived int
+	// copies is, per speaker, channel, target and text, the last line with that text and the time of its last copy,
+	// for repeats.
 	copies map[copyKey]lastCopy
 }
 
-type copyKey struct{ speaker, conversation string }
+// copyKey is what a repeat shares with the line it repeats: the speaker's shown name (lower case), the channel, the
+// target and the text, as the training pipeline's dossiers fold repeats.
+type copyKey struct{ speaker, channel, target, text string }
 
 type lastCopy struct {
 	en *entry
@@ -353,16 +359,18 @@ func (e *Engine) streamFor(at time.Time) {
 }
 
 func copyKeyOf(l Line) copyKey {
-	key := copyKey{l.Account, l.Conversation}
-	if l.Account == "" {
-		key.speaker = "name:" + l.Name
-	}
-	return key
+	return copyKey{strings.ToLower(l.Name), l.Channel, l.Target, l.Text}
+}
+
+// withinRepeat tells whether a line at t is within RepeatWindow of a copy at last, in whole seconds as the logs time
+// lines.
+func withinRepeat(t, last time.Time) bool {
+	return t.Unix()-last.Unix() <= int64(RepeatWindow/time.Second)
 }
 
 // repeatOf is the line l repeats, or nil.
 func (e *Engine) repeatOf(l Line) *entry {
-	if c, ok := e.copies[copyKeyOf(l)]; ok && c.en.line.Text == l.Text && l.Time.Sub(c.at) <= RepeatWindow {
+	if c, ok := e.copies[copyKeyOf(l)]; ok && withinRepeat(l.Time, c.at) {
 		return c.en
 	}
 	return nil
@@ -413,6 +421,7 @@ func (e *Engine) line(l Line, given *scored) Result {
 	r := e.advance(l.Time)
 	e.now = l.Time
 	e.streamFor(l.Time)
+	e.arrived++
 	key := copyKeyOf(l)
 	if en := e.repeatOf(l); en != nil {
 		r.Verdict = e.repeat(key, en, l)
@@ -428,7 +437,7 @@ func (e *Engine) line(l Line, given *scored) Result {
 		Conversation: l.Conversation, Account: l.Account, Name: l.Name, Target: l.Target, Text: l.Text, Verdict: "deliver"}
 	en := &entry{line: l}
 	if l.Ref != "" {
-		en.refs = []string{l.Ref}
+		en.refs = []lineRef{{l.Ref, e.arrived}}
 	}
 	defer func() {
 		en.verdict = rec.Verdict
@@ -511,7 +520,7 @@ func (e *Engine) repeat(key copyKey, en *entry, l Line) string {
 		verdict = "deliver"
 	}
 	if verdict == "hold" && l.Ref != "" {
-		en.refs = append(en.refs, l.Ref)
+		en.refs = append(en.refs, lineRef{l.Ref, e.arrived})
 	}
 	if s := e.open[en.sitting]; s != nil && !s.ending && l.Time.After(s.last) {
 		s.last = l.Time
@@ -649,12 +658,19 @@ func (e *Engine) Rule(job *Job, a Answer, err error) Result {
 		rr.Covers = len(covered)
 		switch ruling {
 		case RulingNothing:
-			var ids, refs []string
+			var ids []string
+			var arrived []lineRef
 			for _, p := range covered {
 				en := s.st.get(p)
 				en.released = true
 				ids = append(ids, en.line.ID)
-				refs = append(refs, en.refs...)
+				arrived = append(arrived, en.refs...)
+			}
+			// a repeat sent after a later held line is delivered after it
+			slices.SortFunc(arrived, func(a, b lineRef) int { return a.n - b.n })
+			var refs []string
+			for _, x := range arrived {
+				refs = append(refs, x.ref)
 			}
 			if len(ids) > 0 {
 				s.released = append(s.released, ids...)
@@ -819,7 +835,7 @@ func (e *Engine) prune() {
 	e.st.prune(max(0, from), back)
 
 	for k, c := range e.copies {
-		if e.now.Sub(c.at) > RepeatWindow {
+		if !withinRepeat(e.now, c.at) {
 			delete(e.copies, k)
 		}
 	}

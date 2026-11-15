@@ -28,7 +28,7 @@ type Line struct {
 	TargetAccount string
 	Target        string
 	Text          string
-	// Sent is how many times the line was sent in a row (1 for a single send).
+	// Sent is how many times the line was sent (1 for a single send): it and its repeats.
 	Sent int
 	// Context marks a line that is context for other lines only: no player's own (a Discord relay), or a trusted
 	// player's, which the plugin delivered at once. It is never scored, held or judged and opens no sitting.
@@ -93,7 +93,7 @@ const (
 )
 
 // Action is one thing the plugin is told to do. A release names its lines by stream id (Lines) and by the driver's
-// refs (Refs: each line's own, then its repeats', in the order they arrived).
+// refs (Refs: the lines' own and their repeats', in the order they arrived).
 type Action struct {
 	Kind    string   `json:"kind"`
 	Account string   `json:"account"`
@@ -103,8 +103,8 @@ type Action struct {
 	Refs    []string `json:"refs,omitempty"`
 }
 
-// RepeatWindow: a speaker's line with the same text as their previous line in the conversation, within this long of
-// that line's last copy, is a repeat of it.
+// RepeatWindow: a line with the same speaker (shown name, any case), channel, target and text as an earlier line, within
+// this long of that line's last copy (in whole seconds), is a repeat of it, whatever lines came between.
 const RepeatWindow = 60 * time.Second
 
 // Example is one of the owner's ruled cases, shown to the judge.

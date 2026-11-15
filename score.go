@@ -20,7 +20,8 @@ format of the pipeline's reference scorer (ecc.reference), to check the server a
 
   -in   one JSON record a line, in arrival order: {"stream", "id", "time" (whole seconds), "channel", "author",
         "partner" (msg only), "text", "context_only" (optional)}
-  -out  one record per input record: {"stream", "id", "sh", "passed", "c", "held_<threshold>"..., "verdict"} or
+  -out  one record per input record: {"stream", "id", "sh", "passed", "c", "held_<threshold>"..., "verdict",
+        "kinds"} or
         {"stream", "id", "context_only": true}; -ids adds the context's ids, SH's input ids and features and C's
         input ids
 `
@@ -100,7 +101,7 @@ func scoreLines(args []string) error {
 			if d.Verdict.Hold {
 				verdict = "hold"
 			}
-			rec["sh"], rec["passed"], rec["verdict"] = d.SH, d.Passed, verdict
+			rec["sh"], rec["passed"], rec["verdict"], rec["kinds"] = d.SH, d.Passed, verdict, nonNil(d.Verdict.Kinds)
 			rec["c"] = nil
 			if d.C != nil {
 				rec["c"] = d.C

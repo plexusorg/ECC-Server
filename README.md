@@ -148,11 +148,16 @@ after it); hosts and paths compare without regard to case. The record and the ju
 original text. The host keeps the last allowlist in `<data>/links.json` for its next start; before any `start`, no link
 is replaced.
 
-**Repeats.** A speaker's line with the same text as their previous line in the same conversation, within 60 seconds
-of that line's last copy, is a repeat of it, as the training logs count repeats: it is not scored, it gets the verdict
-of the line it repeats (a copy of a held line is held, and delivered with it if a ruling releases it; a copy of a line
-a ruling already released is delivered), the judge sees the line once with "(sent N times)", and it is no new held
-line for the checkpoints.
+**Repeats.** A line with the same speaker name (in any case), channel, target and text as an earlier line, within 60
+seconds of that line's last copy (whole seconds), is a repeat of it, whatever lines came between, as the training
+pipeline folds repeats: it is not scored and is no context for later lines, it gets the verdict of the line it
+repeats (a copy of a held line is held, and delivered with it if a ruling releases it; a copy of a line a ruling
+already released is delivered), the judge sees the line once with "(sent N times)", and it is no new held line for
+the checkpoints. A release lists the held lines and their repeats in the order they arrived.
+
+**Kinds.** On a line C scores, the fast model marks each kind whose logit is at or over its `thresholds.kinds` value.
+The judge sees the player's marked lines with the kinds' names from `judge.render.kinds`, and a marked line, held or
+not, is shown with the lines around it.
 
 **Sittings and checkpoints.** A sitting runs from a player's first scored line after they join until
 `sitting_end_seconds` after they leave (with no leave known, after their last line); a game server start ends every
@@ -163,7 +168,7 @@ lines up to its checkpoint's last line:
 
 | ruling | action |
 | --- | --- |
-| `nothing` | `release`: deliver those held lines, and their repeats, in order |
+| `nothing` | `release`: deliver those held lines, and their repeats, in the order they arrived |
 | `hold` | the lines stay held; `warn` the player, once a sitting |
 | `ban` | `ban`: an indefinite ban and an immediate kick; the player's held lines are dropped and the sitting ends |
 
@@ -370,7 +375,7 @@ unacknowledged action, oldest first:
 | --- | --- | --- |
 | `ban` | `uuid`, `name` | ban the player indefinitely, kick them at once, drop their held lines |
 | `warn` | `uuid`, `name` | show the player the warning; their held lines stay held |
-| `release` | `uuid`, `name`, `ids` | deliver the held lines with these ids in the order they were written (the host lists them in that order, a repeat's id after its line's) |
+| `release` | `uuid`, `name`, `ids` | deliver the held lines with these ids in the order they were written (the host lists the lines and their repeats in the order they arrived) |
 | `notice` | `kind`, `text` | show `text` to staff with the alert permission (`kind` `budget`: a judge budget is used up) |
 
 `POST /actions/ack` with `{"id": "...", "ok": true, "detail": "..."}` once an action is carried out: `200 {}`. Only

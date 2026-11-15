@@ -22,8 +22,13 @@ type entry struct {
 	// verdict is the line's verdict; released marks a held line a ruling delivered.
 	verdict  string
 	released bool
-	// refs is the driver's id of the line and of each of its repeats.
-	refs []string
+	// refs is the driver's id of the line and of each of its held repeats, with the order each arrived in.
+	refs []lineRef
+}
+
+type lineRef struct {
+	ref string
+	n   int
 }
 
 // stream is every line since the game server started, in arrival order, numbered from 0. Lines no open sitting can
