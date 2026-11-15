@@ -212,7 +212,7 @@ after `ok: false` the action stays and is served again. A restart of either prog
 acknowledged.
 
 **The record.** `<data>/record/YYYY-MM-DD.jsonl` (UTC days), one JSON line per event, each with `type` and `server`
-(the config's `server`): every `line` (stream, id, time, channel, conversation, account, name and the raw name,
+(the config's `server`): every `line` (stream, id, ref: Module-ECC's id for it, time, channel, conversation, account, name and the raw name,
 target, the prepared and the raw text, sitting, verdict, kinds, score), `repeat`, `sitting_start`, `checkpoint` (the
 held-line count it covers, why it was made, the prompt's size and SHA-256, whether it was sent), `judge_call` (each
 call: attempt, status, the usage's input, cached, cache-write, output and reasoning tokens, cost, duration, or the
@@ -438,13 +438,15 @@ without a key; `update` calls it.
 
 ## Replay
 
-`ecc-server replay -config FILE -lines FILE -fold DIR -out DIR [-mode parity|live] [-judge-delay 15s]` feeds recorded
+`ecc-server replay -config FILE -lines FILE -fold DIR -out DIR [-mode parity|live] [-judge-delay 15s] [-keep-going]
+[-dump FILE]` feeds recorded
 lines (prepared already, with presence events) through the decision core on a virtual clock, with the fast model's
 recorded verdicts and the judge's saved answers (by the SHA-256 of the prompt), and writes the record, one line per
 sitting and a summary to `DIR`. `-config` is a TOML file with the core's settings in a `[core]` table. The core's
 timers run at their time, and a ruling arrives `-judge-delay` after its checkpoint, as an event of its own: the lines
 before then are handled first. Parity mode takes the sittings from the lines, rules at once, and checks every prompt
-and every sitting's outcome against the measured run; live mode makes sittings from presence and silence and uses the
+and every sitting's outcome against the measured run (a prompt with no saved answer stops it, or with `-keep-going`
+is counted); live mode makes sittings from presence and silence and uses the
 waiting-time checkpoint. With `-bundle DIR` (`-threads`, `-threshold`) the bundle's models score every line in place
 of the recorded verdicts (Linux only). `ecc-server replay -h` describes the inputs.
 
