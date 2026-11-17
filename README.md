@@ -15,15 +15,15 @@ it on the host's clock, and `ecc-server replay` drives it on a virtual clock ove
 
 **The fast model.** C scores every covered target on the host's CPU. Its hold score decides `hold` or `deliver`.
 C runs in the server's process through OpenVINO's C API, on Linux only. The binary is built without cgo and loads
-`/usr/lib/ecc-server/openvino` through purego at start. It needs glibc, so use Debian or Ubuntu rather than a musl
-system such as Alpine. On another system, start `ecc-server run` only with the test rig's scorer (`[test] hold_words_file`, see Configuration), which holds a line that contains
+`/usr/lib/ecc-server/openvino` through purego at start. The pinned OpenVINO runtime needs glibc 2.38+ and the `libstdc++6` package 12.1.0+.
+Use a Debian or Ubuntu system with those versions. On another system, start `ecc-server run` only with the test rig's scorer (`[test] hold_words_file`, see Configuration), which holds a line that contains
 one of a file's words and logs a warning at every start that the server filters nothing; it exists for the end-to-end
 rig, never for a game server with players.
 
 ## Install (Debian, Ubuntu)
 
-ECC-Server is packaged as an amd64 `.deb` that depends on `ca-certificates` (the HTTPS calls to W&B and Bedrock), `libc6` (glibc, which the
-binary and OpenVINO link against) and `libstdc++6` (OpenVINO). The package installs:
+ECC-Server is packaged as an amd64 `.deb` that depends on `ca-certificates` (the HTTPS calls to W&B and Bedrock), `libc6` 2.38+ (glibc, which the
+binary and OpenVINO link against) and `libstdc++6` 12.1.0+ (the pinned OpenVINO runtime). The package installs:
 
 - `/usr/bin/ecc-server`, the binary
 - `/usr/lib/ecc-server/openvino/`, the five OpenVINO 2026.4.1 libraries the models run on (77 MB, from OpenVINO's

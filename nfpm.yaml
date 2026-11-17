@@ -17,8 +17,8 @@ description: |
   models on the CPU with the OpenVINO runtime it carries. Needs glibc (Debian, Ubuntu).
 depends:
   - ca-certificates
-  - libc6
-  - libstdc++6
+  - libc6 (>= 2.38)
+  - libstdc++6 (>= 12.1.0)
 contents:
   - src: dist/ecc-server
     dst: /usr/bin/ecc-server
