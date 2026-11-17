@@ -69,7 +69,7 @@ type Job struct {
 
 // Result is what one call to the engine produced.
 type Result struct {
-	Verdict string // "deliver" or "hold", for Line
+	Verdict string // "deliver", "hold" or final nonpunitive "reject", for Line
 	Jobs    []*Job
 	Actions []Action
 }
@@ -469,10 +469,26 @@ func (e *Engine) barred(l Line) bool {
 // a Prepare and its LineScored.
 func (e *Engine) Prepare(l Line) (Line, bool) {
 	e.streamFor(l.Time)
-	if l.Context || !e.Known(l.Channel) || l.Empty || e.repeatOf(l) != nil || e.barred(l) {
+	if l.Context || !e.Known(l.Channel) || l.Empty || e.barred(l) {
+		return Line{}, false
+	}
+	if e.rejectReason(l) != "" || e.repeatOf(l) != nil {
 		return Line{}, false
 	}
 	return e.scorerLine(l), true
+}
+
+func (e *Engine) rejectReason(l Line) string {
+	if l.Context {
+		return ""
+	}
+	if SourceShortened(l.Raw, l.Channel) {
+		return "text preparation would discard content"
+	}
+	if sc, ok := e.scorer.(CoverageScorer); ok {
+		return sc.RejectReason(e.scorerLine(l))
+	}
+	return ""
 }
 
 func (e *Engine) scorerLine(l Line) Line {
@@ -504,6 +520,16 @@ func (e *Engine) line(l Line, given *scored) Result {
 	if !e.Known(l.Channel) {
 		r.Verdict = e.unknownLine(l)
 		return r
+	}
+	// LineScored follows a successful Prepare; its scorer already remembered the validated target.
+	if given == nil {
+		if why := e.rejectReason(l); why != "" {
+			e.rec.Record("line", LineRecord{Stream: e.st.name, Ref: l.Ref, Time: stamp(l.Time), Channel: l.Channel,
+				Conversation: l.Conversation, Account: l.Account, Name: l.Name, RawName: l.RawName, Target: l.Target,
+				Text: l.Text, Raw: l.Raw, Verdict: "reject", Why: why})
+			r.Verdict = "reject"
+			return r
+		}
 	}
 	if l.Empty {
 		// preparation emptied the text: delivered, not scored, no line of the stream

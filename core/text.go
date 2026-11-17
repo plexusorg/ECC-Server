@@ -123,11 +123,20 @@ func KeyName(channel, shown, account string) string {
 	return account
 }
 
+func beforeCuts(raw string) []rune {
+	s := strings.ReplaceAll(strings.ReplaceAll(codes(section(raw)), "\r", " "), "\n", " / ")
+	return []rune(collapse([]rune(s)))
+}
+
+// SourceShortened reports content that preparation would discard, before any URL or character cut.
+func SourceShortened(raw, channel string) bool {
+	r := beforeCuts(raw)
+	return len(r) > Limit(channel) || string(cutLinks(r)) != string(r)
+}
+
 // clean is steps 1-6.
 func clean(raw string, limit int) string {
-	s := strings.ReplaceAll(strings.ReplaceAll(codes(section(raw)), "\r", " "), "\n", " / ")
-	r := []rune(collapse([]rune(s)))
-	r = cutLinks(r)
+	r := cutLinks(beforeCuts(raw))
 	if len(r) > limit {
 		r = append(r[:limit:limit], []rune(TextCut)...)
 	}

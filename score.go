@@ -167,9 +167,11 @@ func scoreLines(args []string) error {
 			out["dropped"], out["verdict"] = true, "deliver"
 		case !score:
 			rec.of = ""
-			eng.Line(l)
+			result := eng.Line(l)
 			keep()
 			switch {
+			case result.Verdict == "reject":
+				out["verdict"], out["rejected"] = "reject", true
 			case rec.of != "":
 				out["folded_into"] = rec.of
 			case l.Context:

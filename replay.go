@@ -32,7 +32,7 @@ first.
   -config  the core's settings (TOML: the [core] table of the server's config)
   -lines   the lines, one JSON event a line: {"type":"stream", "name", "day"}, {"type":"line",...} or
            {"type":"presence", "kind": "join"|"leave", "account", "time"}; text and names prepared
-  -fold    question.md, format.md, cases.json, answers.json (sha256 of the prompt -> answer), expected.json
+  -fold    question.md, format.md, allowlist.txt, cases.json, answers.json (sha256 of the prompt -> answer), expected.json
   -mode    parity: sittings and the sitting-end checkpoint as the lines name them, no waiting-time or every-n-th
            checkpoint, rulings at once (as the measured replay ruled); checkpoints of sittings not in
            expected.json's judged_sittings are built and not sent, and a prompt with no saved answer stops the replay
@@ -44,28 +44,31 @@ first.
 
 // replayEvent is one line of the replay's input.
 type replayEvent struct {
-	Type          string `json:"type"`
-	Kind          string `json:"kind"`
-	Name          string `json:"name"`
-	Day           string `json:"day"`
-	ID            string `json:"id"`
-	Time          string `json:"time"`
-	Channel       string `json:"channel"`
-	Conversation  string `json:"conversation"`
-	Private       bool   `json:"private"`
-	Account       string `json:"account"`
-	Shown         string `json:"name_shown"`
-	TargetAccount string `json:"target_account"`
-	Target        string `json:"target"`
-	Text          string `json:"text"`
+	Type          string  `json:"type"`
+	Kind          string  `json:"kind"`
+	Name          string  `json:"name"`
+	Day           string  `json:"day"`
+	CoverageRule  string  `json:"coverage_rule"`
+	CanonicalLink *string `json:"canonical_link"`
+	ID            string  `json:"id"`
+	Time          string  `json:"time"`
+	Channel       string  `json:"channel"`
+	Conversation  string  `json:"conversation"`
+	Private       bool    `json:"private"`
+	Account       string  `json:"account"`
+	Shown         string  `json:"name_shown"`
+	TargetAccount string  `json:"target_account"`
+	Target        string  `json:"target"`
+	Text          string  `json:"text"`
 	// Speaker is the speaker's account name as the models know them (a Discord relay: "discord:" and the shown name).
-	Speaker string   `json:"speaker"`
-	Sent    int      `json:"sent"`
-	Trusted bool     `json:"trusted"`
-	Context bool     `json:"context"`
-	Sitting string   `json:"sitting"`
-	Verdict string   `json:"verdict"`
-	Kinds   []string `json:"kinds"`
+	Speaker  string   `json:"speaker"`
+	Sent     int      `json:"sent"`
+	Trusted  bool     `json:"trusted"`
+	Context  bool     `json:"context"`
+	Sitting  string   `json:"sitting"`
+	Verdict  string   `json:"verdict"`
+	Coverage string   `json:"coverage"`
+	Kinds    []string `json:"kinds"`
 	// Key is the line's own id, unique in its stream (the rendered id may not be); CopyOf names the line a copy
 	// repeats; RawText and RawShown are the text and the shown name before preparation.
 	Key      string  `json:"key"`
@@ -88,11 +91,12 @@ func (ev replayEvent) coreLine(t time.Time, sitting string) core.Line {
 	l := core.Line{ID: ev.ID, Ref: ev.ref(), Time: t, Channel: ev.Channel, Conversation: ev.Conversation,
 		Private: ev.Private, Account: ev.Account, Name: ev.Shown, Speaker: ev.Speaker, RawName: ev.Shown,
 		TargetAccount: ev.TargetAccount, Target: ev.Target, Text: ev.Text, Raw: ev.Text, Key: ev.Text,
-		KeyName: core.KeyName(ev.Channel, ev.Shown, account), Sent: ev.Sent, Context: ev.Context || ev.Trusted,
+		KeyName: core.KeyName(ev.Channel, ev.Shown, account), Sent: ev.Sent, Context: ev.Context || ev.Trusted || ev.Channel == "discord",
 		Sitting: sitting}
 	if ev.RawText != nil {
 		l.Raw = *ev.RawText
 		l.Key, _ = core.PrepareText(l.Raw, ev.Channel)
+		l.Empty = l.Key == ""
 	}
 	if ev.RawShown != nil {
 		l.RawName = *ev.RawShown
@@ -135,9 +139,17 @@ type expected struct {
 // recordedScorer answers with the verdicts the lines carry, by line id within the current stream.
 type recordedScorer struct {
 	verdicts map[string]core.Verdict
+	rejects  map[string]bool
 }
 
 func (s *recordedScorer) See(core.Line) {}
+
+func (s *recordedScorer) RejectReason(l core.Line) string {
+	if s.rejects[l.Ref] {
+		return "recorded complete-target rejection"
+	}
+	return ""
+}
 
 func (s *recordedScorer) Score(l core.Line) (core.Verdict, error) {
 	v, ok := s.verdicts[l.Ref]
@@ -205,6 +217,7 @@ func readReplayEvents(path string) ([]replayEvent, error) {
 	}
 	defer f.Close()
 	var out []replayEvent
+	stream := false
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 1<<20), 1<<24)
 	for n := 1; sc.Scan(); n++ {
@@ -213,7 +226,34 @@ func readReplayEvents(path string) ([]replayEvent, error) {
 		if err := json.Unmarshal(sc.Bytes(), &ev); err != nil {
 			return nil, fmt.Errorf("%s:%d: %w", path, n, err)
 		}
+		if ev.Type == "stream" {
+			if ev.CoverageRule != model.CoverageRule || ev.CanonicalLink == nil {
+				return nil, fmt.Errorf("%s:%d: stream requires canonical_link and coverage_rule %q", path, n, model.CoverageRule)
+			}
+			stream = true
+		}
 		if ev.Type == "line" {
+			if !stream || ev.RawText == nil {
+				return nil, fmt.Errorf("%s:%d: line requires a coverage stream and raw_text", path, n)
+			}
+			switch ev.Coverage {
+			case "cascade", "c", "reject", "context", "fold", "dropped":
+			default:
+				return nil, fmt.Errorf("%s:%d: line has invalid coverage %q", path, n, ev.Coverage)
+			}
+			if (ev.Verdict == "reject") != (ev.Coverage == "reject") {
+				return nil, fmt.Errorf("%s:%d: reject verdict and coverage disagree", path, n)
+			}
+			if ev.Verdict != "" && ev.Verdict != "deliver" && ev.Verdict != "hold" && ev.Verdict != "reject" {
+				return nil, fmt.Errorf("%s:%d: invalid verdict %q", path, n, ev.Verdict)
+			}
+			context := ev.Context || ev.Trusted || ev.Channel == "discord"
+			if context && ev.Coverage != "context" && ev.Coverage != "fold" && ev.Coverage != "dropped" {
+				return nil, fmt.Errorf("%s:%d: context line has scoring coverage", path, n)
+			}
+			if !context && (ev.Coverage == "context" || ((ev.Coverage == "cascade" || ev.Coverage == "c") && ev.Verdict == "")) {
+				return nil, fmt.Errorf("%s:%d: scoring line has no recorded verdict", path, n)
+			}
 			ev.Shown, ev.Name = ev.Name, ""
 		}
 		out = append(out, ev)
@@ -289,6 +329,11 @@ func replay(args []string) error {
 	if err != nil {
 		return err
 	}
+	for _, ev := range events {
+		if ev.Type == "stream" && *ev.CanonicalLink != cfg.CanonicalLink {
+			return fmt.Errorf("stream %s: canonical_link differs from replay config", ev.Name)
+		}
+	}
 
 	if err := os.MkdirAll(*outDir, 0o750); err != nil {
 		return err
@@ -302,6 +347,13 @@ func replay(args []string) error {
 	scorer := &recordedScorer{}
 	var sc core.Scorer = scorer
 	if *bundle != "" {
+		var metadata Bundle
+		if err := readJSON(filepath.Join(*bundle, "bundle.json"), &metadata); err != nil {
+			return err
+		}
+		if metadata.Links.Canonical != cfg.CanonicalLink {
+			return fmt.Errorf("bundle canonical link differs from replay config")
+		}
 		spec, err := model.ReadSpec(*bundle)
 		if err != nil {
 			return err
@@ -324,6 +376,13 @@ func replay(args []string) error {
 		dump = json.NewEncoder(df)
 	}
 	eng := core.NewEngine(cfg, texts, sc, rec)
+	allowed, err := readAllow(filepath.Join(*foldDir, "allowlist.txt"))
+	if err != nil {
+		return err
+	}
+	if err := eng.AllowLinks(allowed); err != nil {
+		return err
+	}
 
 	judged := map[string]bool{}
 	for _, s := range exp.JudgedSittings {
@@ -393,11 +452,14 @@ func replay(args []string) error {
 				return fmt.Errorf("stream %s: %w", ev.Name, err)
 			}
 			scorer.verdicts = map[string]core.Verdict{}
+			scorer.rejects = map[string]bool{}
 			for _, x := range events[i+1:] {
 				if x.Type == "stream" {
 					break
 				}
-				if x.Verdict != "" {
+				if x.Verdict == "reject" {
+					scorer.rejects[x.ref()] = true
+				} else if x.Verdict != "" {
 					scorer.verdicts[x.ref()] = core.Verdict{Hold: x.Verdict == "hold", Kinds: x.Kinds}
 				}
 			}
@@ -429,7 +491,21 @@ func replay(args []string) error {
 				sit = ""
 			}
 			until(t)
-			put(eng.Line(ev.coreLine(t, sit)), t)
+			line := ev.coreLine(t, sit)
+			if line.Empty != (ev.Coverage == "dropped") {
+				return fmt.Errorf("line %s: actual and recorded empty text disagree", ev.ref())
+			}
+			result := eng.Line(line)
+			if *bundle == "" {
+				if (result.Verdict == "reject") != (ev.Coverage == "reject") {
+					return fmt.Errorf("line %s: actual and recorded rejection disagree", ev.ref())
+				}
+				_, folded := rec.folded[ev.ref()]
+				if folded != (ev.Coverage == "fold") {
+					return fmt.Errorf("line %s: actual and recorded folding disagree", ev.ref())
+				}
+			}
+			put(result, t)
 			if parity && ev.Sitting != "" && lastOf[ev.Sitting] == i {
 				until(t)
 				put(eng.End(ev.Sitting, t), t)
@@ -536,6 +612,7 @@ type copyCheck struct {
 	FoldedAsNamed int `json:"folded_into_the_line_named"`
 	FoldedOther   int `json:"folded_into_another_line"`
 	NotFolded     int `json:"not_folded"`
+	Rejected      int `json:"rejected_before_fold"`
 	FoldedUnnamed int `json:"folded_without_copy_of"`
 }
 
@@ -549,6 +626,8 @@ func checkCopies(events []replayEvent, folded map[string]string) *copyCheck {
 		c.InInput++
 		named[ev.ref()] = true
 		switch of, ok := folded[ev.ref()]; {
+		case ev.Coverage == "reject":
+			c.Rejected++
 		case !ok:
 			c.NotFolded++
 		case of == ev.CopyOf:

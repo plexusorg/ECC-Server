@@ -67,6 +67,11 @@ type Scorer interface {
 	See(line Line)
 }
 
+// CoverageScorer checks the complete target without remembering it or running inference.
+type CoverageScorer interface {
+	RejectReason(line Line) string
+}
+
 // Rulings the judge gives.
 const (
 	RulingNothing = "nothing"

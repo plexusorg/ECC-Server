@@ -23,6 +23,9 @@ import (
 
 // Spec is what bundle.json states about scoring a line.
 type Spec struct {
+	Coverage struct {
+		Rule string `json:"rule"`
+	} `json:"coverage"`
 	Graphs map[string]struct {
 		XML    string `json:"xml"`
 		Inputs []struct {
@@ -80,14 +83,14 @@ type Spec struct {
 // RulesSHA256 is the sha256 of the rules bundle.json states in words and patterns, at the paths of Rules, as this
 // server implements them (the models' inputs here, the channels, the text preparation and the link rule in core). A
 // bundle that states other rules is refused rather than served by the wrong ones.
-const RulesSHA256 = "3540be87efda1595ea1e0ddc564403ba7fde4e28d1916f3559d7de4f4e4f6042"
+const RulesSHA256 = "0b2b32a51a1ee37e441f3971b921bfdc25e0ca5b700b590cf8abcc7e91862826"
 
 // Rules is the paths in bundle.json of the rules RulesSHA256 covers, in order.
 var Rules = []string{"context.rule", "sh.line_string", "sh.line_tokens", "sh.slot", "sh.gap", "sh.pos", "c.roles",
 	"c.line_string", "c.input_ids", "channels", "text.rule", "text.whitespace", "text.patterns.section",
 	"text.patterns.codes", "text.patterns.url", "text.patterns.ipv4", "text.patterns.ipv6", "text.patterns.not_secure",
 	"text.patterns.icons", "text.patterns.discord_tags", "text.shown", "text.discord_name", "text.names", "text.repeat",
-	"links.pattern", "links.rule"}
+	"links.pattern", "links.rule", "coverage.rule"}
 
 // The rules that bundle.json states in words, with the numbers in them this package uses: SH keeps the first
 // shLineIDs ids of a line string, and a gap is at most maxGap.
@@ -181,6 +184,8 @@ func ReadSpec(dir string) (*Spec, error) {
 	}
 	t := s.Thresholds
 	switch {
+	case s.Coverage.Rule != CoverageRule:
+		return nil, errors.New("bundle.json needs coverage.rule complete_target_v1")
 	case s.Special.BOS == nil || s.Special.EOS == nil:
 		return nil, errors.New("bundle.json: special_tokens needs bos and eos")
 	case !slices.Contains(s.Outputs, "hold"):
@@ -364,6 +369,7 @@ type entry struct {
 	time                     int64
 	channel, author, partner string
 	text                     string
+	directC                  bool
 	toks                     []int64   // SH's input ids
 	vec                      []float32 // SH's line vector, nil until encoded
 }
@@ -465,12 +471,16 @@ func AuthorKey(speaker string) string {
 // entryOf is the line as the models see it: author and partner keys, whole seconds, SH's input ids. A line's author
 // key is Line.Speaker lowercased as Python's str.lower() does: the speaker's account name, or for a Discord relay "discord:"
 // and its prepared name.
-func (s *Scorer) entryOf(l core.Line) *entry {
-	e := &entry{id: l.ID, time: l.Time.Unix(), channel: l.Channel, author: AuthorKey(l.Speaker),
-		text: l.Text}
+func (s *Scorer) entryData(l core.Line) *entry {
+	e := &entry{id: l.ID, time: l.Time.Unix(), channel: l.Channel, author: AuthorKey(l.Speaker), text: l.Text}
 	if l.Channel == s.spec.Context.Private {
 		e.partner = core.Lower(l.Target)
 	}
+	return e
+}
+
+func (s *Scorer) entryOf(l core.Line) *entry {
+	e := s.entryData(l)
 	s.encode(e)
 	return e
 }
@@ -482,6 +492,7 @@ func (s *Scorer) encode(e *entry) {
 		str = "[" + e.channel + "] " + e.text
 	}
 	ids := s.shTok.Encode(str)
+	e.directC = len(ids) > shLineIDs
 	if len(ids) > shLineIDs {
 		ids = ids[:shLineIDs]
 	}
@@ -629,7 +640,55 @@ func (s *Scorer) run(e *entry, ctx []*entry) (Detail, error) {
 		c.vec = v
 	}
 
-	// SH: slot, addr, chan, gap, pos, mask
+	f := s.shFeatures(e, ctx)
+	vec := make([]float32, 0, n*len(e.vec))
+	for _, c := range seq {
+		vec = append(vec, c.vec...)
+	}
+
+	d.Slot, d.Addr, d.Chan, d.Gap = f[0], f[1], f[2], f[3]
+	in := []tensor{{f32: vec, shape: []int64{1, int64(n), int64(len(e.vec))}}}
+	for _, x := range f {
+		in = append(in, tensor{i64: x, shape: []int64{1, int64(n)}})
+	}
+	var err error
+	if d.SH, err = s.ctx.run(in); err != nil {
+		return d, err
+	}
+	sh := float64(d.SH[s.holdAt])
+	d.Verdict.SH = &sh
+	d.Passed = e.directC || d.SH[s.holdAt] >= s.shPass
+	d.Held = map[string]bool{}
+	for k := range s.spec.Thresholds.Hold {
+		d.Held[k] = false
+	}
+	if !d.Passed {
+		return d, nil
+	}
+
+	d.CIDs = s.cIDs(e, ctx)
+	shape := []int64{1, int64(len(d.CIDs))}
+	if d.C, err = s.c.run([]tensor{{i64: d.CIDs, shape: shape}, {i64: ones(len(d.CIDs)), shape: shape}}); err != nil {
+		return d, err
+	}
+	c := float64(d.C[s.holdAt])
+	d.Verdict.C = &c
+	for k, v := range s.spec.Thresholds.Hold {
+		d.Held[k] = d.C[s.holdAt] >= v
+	}
+	d.Verdict.Hold = d.C[s.holdAt] >= s.hold
+	for _, k := range s.kinds {
+		if d.C[k.at] >= k.min {
+			d.Verdict.Kinds = append(d.Verdict.Kinds, k.name)
+		}
+	}
+	return d, nil
+}
+
+// shFeatures builds the scalar context inputs used by SH.
+func (s *Scorer) shFeatures(e *entry, ctx []*entry) [6][]int64 {
+	seq := append(slices.Clip(ctx), e)
+	n := len(seq)
 	names := map[string]int64{e.author: 0}
 	slotMax := s.spec.SH.AddrNone - 1
 	num := func(a string) int64 {
@@ -644,7 +703,6 @@ func (s *Scorer) run(e *entry, ctx []*entry) (Detail, error) {
 	for k := range f {
 		f[k] = make([]int64, n)
 	}
-	vec := make([]float32, 0, n*len(e.vec))
 	for k, c := range seq {
 		if k < n-1 {
 			f[0][k] = num(c.author)
@@ -662,50 +720,17 @@ func (s *Scorer) run(e *entry, ctx []*entry) (Detail, error) {
 		}
 		f[4][k] = int64(n - 1 - k)
 		f[5][k] = 1
-		vec = append(vec, c.vec...)
 	}
-	d.Slot, d.Addr, d.Chan, d.Gap = f[0], f[1], f[2], f[3]
-	in := []tensor{{f32: vec, shape: []int64{1, int64(n), int64(len(e.vec))}}}
-	for _, x := range f {
-		in = append(in, tensor{i64: x, shape: []int64{1, int64(n)}})
-	}
-	var err error
-	if d.SH, err = s.ctx.run(in); err != nil {
-		return d, err
-	}
-	sh := float64(d.SH[s.holdAt])
-	d.Verdict.SH = &sh
-	d.Passed = d.SH[s.holdAt] >= s.shPass
-	d.Held = map[string]bool{}
-	for k := range s.spec.Thresholds.Hold {
-		d.Held[k] = false
-	}
-	if !d.Passed {
-		return d, nil
-	}
+	return f
+}
 
-	// C: the role names, each line's string, the input ids
-	roles := map[string]string{e.author: "t"}
-	role := func(a string) string {
-		r, ok := roles[a]
-		if !ok {
-			r = fmt.Sprintf("s%d", len(roles))
-			roles[a] = r
-		}
-		return r
-	}
+// cIDs builds the same complete context/target input used in inference.
+func (s *Scorer) cIDs(e *entry, ctx []*entry) []int64 {
 	var body []int64
-	for k, c := range seq {
-		who := role(c.author)
-		tag := ""
-		switch {
-		case c.channel == s.spec.Context.Private:
-			tag = "[msg to " + role(c.partner) + "] "
-		case c.channel != "chat":
-			tag = "[" + c.channel + "] "
-		}
-		ids := s.cTok.Encode(tag + who + ": " + c.text)
-		if k == n-1 {
+	texts := s.cStrings(e, ctx)
+	for k, text := range texts {
+		ids := s.cTok.Encode(text)
+		if k == len(texts)-1 {
 			body = append(body, s.eos)
 		}
 		for _, id := range ids {
@@ -716,23 +741,34 @@ func (s *Scorer) run(e *entry, ctx []*entry) (Detail, error) {
 	if max := s.spec.C.MaxTokens - 1; len(body) > max {
 		body = body[len(body)-max:]
 	}
-	d.CIDs = append([]int64{s.bos}, body...)
-	shape := []int64{1, int64(len(d.CIDs))}
-	if d.C, err = s.c.run([]tensor{{i64: d.CIDs, shape: shape}, {i64: ones(len(d.CIDs)), shape: shape}}); err != nil {
-		return d, err
-	}
-	c := float64(d.C[s.holdAt])
-	d.Verdict.C = &c
-	for k, v := range s.spec.Thresholds.Hold {
-		d.Held[k] = d.C[s.holdAt] >= v
-	}
-	d.Verdict.Hold = d.C[s.holdAt] >= s.hold
-	for _, k := range s.kinds {
-		if d.C[k.at] >= k.min {
-			d.Verdict.Kinds = append(d.Verdict.Kinds, k.name)
+	return append([]int64{s.bos}, body...)
+}
+
+// cStrings renders the exact context role walk and final target used by C.
+func (s *Scorer) cStrings(e *entry, ctx []*entry) []string {
+	seq := append(slices.Clip(ctx), e)
+	roles := map[string]string{e.author: "t"}
+	role := func(a string) string {
+		r, ok := roles[a]
+		if !ok {
+			r = fmt.Sprintf("s%d", len(roles))
+			roles[a] = r
 		}
+		return r
 	}
-	return d, nil
+	out := make([]string, 0, len(seq))
+	for _, c := range seq {
+		who := role(c.author)
+		tag := ""
+		switch {
+		case c.channel == s.spec.Context.Private:
+			tag = "[msg to " + role(c.partner) + "] "
+		case c.channel != "chat":
+			tag = "[" + c.channel + "] "
+		}
+		out = append(out, tag+who+": "+c.text)
+	}
+	return out
 }
 
 func ones(n int) []int64 {

@@ -3,7 +3,7 @@
 The chat-safety decision maker for Module-ECC. It is one Go binary beside the game server, with the OpenVINO runtime its models
 run on. Module-ECC asks it
 for a verdict on every line a player writes before the line is delivered, and carries out the actions it gives; every
-decision is made here: the verdict on each line (`deliver` or `hold`), each player's sitting and its held lines, the
+decision is made here: the verdict on each line (`deliver`, `hold` or `reject`), each player's sitting and its held lines, the
 checkpoints at which a judge (a model on Amazon Bedrock) reads the sitting and rules `nothing`, `hold` or `ban`, the
 actions that carry out each ruling, the judge's spend budget, the review queue and the daily record. The judge's
 question, the owner's ruled cases it is shown, the checkpoint settings and the fast model's thresholds come from the
@@ -174,6 +174,12 @@ match of `links.pattern` with its scheme, port and path: an entry `host` or `hos
 with `start`) allows a link whose host is the host or one of its subdomains and whose path, any case, starts with the
 prefix (punctuation after the link counts as path). The record and the judge see the link. The host keeps the last
 allowlist in `<data>/links.json` for its next start; before any `start`, no link is replaced.
+
+**Complete target coverage.** Every bundle must declare `coverage.rule: "complete_target_v1"`. For a line to score,
+the host rejects raw text that needs a channel-length cut or URL shortening. It also rejects a target whose complete
+rendered C input cannot fit the bundle's C token budget with its three special tokens. If the complete SH line exceeds
+SH's line budget, the host sends it to C regardless of SH's score. The host checks coverage before it folds a repeat
+or remembers a line. Trusted lines and context-only lines keep their existing exemption.
 
 **Repeats.** A line is a repeat of an earlier line of the stream with the same name, channel and text within 60
 seconds (whole seconds) of that line's last copy, whatever lines came between, as the training pipeline folded
@@ -404,7 +410,9 @@ All bodies are JSON. Module-ECC uses the first four; every endpoint needs the to
  "target_uuid": null, "target": null, "text": "<the raw text>", "trusted": false}
 ```
 
-`{"verdict": "deliver"}` or `{"verdict": "hold"}`. `id` is Module-ECC's own id for the line: Module-ECC keeps a held
+`{"verdict": "deliver"}`, `{"verdict": "hold"}` or `{"verdict": "reject"}`. A `reject` is final and nonpunitive.
+Module-ECC drops its pending payload and asks the player to shorten it. The line enters no context or sitting, and
+the judge cannot release it. `id` is Module-ECC's own id for the line: Module-ECC keeps a held
 line by it until a `release` names it or a `ban` drops it, and a line sent again with the same id gets the same verdict
 and is not counted twice. `channel` is one of `bundle.json` `channels` (another is held, see A line). `speaker` is the
 account name (the models tell players apart by it), and on `discord` the Discord name; `speaker_uuid` is `null` only
@@ -487,3 +495,8 @@ of the recorded verdicts (Linux only). `ecc-server replay -h` describes the inpu
 each as the host does (prepared, refused, dropped, folded, links replaced, scored) and writes the format of the
 training pipeline's reference scorer (`ecc.reference`), the prepared texts, keys, token ids and features included with
 `-ids`, to check the host against it (Linux only). `ecc-server score -h` describes the formats.
+Replay input streams must declare `coverage_rule: "complete_target_v1"`. Each stream must also declare `canonical_link`, equal to the replay config. The judge folder must contain the
+producer's `allowlist.txt`. Every line must include `raw_text` and its
+`coverage` route (`cascade`, `c`, `reject`, `context`, `fold` or `dropped`). A reject must carry `verdict: "reject"`.
+Recorded replay preserves that final decision before it opens a sitting. Copies need their own coverage result;
+they can reject before folding even when the original line fit.
