@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/klauspost/compress/zstd"
@@ -66,14 +67,18 @@ type restartEnd struct {
 	EndedBy string `json:"ended_by"`
 }
 
-// scanRestart ends the sittings the previous run left open: it reads the last two days' record for a sitting_start
-// with no sitting_end, puts each one with held lines no ruling covered on the review queue, and records its end.
-// Their held lines stay held; the plugin delivers a held line only on a release.
+// scanRestart ends the sittings the previous run left open. It recovers host outcomes and review reasons from the
+// last two days' record. Historical rulings without an effective outcome need durable action evidence; otherwise
+// their lines stay held for review. The scan records each end and sends no actions.
 func scanRestart(r *recorder, dir string, now time.Time) error {
 	type open struct {
 		start                    map[string]any
 		name                     string
 		held, ruled, kept, freed int
+		banned                   bool
+		review                   []string
+		// Only a durable host action can establish an old ruling's missing effect.
+		legacyPending, legacyUnknown int
 	}
 	sittings := map[string]*open{}
 	var order []string
@@ -101,13 +106,41 @@ func scanRestart(r *recorder, dir string, now time.Time) error {
 			case "ruling":
 				if s := sittings[id]; s != nil {
 					covers, _ := l["covers"].(float64)
-					s.ruled += int(covers)
-					a, _ := l["answer"].(map[string]any)
-					switch a["ruling"] {
+					n := int(covers)
+					s.ruled += n
+					s.legacyPending = 0
+					if why, _ := l["review"].(string); why != "" && !slices.Contains(s.review, why) {
+						s.review = append(s.review, why)
+					}
+					switch l["effective"] {
 					case core.RulingHold:
-						s.kept++
+						s.kept += n
 					case core.RulingNothing:
-						s.freed++
+						s.freed += n
+					case core.RulingBan:
+						s.banned = true
+					default:
+						// A diagnostic answer does not prove that a line was released or a ban applied.
+						s.kept += n
+						s.legacyPending = n
+						s.legacyUnknown += n
+					}
+				}
+			case "action":
+				if s := sittings[id]; s != nil {
+					switch l["kind"] {
+					case core.ActionBan:
+						s.banned = true
+					case core.ActionRelease:
+						lines, _ := l["lines"].([]any)
+						n := min(len(lines), s.legacyPending)
+						s.kept -= n
+						s.freed += n
+						s.legacyPending -= n
+						s.legacyUnknown -= n
+					case core.ActionWarn:
+						s.legacyUnknown -= s.legacyPending
+						s.legacyPending = 0
 					}
 				}
 			}
@@ -124,6 +157,8 @@ func scanRestart(r *recorder, dir string, now time.Time) error {
 		e := restartEnd{Time: at, Stream: str("stream"), Sitting: id, Account: str("account"), Start: str("time"),
 			Held: s.held, Unruled: s.held - s.ruled, EndedBy: "restart"}
 		switch {
+		case s.banned:
+			e.Outcome = core.OutcomeBanned
 		case e.Unruled > 0 || s.kept > 0:
 			e.Outcome = core.OutcomeHeld
 		case s.freed > 0:
@@ -131,9 +166,18 @@ func scanRestart(r *recorder, dir string, now time.Time) error {
 		default:
 			e.Outcome = core.OutcomeNone
 		}
-		if e.Unruled > 0 {
-			e.Review = "the server restarted with " + strconv.Itoa(e.Unruled) + " held lines no ruling covered"
+		why := slices.Clone(s.review)
+		if s.banned {
+			why = append(why, "ban")
+		} else {
+			if e.Unruled > 0 {
+				why = append(why, "the server restarted with "+strconv.Itoa(e.Unruled)+" held lines no ruling covered")
+			}
+			if s.legacyUnknown > 0 {
+				why = append(why, "the historical record has no host outcome for "+strconv.Itoa(s.legacyUnknown)+" held lines")
+			}
 		}
+		e.Review = strings.Join(why, "; ")
 		r.Record("sitting_end", e)
 		if e.Review != "" {
 			r.Record("review", core.ReviewRecord{Time: at, Sitting: id, Account: e.Account, Name: s.name, Why: e.Review})
@@ -177,7 +221,7 @@ func readRecordDay(name string) ([]map[string]any, error) {
 		if json.Unmarshal(sc.Bytes(), &l) != nil {
 			continue // a line cut off by a crash
 		}
-		if t, _ := l["type"].(string); slices.Contains([]string{"sitting_start", "sitting_end", "line", "ruling"}, t) {
+		if t, _ := l["type"].(string); slices.Contains([]string{"sitting_start", "sitting_end", "line", "ruling", "action"}, t) {
 			out = append(out, l)
 		}
 	}
