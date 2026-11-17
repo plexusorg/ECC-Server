@@ -1,7 +1,5 @@
-// Package model is the fast model: SH, a small model, on every line (a line encoder whose vector is kept with the
-// line, then a context step over the line and its context), and C, a large model, on the lines SH passes. It scores
-// as the bundle's bundle.json and README state: the context lists, the features, the input strings and token ids, the
-// thresholds. OpenVINO runs the graphs on the CPU, loaded through its C API on Linux.
+// Package model scores every covered target with the C classifier. It preserves the bundle's context, input
+// strings, token ids and thresholds. OpenVINO runs the graph on the CPU through its C API on Linux.
 package model
 
 import (
@@ -11,7 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math/bits"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -23,6 +21,9 @@ import (
 
 // Spec is what bundle.json states about scoring a line.
 type Spec struct {
+	Scoring struct {
+		Mode string `json:"mode"`
+	} `json:"scoring"`
 	ModelText struct {
 		Rule string `json:"rule"`
 	} `json:"model_text"`
@@ -58,16 +59,6 @@ type Spec struct {
 		Private string   `json:"private_channel"`
 		Rule    string   `json:"rule"`
 	} `json:"context"`
-	SH struct {
-		LineString string   `json:"line_string"`
-		LineTokens string   `json:"line_tokens"`
-		Channels   []string `json:"channels"`
-		Unknown    *int64   `json:"unknown_channel_id"`
-		Slot       string   `json:"slot"`
-		AddrNone   int64    `json:"addr_none"`
-		Gap        string   `json:"gap"`
-		Pos        string   `json:"pos"`
-	} `json:"sh"`
 	C struct {
 		MaxTokens  int    `json:"max_tokens"`
 		Roles      string `json:"roles"`
@@ -75,7 +66,6 @@ type Spec struct {
 		InputIDs   string `json:"input_ids"`
 	} `json:"c"`
 	Thresholds struct {
-		SHPass  *float32           `json:"sh_pass"`
 		Hold    map[string]float32 `json:"hold"`
 		Default string             `json:"default"`
 		// Kinds, when the bundle sets them: C's logit for a kind at or over its threshold marks the line with it.
@@ -86,21 +76,17 @@ type Spec struct {
 // RulesSHA256 is the sha256 of the rules bundle.json states in words and patterns, at the paths of Rules, as this
 // server implements them (the models' inputs here, the channels, the text preparation and the link rule in core). A
 // bundle that states other rules is refused rather than served by the wrong ones.
-const RulesSHA256 = "27c4a2a1efe65ca67931d8ad4a8db8a0cbd1ddd1ef376e789552a5b8327f66cf"
+const RulesSHA256 = "57a28e87a6addbd62c6d73301037ee9fbb4e01233be673a407510e25e65568ad"
 
 // Rules is the paths in bundle.json of the rules RulesSHA256 covers, in order.
-var Rules = []string{"context.rule", "sh.line_string", "sh.line_tokens", "sh.slot", "sh.gap", "sh.pos", "c.roles",
+var Rules = []string{"context.rule", "c.roles",
 	"c.line_string", "c.input_ids", "channels", "text.rule", "text.whitespace", "text.patterns.section",
 	"text.patterns.codes", "text.patterns.url", "text.patterns.ipv4", "text.patterns.ipv6", "text.patterns.not_secure",
 	"text.patterns.icons", "text.patterns.discord_tags", "text.shown", "text.discord_name", "text.names", "text.repeat",
-	"links.pattern", "links.rule", "coverage.rule", "model_text.rule"}
+	"links.pattern", "links.rule", "coverage.rule", "model_text.rule", "scoring.mode"}
 
-// The rules that bundle.json states in words, with the numbers in them this package uses: SH keeps the first
-// shLineIDs ids of a line string, and a gap is at most maxGap.
-const (
-	shLineIDs = 46
-	maxGap    = 11
-)
+// ScoringMode is the explicit single-classifier serving contract.
+const ScoringMode = "c_only"
 
 // RulesHash is the sha256 of the UTF-8 of the values at the paths of Rules in bundle.json, joined by U+0000; a list
 // is its items joined by one space, numbers in decimal (bundle.json rules.how).
@@ -158,6 +144,18 @@ func CheckRules(bundleJSON []byte) error {
 		return fmt.Errorf("bundle.json states rules this server does not implement (their sha256 is %s, this server's %s)",
 			h, RulesSHA256)
 	}
+	var declaration struct {
+		Rules struct {
+			Of     []string `json:"of"`
+			SHA256 string   `json:"sha256"`
+		} `json:"rules"`
+	}
+	if err := json.Unmarshal(bundleJSON, &declaration); err != nil {
+		return fmt.Errorf("bundle.json: %w", err)
+	}
+	if !slices.Equal(declaration.Rules.Of, Rules) || declaration.Rules.SHA256 != h {
+		return errors.New("bundle.json: rules.of or rules.sha256 differs from the implemented rules")
+	}
 	return nil
 }
 
@@ -174,45 +172,73 @@ func ReadSpec(dir string) (*Spec, error) {
 	if err := CheckRules(raw); err != nil {
 		return nil, err
 	}
-	for _, name := range []string{"sh_line_encoder", "sh_context", "c"} {
-		g, ok := s.Graphs[name]
-		if !ok || g.XML == "" || len(g.Inputs) == 0 {
-			return nil, fmt.Errorf("bundle.json: graphs.%s needs xml and inputs", name)
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return nil, err
+	}
+	if _, ok := fields["sh"]; ok {
+		return nil, errors.New("bundle.json: sh metadata is not allowed in c_only mode")
+	}
+	for _, name := range []string{"models", "thresholds"} {
+		var section map[string]json.RawMessage
+		if err := json.Unmarshal(fields[name], &section); err != nil && fields[name] != nil {
+			return nil, fmt.Errorf("bundle.json %s: %w", name, err)
+		}
+		for key := range section {
+			if key == "sh" || strings.HasPrefix(key, "sh_") {
+				return nil, fmt.Errorf("bundle.json: %s.%s is not allowed in c_only mode", name, key)
+			}
+		}
+		if name == "thresholds" {
+			for _, group := range []string{"hold", "kinds"} {
+				if section[group] == nil {
+					continue
+				}
+				var values map[string]*float32
+				if err := json.Unmarshal(section[group], &values); err != nil {
+					return nil, fmt.Errorf("bundle.json thresholds.%s: %w", group, err)
+				}
+				for key, value := range values {
+					if value == nil {
+						return nil, fmt.Errorf("bundle.json: thresholds.%s.%s must be a number", group, key)
+					}
+				}
+			}
 		}
 	}
-	for _, name := range []string{"sh", "c"} {
-		if s.Tokenizers[name].File == "" {
-			return nil, fmt.Errorf("bundle.json: tokenizers.%s.file is empty", name)
-		}
+	g, ok := s.Graphs["c"]
+	if len(s.Graphs) != 1 || !ok || !filepath.IsLocal(g.XML) || len(g.Inputs) != 2 ||
+		g.Inputs[0].Name != "input_ids" || g.Inputs[1].Name != "attention_mask" {
+		return nil, errors.New("bundle.json: graphs must contain only c with local xml and input_ids, attention_mask")
+	}
+	if len(s.Tokenizers) != 1 || !filepath.IsLocal(s.Tokenizers["c"].File) {
+		return nil, errors.New("bundle.json: tokenizers must contain only c with a local file")
 	}
 	t := s.Thresholds
 	switch {
+	case s.Scoring.Mode != ScoringMode:
+		return nil, errors.New("bundle.json needs scoring.mode c_only")
 	case s.ModelText.Rule != core.ModelTextRule:
 		return nil, errors.New("bundle.json needs model_text.rule v3_meaning_v1")
 	case s.Coverage.Rule != CoverageRule:
 		return nil, errors.New("bundle.json needs coverage.rule complete_target_v1")
 	case s.Special.BOS == nil || s.Special.EOS == nil:
 		return nil, errors.New("bundle.json: special_tokens needs bos and eos")
-	case !slices.Contains(s.Outputs, "hold"):
-		return nil, errors.New("bundle.json: outputs has no hold")
+	case !slices.Equal(s.Outputs, []string{"ask_contact", "give_contact", "ask_personal", "give_personal", "off_server", "sexual", "romantic", "hold"}):
+		return nil, errors.New("bundle.json: outputs must contain the seven facts then hold in the supported order")
+	case !slices.Equal(s.Kinds, s.Outputs[:7]):
+		return nil, errors.New("bundle.json: kinds must contain the seven facts in the supported order")
 	case s.OpenVINO.Device != "CPU" || s.OpenVINO.Batch != 1:
 		return nil, errors.New("bundle.json: openvino must name the CPU device and batch 1")
 	case s.Context.Lines < 1 || s.Context.Seconds < 1 || s.Context.Private == "":
 		return nil, errors.New("bundle.json: context needs lines, seconds and private_channel")
-	case len(s.SH.Channels) == 0 || s.SH.Unknown == nil || s.SH.AddrNone < 1:
-		return nil, errors.New("bundle.json: sh needs channels, unknown_channel_id and addr_none")
-	case s.C.MaxTokens < 2:
-		return nil, errors.New("bundle.json: c.max_tokens must be at least 2")
-	case t.SHPass == nil || len(t.Hold) == 0:
-		return nil, errors.New("bundle.json: thresholds need sh_pass and hold")
+	case s.C.MaxTokens < 3:
+		return nil, errors.New("bundle.json: c.max_tokens must be at least 3")
+	case len(t.Hold) == 0:
+		return nil, errors.New("bundle.json: thresholds need hold")
 	}
 	if _, ok := t.Hold[t.Default]; !ok {
 		return nil, fmt.Errorf("bundle.json: thresholds.default %q is not one of thresholds.hold", t.Default)
-	}
-	for _, k := range s.Kinds {
-		if !slices.Contains(s.Outputs, k) {
-			return nil, fmt.Errorf("bundle.json: kind %s is not one of outputs", k)
-		}
 	}
 	for k := range t.Kinds {
 		if !slices.Contains(s.Kinds, k) {
@@ -236,13 +262,12 @@ type Scorer struct {
 	spec           *Spec
 	opt            Options
 	core           *ovCore
-	enc, ctx, c    *graph
-	shTok, cTok    *Tokenizer
+	c              *graph
+	cTok           *Tokenizer
 	threshold      string
-	shPass, hold   float32
+	hold           float32
 	holdAt         int
 	kinds          []kindMark
-	chanID         map[string]int64
 	public, placed map[string]bool
 	bos, eos       int64
 
@@ -256,14 +281,13 @@ type kindMark struct {
 	min  float32
 }
 
-// Open loads a bundle's graphs and tokenizers. The models take about 4 GB of memory, 2.7 GB of it the graphs' weights
-// mapped from the bundle's files.
+// Open loads the bundle's C graph and tokenizer.
 func Open(dir string, spec *Spec, opt Options) (*Scorer, error) {
 	if opt.Threads < 1 {
 		return nil, errors.New("threads must be at least 1")
 	}
-	s := &Scorer{spec: spec, opt: opt, threshold: opt.Threshold, shPass: *spec.Thresholds.SHPass,
-		holdAt: slices.Index(spec.Outputs, "hold"), chanID: map[string]int64{}, public: map[string]bool{},
+	s := &Scorer{spec: spec, opt: opt, threshold: opt.Threshold,
+		holdAt: slices.Index(spec.Outputs, "hold"), public: map[string]bool{},
 		placed: map[string]bool{}, bos: *spec.Special.BOS, eos: *spec.Special.EOS, st: newStream("")}
 	if s.threshold == "" {
 		s.threshold = spec.Thresholds.Default
@@ -278,9 +302,6 @@ func Open(dir string, spec *Spec, opt Options) (*Scorer, error) {
 			s.kinds = append(s.kinds, kindMark{k, slices.Index(spec.Outputs, k), v})
 		}
 	}
-	for i, c := range spec.SH.Channels {
-		s.chanID[c] = int64(i)
-	}
 	for _, c := range spec.Context.Public {
 		s.public[c] = true
 	}
@@ -288,9 +309,6 @@ func Open(dir string, spec *Spec, opt Options) (*Scorer, error) {
 		s.placed[c] = true
 	}
 	var err error
-	if s.shTok, err = LoadTokenizer(filepath.Join(dir, spec.Tokenizers["sh"].File)); err != nil {
-		return nil, err
-	}
 	if s.cTok, err = LoadTokenizer(filepath.Join(dir, spec.Tokenizers["c"].File)); err != nil {
 		return nil, err
 	}
@@ -311,16 +329,14 @@ func Open(dir string, spec *Spec, opt Options) (*Scorer, error) {
 		props[k] = fmt.Sprint(v)
 	}
 	props["INFERENCE_NUM_THREADS"] = fmt.Sprint(opt.Threads)
-	for name, dst := range map[string]**graph{"sh_line_encoder": &s.enc, "sh_context": &s.ctx, "c": &s.c} {
-		g := spec.Graphs[name]
-		var inputs []string
-		for _, in := range g.Inputs {
-			inputs = append(inputs, in.Name)
-		}
-		if *dst, err = s.core.load(name, filepath.Join(dir, g.XML), inputs, props); err != nil {
-			s.Close()
-			return nil, err
-		}
+	g := spec.Graphs["c"]
+	inputs := make([]string, 0, len(g.Inputs))
+	for _, in := range g.Inputs {
+		inputs = append(inputs, in.Name)
+	}
+	if s.c, err = s.core.load("c", filepath.Join(dir, g.XML), inputs, props); err != nil {
+		s.Close()
+		return nil, err
 	}
 	return s, nil
 }
@@ -347,12 +363,10 @@ func keys[V any](m map[string]V) []string {
 func (s *Scorer) Close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, g := range []*graph{s.enc, s.ctx, s.c} {
-		if g != nil {
-			g.close()
-		}
+	if s.c != nil {
+		s.c.close()
 	}
-	s.enc, s.ctx, s.c = nil, nil, nil
+	s.c = nil
 	if s.core != nil {
 		s.core.close()
 		s.core = nil
@@ -374,9 +388,6 @@ type entry struct {
 	time                     int64
 	channel, author, partner string
 	text                     string
-	directC                  bool
-	toks                     []int64   // SH's input ids
-	vec                      []float32 // SH's line vector, nil until encoded
 }
 
 // stream is one stream's lists of earlier lines: the public list, each pair's private messages, each author's placed
@@ -473,7 +484,7 @@ func AuthorKey(speaker string) string {
 	return core.Lower(speaker)
 }
 
-// entryOf is the line as the models see it: author and partner keys, whole seconds, SH's input ids. A line's author
+// entryData is the line as C sees it: author and partner keys and whole seconds. A line's author
 // key is Line.Speaker lowercased as Python's str.lower() does: the speaker's account name, or for a Discord relay "discord:"
 // and its prepared name.
 func (s *Scorer) entryData(l core.Line) *entry {
@@ -484,34 +495,9 @@ func (s *Scorer) entryData(l core.Line) *entry {
 	return e
 }
 
-func (s *Scorer) entryOf(l core.Line) *entry {
-	e := s.entryData(l)
-	s.encode(e)
-	return e
-}
-
-// encode gives the entry SH's input ids.
-func (s *Scorer) encode(e *entry) {
-	str := e.text
-	if e.channel != "chat" {
-		str = "[" + e.channel + "] " + e.text
-	}
-	ids := s.shTok.Encode(str)
-	e.directC = len(ids) > shLineIDs
-	if len(ids) > shLineIDs {
-		ids = ids[:shLineIDs]
-	}
-	e.toks = make([]int64, 0, len(ids)+2)
-	e.toks = append(e.toks, s.bos)
-	for _, id := range ids {
-		e.toks = append(e.toks, int64(id))
-	}
-	e.toks = append(e.toks, s.eos)
-}
-
 // TakeContext gives the scorer the context of the scorer it replaces (a bundle switch), so that the next line's
 // context is the one it had with the old models: each line the old lists keep, taken again in the order it came, with
-// this bundle's input ids. A line's vector is made when a later line first needs it.
+// this bundle's context settings.
 func (s *Scorer) TakeContext(old *Scorer) {
 	old.mu.Lock()
 	src := old.st
@@ -529,7 +515,6 @@ func (s *Scorer) TakeContext(old *Scorer) {
 	st := newStream(src.name)
 	for _, o := range all {
 		e := &entry{id: o.id, time: o.time, channel: o.channel, author: o.author, partner: o.partner, text: o.text}
-		s.encode(e)
 		s.remember(st, e)
 	}
 	s.st = st
@@ -548,24 +533,19 @@ func (s *Scorer) streamFor(name string) *stream {
 // Detail is everything about one line's score.
 type Detail struct {
 	Verdict    core.Verdict
-	SH         []float32
 	Passed     bool
 	C          []float32 // nil when C did not run
 	Held       map[string]bool
 	ContextIDs []string
-	SHIDs      []int64
-	Slot, Addr []int64
-	Chan, Gap  []int64
 	CIDs       []int64
 }
 
-// See takes a line that is context only: kept for later lines, never scored. Its vector is made when a later line
-// first needs it.
+// See keeps a context-only line for later targets without scoring it.
 func (s *Scorer) See(l core.Line) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	st := s.streamFor(l.Stream)
-	s.remember(st, s.entryOf(l))
+	s.remember(st, s.entryData(l))
 }
 
 // Score scores a line (core.Scorer).
@@ -604,11 +584,11 @@ func (s *Scorer) Take(l core.Line) (*Call, error) {
 
 // take is Take. The caller holds mu.
 func (s *Scorer) take(l core.Line) (*Call, error) {
-	if s.enc == nil {
+	if s.c == nil {
 		return nil, errClosed
 	}
 	st := s.streamFor(l.Stream)
-	e := s.entryOf(l)
+	e := s.entryData(l)
 	ctx := s.context(st, e)
 	s.remember(st, e)
 	return &Call{s, e, ctx}, nil
@@ -618,7 +598,7 @@ func (s *Scorer) take(l core.Line) (*Call, error) {
 func (c *Call) Run() (Detail, error) {
 	c.s.mu.Lock()
 	defer c.s.mu.Unlock()
-	if c.s.enc == nil {
+	if c.s.c == nil {
 		return Detail{}, errClosed
 	}
 	return c.s.run(c.e, c.ctx)
@@ -627,54 +607,24 @@ func (c *Call) Run() (Detail, error) {
 // run runs the models on the line e with its context ctx. The caller holds mu.
 func (s *Scorer) run(e *entry, ctx []*entry) (Detail, error) {
 	var d Detail
-	d.SHIDs = e.toks
+	d.Passed = true
 	for _, c := range ctx {
 		d.ContextIDs = append(d.ContextIDs, c.id)
 	}
-	seq := append(slices.Clip(ctx), e)
-	n := len(seq)
-	for _, c := range seq {
-		if c.vec != nil {
-			continue
-		}
-		shape := []int64{1, int64(len(c.toks))}
-		v, err := s.enc.run([]tensor{{i64: c.toks, shape: shape}, {i64: ones(len(c.toks)), shape: shape}})
-		if err != nil {
-			return d, err
-		}
-		c.vec = v
-	}
-
-	f := s.shFeatures(e, ctx)
-	vec := make([]float32, 0, n*len(e.vec))
-	for _, c := range seq {
-		vec = append(vec, c.vec...)
-	}
-
-	d.Slot, d.Addr, d.Chan, d.Gap = f[0], f[1], f[2], f[3]
-	in := []tensor{{f32: vec, shape: []int64{1, int64(n), int64(len(e.vec))}}}
-	for _, x := range f {
-		in = append(in, tensor{i64: x, shape: []int64{1, int64(n)}})
-	}
-	var err error
-	if d.SH, err = s.ctx.run(in); err != nil {
-		return d, err
-	}
-	sh := float64(d.SH[s.holdAt])
-	d.Verdict.SH = &sh
-	d.Passed = e.directC || d.SH[s.holdAt] >= s.shPass
 	d.Held = map[string]bool{}
-	for k := range s.spec.Thresholds.Hold {
-		d.Held[k] = false
-	}
-	if !d.Passed {
-		return d, nil
-	}
-
+	var err error
 	d.CIDs = s.cIDs(e, ctx)
 	shape := []int64{1, int64(len(d.CIDs))}
 	if d.C, err = s.c.run([]tensor{{i64: d.CIDs, shape: shape}, {i64: ones(len(d.CIDs)), shape: shape}}); err != nil {
 		return d, err
+	}
+	if len(d.C) != len(s.spec.Outputs) {
+		return d, fmt.Errorf("C returned %d logits, expected %d", len(d.C), len(s.spec.Outputs))
+	}
+	for _, v := range d.C {
+		if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
+			return d, errors.New("C returned nonfinite logits")
+		}
 	}
 	c := float64(d.C[s.holdAt])
 	d.Verdict.C = &c
@@ -688,45 +638,6 @@ func (s *Scorer) run(e *entry, ctx []*entry) (Detail, error) {
 		}
 	}
 	return d, nil
-}
-
-// shFeatures builds the scalar context inputs used by SH.
-func (s *Scorer) shFeatures(e *entry, ctx []*entry) [6][]int64 {
-	seq := append(slices.Clip(ctx), e)
-	n := len(seq)
-	names := map[string]int64{e.author: 0}
-	slotMax := s.spec.SH.AddrNone - 1
-	num := func(a string) int64 {
-		v, ok := names[a]
-		if !ok {
-			v = int64(len(names))
-			names[a] = v
-		}
-		return min(v, slotMax)
-	}
-	var f [6][]int64
-	for k := range f {
-		f[k] = make([]int64, n)
-	}
-	for k, c := range seq {
-		if k < n-1 {
-			f[0][k] = num(c.author)
-		}
-		f[1][k] = s.spec.SH.AddrNone
-		if c.channel == s.spec.Context.Private {
-			f[1][k] = num(c.partner)
-		}
-		f[2][k] = *s.spec.SH.Unknown
-		if id, ok := s.chanID[c.channel]; ok {
-			f[2][k] = id
-		}
-		if g := e.time - c.time; g > 0 {
-			f[3][k] = int64(min(maxGap, bits.Len64(uint64(g))))
-		}
-		f[4][k] = int64(n - 1 - k)
-		f[5][k] = 1
-	}
-	return f
 }
 
 // cIDs builds the same complete context/target input used in inference.

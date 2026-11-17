@@ -13,11 +13,10 @@ bundle the Module-ECC training pipeline writes; with a W&B API key, the host fet
 The decisions are made by the package `core/`, which has no clock, network or file of its own: the HTTP server drives
 it on the host's clock, and `ecc-server replay` drives it on a virtual clock over recorded lines.
 
-**The fast model.** Two models score each line on the host's CPU: SH, a small model, on every line, and C, a large
-model, on the lines SH passes; C's score decides `hold` or `deliver`. They run in the server's process through
-OpenVINO's C API, on Linux only. The binary is built without cgo and loads `/usr/lib/ecc-server/openvino` through purego at start, so it is dynamically linked against glibc: it runs on glibc systems (Debian, Ubuntu) and not on musl systems such as Alpine, and a container image for it is a Debian one. They take about
-4 GB of memory, 2.7 GB of it the graphs' weights mapped from the bundle's files. On another system `ecc-server run`
-starts only with the test rig's scorer (`[test] hold_words_file`, see Configuration), which holds a line that contains
+**The fast model.** C scores every covered target on the host's CPU. Its hold score decides `hold` or `deliver`.
+C runs in the server's process through OpenVINO's C API, on Linux only. The binary is built without cgo and loads
+`/usr/lib/ecc-server/openvino` through purego at start. It needs glibc, so use Debian or Ubuntu rather than a musl
+system such as Alpine. On another system, start `ecc-server run` only with the test rig's scorer (`[test] hold_words_file`, see Configuration), which holds a line that contains
 one of a file's words and logs a warning at every start that the server filters nothing; it exists for the end-to-end
 rig, never for a game server with players.
 
@@ -66,15 +65,17 @@ as `models/c.bin`) and the files `bundle.json` names: the fast model's graphs an
 reads:
 
 - `graphs`, `tokenizers`, `special_tokens`, `outputs`, `kinds`, `openvino` (the release and the compile
-  settings), `context` (the lists of earlier lines a line is scored with), `sh` and `c` (the models' inputs): how a
-  line is scored;
+  settings), `context` (the lists of earlier lines a line is scored with) and `c` (the classifier input);
+- `scoring.mode`: must be `c_only`. The bundle must contain exactly graph `c` and tokenizer `c`. SH metadata and
+  old cascade bundles are refused;
 - `channels`: the channels a line may have;
 - `text`: how a line's raw text and names are prepared (see A line), with its limits, marks, whitespace and patterns;
-- `rules`: the paths of every rule the host implements in code, from `context.rule` to `links.rule`. The host hashes
-  the values at those paths as `rules.how` states; a bundle whose rules hash differently from the ones this host
+- `rules`: the paths of every rule the host implements in code, from `context.rule` through `model_text.rule` and
+  `scoring.mode`. The host checks the path list and digest, then hashes the values as `rules.how` states; a bundle whose rules hash differently from the ones this host
   implements is refused, and so is one whose text limits, marks, whitespace or link pattern differ;
-- `thresholds`: `sh_pass`, `hold` (by name) and `default`, the hold threshold to use, and, when set, `kinds`
-  (a threshold per kind on C's logits; without them no line is marked with a kind);
+- `thresholds`: `hold` (by name), `default` and optional `kinds`. Leave the configured threshold empty to use
+  the bundle's default. Set an explicit hold key to select another operating point. Kind thresholds add hints;
+  they do not clear a hold;
 - `judge.question`: `question.md`, whose `json` block holds the prompt's fixed strings (`QUESTION`, `ADDED`, `FORMAT`
   and the separators, which must be the ones the host lays the prompt out with, or the bundle is refused);
 - `judge.examples`: `examples.json`, the owner's ruled cases (`examples`: `id`, `ruling`, `date`, `text`) in the
@@ -180,9 +181,8 @@ allowlist in `<data>/links.json` for its next start; before any `start`, no link
 base64 word decoding and address redaction before allowed-link replacement. The record, judge text and repeat key
 keep their prepared text. For a line to score,
 the host rejects raw text that needs a channel-length cut or URL shortening. It also rejects a target whose complete
-rendered C input cannot fit the bundle's C token budget with its three special tokens. If the complete SH line exceeds
-SH's line budget, the host sends it to C regardless of SH's score. The host checks coverage before it folds a repeat
-or remembers a line. Trusted lines and context-only lines keep their existing exemption.
+rendered C input cannot fit the bundle's C token budget with its three special tokens. Every covered target runs C.
+The host checks coverage before it folds a repeat or remembers a line. Trusted lines and context-only lines keep their existing exemption.
 
 **Repeats.** A line is a repeat of an earlier line of the stream with the same name, channel and text within 60
 seconds (whole seconds) of that line's last copy, whatever lines came between, as the training pipeline folded
@@ -205,24 +205,38 @@ are unruled. One call per sitting is in flight; a later checkpoint waits for its
 headed with the UTC date of its first line and shows each line at its UTC time of day. A ruling covers the held lines
 up to its checkpoint's last line:
 
-| ruling | action |
+The host records the raw ruling, `sure`, speaker reference and model evidence. It applies a separate effective
+ruling. For live model answers:
+
+| firm result | action |
 | --- | --- |
-| `nothing` | `release`: deliver those held lines, and their repeats, in the order they arrived |
-| `hold` | the lines stay held; `warn` the player, once a sitting |
-| `ban` | `ban`: an indefinite ban and an immediate kick; the player's held lines are dropped and the sitting ends |
+| `nothing`, `sure: true` | `release`: deliver those held lines and their repeats in arrival order |
+| `hold`, `sure: true` | keep the lines held; `warn` the player once per sitting |
+| two independent valid `ban` answers, both `sure: true` | `ban`: apply the existing indefinite ban and immediate kick; drop the player's held lines and end the sitting |
+| any uncertain answer or conflicting confirmation | keep the lines held and add the sitting to the review queue at once |
+
+A ban requires two separate requests and responses for the identical frozen prompt. Both answers must cite a valid
+line from the player. One cached answer cannot supply both confirmations. An uncertain or conflicting answer cannot
+release a line, ban or kick a player, or write an IP ban. A previously released line remains evidence in later cases,
+but the render marks it as previously cleared.
 
 A checkpoint the judge does not rule (three invalid answers, a refusal by Bedrock, a prompt over `max_prompt_chars`,
 the day's calls or a budget used up, no Bedrock key, or a judge it could not reach before the sitting ended) leaves
 its lines held.
 
-**The review queue.** `<data>/review/queue.jsonl` gets one JSON line for each ban, each sitting that ends with
+**The review queue.** The host adds a sitting to `<data>/review/queue.jsonl` at once after an uncertain answer or
+conflicting confirmation. It also adds each ban, each sitting that ends with
 `review_held` or more held lines and no ban, each sitting with a checkpoint the judge did not rule, each sitting with a
 line on a channel the bundle does not name, and each sitting a restart ended with held lines no ruling covered.
 
-**Restart.** Nothing about a sitting is reloaded. At start the host reads the last two days' record for sittings that
-started and did not end, records each one's end, and puts each with held lines no ruling covered on the review queue.
-Their held lines stay held: Module-ECC delivers a held line only on a `release`. Module-ECC sends `start` when it
-starts, so a host and plugin restarted together begin a clean stream.
+**Restart.** At start, the host reads the last two days' record for sittings that started and did not end.
+It records each sitting's end. It uses the recorded effective ruling and review reason. An uncertain or conflicting
+answer leaves its lines held. A pending answer covers no lines. For older records without an effective ruling,
+the host keeps the lines held for review unless a recorded action proves release, hold or ban. A firm hold does not
+add a review reason merely because the host restarted. Recovery sends no new action.
+
+The host does not reload the sitting as a live case. Held lines stay held until Module-ECC receives a `release`.
+Module-ECC sends `start` when it starts, so a host and plugin restarted together begin a clean stream.
 
 **Actions** wait in `<data>/actions.json` (written atomically) until Module-ECC acknowledges each with `ok: true`;
 after `ok: false` the action stays and is served again. A restart of either program resends what was not
@@ -235,7 +249,8 @@ line answered hold at `max_wait`, once its models end), `unscored` (such a line 
 `sitting_start`, `checkpoint` (the
 held-line count it covers, why it was made, the prompt's size and SHA-256, whether it was sent), `judge_call` (each
 call: attempt, status, the usage's input, cached, cache-write, output and reasoning tokens, cost, duration, or the
-error), `ruling` (the judge's answer, the error, or `pending` with the time it is put again), `checkpoint_again`,
+error, request/response identifiers and raw answer), `ruling` (the raw answer, confidence, confirmation evidence,
+effective ruling and review reason, the error, or `pending` with the time it is put again), `checkpoint_again`,
 `action` (the core's, by line id), `action_sent` (as Module-ECC gets it), `ack`, `presence`, `sitting_end` (outcome, held, released and unruled
 lines, the checkpoints) and `review`. Lines are flushed one at a time. Just after midnight UTC the day's file is
 compressed to `YYYY-MM-DD.jsonl.zst`; compressed files older than `record_retention_days` are deleted.
@@ -257,7 +272,8 @@ key the service starts and gives verdicts, and no checkpoint is judged. `sudo ec
 key and restarts the service. Bedrock API keys expire; when Bedrock refuses the key, the host logs it once, with the
 fix, until a call succeeds again.
 
-**The call.** Each checkpoint is one Responses request, `POST
+**The call.** A checkpoint starts with a Responses request. A firm ban requires another independent response to
+the same frozen prompt. Each request uses `POST
 https://bedrock-runtime.<region>.amazonaws.com/openai/v1/responses` with `Authorization: Bearer <key>`:
 
 ```json
@@ -269,17 +285,20 @@ https://bedrock-runtime.<region>.amazonaws.com/openai/v1/responses` with `Author
 ```
 
 The two parts, joined, are the prompt: the question, the owner's cases, the sitting so far with the held lines marked
-`[held]`, and the answer format. The first part is the same in every call and ends at an explicit cache breakpoint, so
+`[held]` and previously cleared lines marked separately, and the answer format. The first part is the same in every call and ends at an explicit cache breakpoint, so
 Bedrock serves it from its prompt cache (at least 30 minutes; a hit resets the time, and a request another server takes
 writes a new entry). `store` is false: Bedrock keeps no copy of the prompt or the answer. The answer is the output
 message's text; an answer whose `status` is `incomplete` (its output cut at `max_output_tokens`) is invalid. A valid
 answer is one JSON object (a Markdown code fence around it is accepted) whose `rulings` list holds one entry for the
 case `N1`: `ruling` `nothing`, `hold` or `ban` (`not ban`, a ruling of the owner's cases, is taken as `hold`); for
 `hold` or `ban`, `by` one of the player's lines the case shows; `like` a list of at most three of the owner's case
-ids; `sure` true or false. An invalid answer is asked for again, up to three answers. A call that fails (`429`, a
+ids; `sure` true or false. The host records both requests and responses when it seeks ban confirmation.
+An invalid answer is asked for again, up to three invalid answers per confirmation stage. A call that fails (`429`, a
 `5xx`, an answer whose `status` is `failed` or `cancelled`, the `timeout`, the network) is made again after 5 seconds, then 10, 20, ..., while the failures have lasted
 less than 5 minutes; then the checkpoint is pending: it is put again 5 minutes later, and so on until the sitting ends
-(`/status` counts the pending ones). A call refused by the budget, or by Bedrock for the key (`401`, `403`) or as a
+(`/status` counts the pending ones). A confirmation failure leaves the lines held. The host keeps the first firm
+ban with that pending job and seeks a separate valid confirmation when it retries. It applies no partial ban.
+A call refused by the budget, or by Bedrock for the key (`401`, `403`) or as a
 bad request, is not made again. Each of these stops, three invalid answers on one checkpoint and a missing key send
 staff a `notice` naming the cause, a notice of one cause at most once an hour (see HTTP interface).
 **The budget.** The host adds up each call's cost from the usage Bedrock returns at the configured prices, halved on
@@ -496,10 +515,11 @@ of the recorded verdicts (Linux only). `ecc-server replay -h` describes the inpu
 
 `ecc-server score -bundle DIR -in FILE -out FILE [-ids] [-allow FILE]` takes lines as Module-ECC sends them, handles
 each as the host does (prepared, refused, dropped, folded, links replaced, scored) and writes the format of the
-training pipeline's reference scorer (`ecc.reference`), the prepared texts, keys, token ids and features included with
+training pipeline's reference scorer (`ecc.reference`), the prepared texts, keys, C token ids and context IDs included with
 `-ids`, to check the host against it (Linux only). `ecc-server score -h` describes the formats.
-Replay input streams must declare `coverage_rule: "complete_target_v1"`. Each stream must also declare `model_text_rule: "v3_meaning_v1"` and `canonical_link`, equal to the replay config. The judge folder must contain the
-producer's `allowlist.txt`. Every line must include `raw_text` and its
-`coverage` route (`cascade`, `c`, `reject`, `context`, `fold` or `dropped`). A reject must carry `verdict: "reject"`.
+Replay input streams must declare `scoring_mode: "c_only"` and `coverage_rule: "complete_target_v1"`.
+Each stream must also declare `model_text_rule: "v3_meaning_v1"` and `canonical_link`, equal to the replay config.
+The judge folder must contain the producer's `allowlist.txt`. Every line must include `raw_text` and its
+`coverage` route (`c`, `reject`, `context`, `fold` or `dropped`). A reject must carry `verdict: "reject"`.
 Recorded replay preserves that final decision before it opens a sitting. Copies need their own coverage result;
 they can reject before folding even when the original line fit.

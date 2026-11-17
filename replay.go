@@ -49,6 +49,7 @@ type replayEvent struct {
 	Name          string  `json:"name"`
 	Day           string  `json:"day"`
 	CoverageRule  string  `json:"coverage_rule"`
+	ScoringMode   string  `json:"scoring_mode"`
 	ModelTextRule string  `json:"model_text_rule"`
 	CanonicalLink *string `json:"canonical_link"`
 	ID            string  `json:"id"`
@@ -228,8 +229,8 @@ func readReplayEvents(path string) ([]replayEvent, error) {
 			return nil, fmt.Errorf("%s:%d: %w", path, n, err)
 		}
 		if ev.Type == "stream" {
-			if ev.CoverageRule != model.CoverageRule || ev.CanonicalLink == nil || ev.ModelTextRule != core.ModelTextRule {
-				return nil, fmt.Errorf("%s:%d: stream requires model_text_rule v3_meaning_v1, canonical_link and coverage_rule %q", path, n, model.CoverageRule)
+			if ev.ScoringMode != model.ScoringMode || ev.CoverageRule != model.CoverageRule || ev.CanonicalLink == nil || ev.ModelTextRule != core.ModelTextRule {
+				return nil, fmt.Errorf("%s:%d: stream requires scoring_mode c_only, model_text_rule v3_meaning_v1, canonical_link and coverage_rule %q", path, n, model.CoverageRule)
 			}
 			stream = true
 		}
@@ -238,7 +239,7 @@ func readReplayEvents(path string) ([]replayEvent, error) {
 				return nil, fmt.Errorf("%s:%d: line requires a coverage stream and raw_text", path, n)
 			}
 			switch ev.Coverage {
-			case "cascade", "c", "reject", "context", "fold", "dropped":
+			case "c", "reject", "context", "fold", "dropped":
 			default:
 				return nil, fmt.Errorf("%s:%d: line has invalid coverage %q", path, n, ev.Coverage)
 			}
@@ -252,7 +253,7 @@ func readReplayEvents(path string) ([]replayEvent, error) {
 			if context && ev.Coverage != "context" && ev.Coverage != "fold" && ev.Coverage != "dropped" {
 				return nil, fmt.Errorf("%s:%d: context line has scoring coverage", path, n)
 			}
-			if !context && (ev.Coverage == "context" || ((ev.Coverage == "cascade" || ev.Coverage == "c") && ev.Verdict == "")) {
+			if !context && (ev.Coverage == "context" || (ev.Coverage == "c" && ev.Verdict == "")) {
 				return nil, fmt.Errorf("%s:%d: scoring line has no recorded verdict", path, n)
 			}
 			ev.Shown, ev.Name = ev.Name, ""

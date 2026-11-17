@@ -27,9 +27,9 @@ bundle's models scoring the rest), and writes one record per line in the format 
           "target_uuid", "target", "text", "trusted"}
   -out    one record per input record: {"stream", "id", "refused": "unknown channel", "verdict": "hold"},
           {"stream", "id", "dropped": true, "verdict": "deliver"}, {"stream", "id", "folded_into": "<id>"},
-          {"stream", "id", "context_only": true}, or {"stream", "id", "sh", "passed", "c", "held_<threshold>"...,
+          {"stream", "id", "context_only": true}, or {"stream", "id", "passed", "c", "held_<threshold>"...,
           "verdict", "kinds"}; -ids adds the prepared text, the text the models read, the author key and the repeat
-          key of every line kept, and the context's ids, SH's input ids and features and C's input ids of a scored one
+          key of every line kept, and the context's ids and C's input ids of a scored one
   -allow  a file of allowed links, one host or host/prefix a line (# comments)
 `
 
@@ -171,7 +171,7 @@ func scoreLines(args []string) error {
 			keep()
 			switch {
 			case result.Verdict == "reject":
-				out["verdict"], out["rejected"] = "reject", true
+				out["verdict"], out["coverage"] = "reject", "reject"
 			case rec.of != "":
 				out["folded_into"] = rec.of
 			case l.Context:
@@ -195,22 +195,15 @@ func scoreLines(args []string) error {
 			if d.Verdict.Hold {
 				verdict = "hold"
 			}
-			out["sh"], out["passed"], out["verdict"], out["kinds"] = d.SH, d.Passed, verdict, nonNil(d.Verdict.Kinds)
-			out["c"] = nil
-			if d.C != nil {
-				out["c"] = d.C
-				cRuns++
-			}
+			out["coverage"], out["passed"], out["verdict"], out["kinds"] = "c", d.Passed, verdict, nonNil(d.Verdict.Kinds)
+			out["c"] = d.C
+			cRuns++
 			for k, v := range d.Held {
 				out["held_"+k] = v
 			}
 			if *ids {
 				out["context_ids"] = nonNil(d.ContextIDs)
-				out["sh_slot"], out["sh_addr"], out["sh_chan"], out["sh_gap"] = d.Slot, d.Addr, d.Chan, d.Gap
-				out["sh_input_ids"] = d.SHIDs
-				if d.CIDs != nil {
-					out["c_input_ids"] = d.CIDs
-				}
+				out["c_input_ids"] = d.CIDs
 			}
 		}
 		b, _ := json.Marshal(out)
