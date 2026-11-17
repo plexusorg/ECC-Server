@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -344,7 +345,7 @@ func activate(cfg Config, version string, byOperator bool) error {
 		return nil
 	}
 	for _, e := range entries {
-		// An install in progress (another process's `use`) keeps its .tmp folder; installBundle replaces a stale one.
+		// Keep install staging; each installer owns and removes its own directory.
 		if e.Name() != st.Current && e.Name() != st.Previous && !strings.HasSuffix(e.Name(), ".tmp") {
 			if err := os.RemoveAll(filepath.Join(cfg.Data, "bundles", e.Name())); err != nil {
 				slog.Warn("could not delete an old bundle", "bundle", e.Name(), "err", err)
@@ -354,10 +355,16 @@ func activate(cfg Config, version string, byOperator bool) error {
 	return nil
 }
 
-// removeStaleInstalls deletes the .tmp folders of installs a stopped process left unfinished.
+// removeStaleInstalls reclaims only staging whose owner has exited. The packaged CLI and daemon share a PID
+// namespace. Unknown names and owners whose state cannot be checked stay in place.
 func removeStaleInstalls(cfg Config) error {
-	stale, err := filepath.Glob(filepath.Join(cfg.Data, "bundles", "*.tmp"))
+	stale, err := filepath.Glob(filepath.Join(cfg.Data, "bundles", ".install-*.tmp"))
 	for _, dir := range stale {
+		owner, _, ok := strings.Cut(strings.TrimPrefix(filepath.Base(dir), ".install-"), "-")
+		pid, parseErr := strconv.Atoi(owner)
+		if !ok || parseErr != nil || pid < 1 || !installOwnerExited(pid) {
+			continue
+		}
 		if err := os.RemoveAll(dir); err != nil {
 			return err
 		}
@@ -365,14 +372,57 @@ func removeStaleInstalls(cfg Config) error {
 	return err
 }
 
-// installBundle copies (or hardlinks) a bundle folder into the store and checks every file against its manifest.
+// loadInstalledBundle verifies the stored bytes before any judge text or model is activated.
+func loadInstalledBundle(cfg Config, version string) (*Bundle, error) {
+	if version == "" || !filepath.IsLocal(version) || filepath.Base(version) != version || version == "." {
+		return nil, fmt.Errorf("bundle version %q is not a plain name", version)
+	}
+	dir := bundleDir(cfg, version)
+	var manifest Manifest
+	if err := readJSON(filepath.Join(dir, "manifest.json"), &manifest); err != nil {
+		return nil, err
+	}
+	if manifest.Version != version {
+		return nil, fmt.Errorf("stored manifest version %q does not match requested %q", manifest.Version, version)
+	}
+	if _, ok := manifest.Files["bundle.json"]; !ok {
+		return nil, fmt.Errorf("bundle %s: the manifest does not cover bundle.json", version)
+	}
+	if err := verifyBundle(dir, manifest); err != nil {
+		return nil, err
+	}
+	b, err := loadBundle(dir)
+	if err != nil {
+		return nil, err
+	}
+	if b.Version != version {
+		return nil, fmt.Errorf("stored bundle version %q does not match requested %q", b.Version, version)
+	}
+	for _, name := range b.files() {
+		if _, ok := manifest.Files[name]; !ok {
+			return nil, fmt.Errorf("bundle %s: the manifest does not cover %s", version, name)
+		}
+	}
+	return b, nil
+}
+
+// installBundle copies a bundle folder into the store and checks every file against its manifest.
 // It returns the version and whether the folder was newly installed.
 func installBundle(cfg Config, src string) (string, bool, error) {
 	var m Manifest
 	if err := readJSON(filepath.Join(src, "manifest.json"), &m); err != nil {
 		return "", false, err
 	}
-	b, err := loadBundle(src)
+	if m.Version == "" || !filepath.IsLocal(m.Version) || filepath.Base(m.Version) != m.Version || m.Version == "." {
+		return "", false, fmt.Errorf("%s: manifest version %q is not a plain name", src, m.Version)
+	}
+	dst := bundleDir(cfg, m.Version)
+	loadFrom, existing := src, false
+	if _, err := os.Stat(dst); err == nil {
+		// W&B stages only the manifest and bundle.json when this version is installed.
+		loadFrom, existing = dst, true
+	}
+	b, err := loadBundle(loadFrom)
 	if err != nil {
 		return "", false, err
 	}
@@ -387,17 +437,17 @@ func installBundle(cfg Config, src string) (string, bool, error) {
 			return "", false, fmt.Errorf("%s: the manifest does not cover %s", src, f)
 		}
 	}
-	dst := bundleDir(cfg, m.Version)
-	if _, err := os.Stat(dst); err == nil {
+	if existing {
 		return m.Version, false, verifyBundle(dst, m)
 	}
-	tmp := dst + ".tmp"
-	if err := os.RemoveAll(tmp); err != nil {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return "", false, err
 	}
-	if err := os.MkdirAll(tmp, 0o755); err != nil {
+	tmp, err := os.MkdirTemp(filepath.Dir(dst), fmt.Sprintf(".install-%d-*.tmp", os.Getpid()))
+	if err != nil {
 		return "", false, err
 	}
+	defer os.RemoveAll(tmp)
 	names := []string{"manifest.json"}
 	for name := range m.Files {
 		if err := checkBundleName(name); err != nil {
@@ -408,19 +458,20 @@ func installBundle(cfg Config, src string) (string, bool, error) {
 	for _, name := range names {
 		dst := filepath.Join(tmp, filepath.FromSlash(name))
 		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-			os.RemoveAll(tmp)
 			return "", false, err
 		}
-		if err := linkOrCopy(filepath.Join(src, filepath.FromSlash(name)), dst); err != nil {
-			os.RemoveAll(tmp)
+		if err := copyBundleFile(filepath.Join(src, filepath.FromSlash(name)), dst); err != nil {
 			return "", false, err
 		}
 	}
 	if err := verifyBundle(tmp, m); err != nil {
-		os.RemoveAll(tmp)
 		return "", false, err
 	}
 	if err := os.Rename(tmp, dst); err != nil {
+		if _, existsErr := os.Stat(dst); existsErr == nil {
+			// Another installer won. Accept only the same verified payload.
+			return m.Version, false, verifyBundle(dst, m)
+		}
 		return "", false, err
 	}
 	return m.Version, true, nil
@@ -456,10 +507,7 @@ func verifyBundle(dir string, m Manifest) error {
 	return nil
 }
 
-func linkOrCopy(src, dst string) error {
-	if os.Link(src, dst) == nil {
-		return nil
-	}
+func copyBundleFile(src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err

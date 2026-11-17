@@ -128,7 +128,7 @@ func run(cfg Config) error {
 		return err
 	}
 	if st.Current != "" {
-		b, err := loadBundle(bundleDir(cfg, st.Current))
+		b, err := loadInstalledBundle(cfg, st.Current)
 		if err != nil {
 			return err
 		}
@@ -786,7 +786,7 @@ func (s *server) serve(version string, byOperator bool) error {
 	if cur != nil && cur.Version == version {
 		return nil
 	}
-	b, err := loadBundle(bundleDir(s.cfg, version))
+	b, err := loadInstalledBundle(s.cfg, version)
 	var sc core.Scorer
 	if err == nil {
 		sc, err = s.scorerFor(b)

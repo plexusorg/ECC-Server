@@ -51,6 +51,9 @@ func (e errBad) Unwrap() error { return e.error }
 
 func bad(format string, args ...any) error { return errBad{fmt.Errorf(format, args...)} }
 
+// A later operator rollback takes precedence over an update whose download started earlier.
+var errRolledBackDuringDownload = errors.New("production was rolled back during download")
+
 func newUpdater(s *server, key string) *updater {
 	u := &updater{s: s, wb: newWandb(key, s.cfg.WandbEntity, s.cfg.WandbProject)}
 	u.st.Artifact = u.name()
@@ -144,6 +147,9 @@ func (u *updater) update(ctx context.Context, force bool) (string, error) {
 	}
 
 	version, err := u.fetch(ctx, a)
+	if errors.Is(err, errRolledBackDuringDownload) {
+		return "production " + a.label() + " was rolled back during download; keeping the current bundle", nil
+	}
 	var b errBad
 	if errors.As(err, &b) {
 		u.failed = a.Digest
@@ -210,6 +216,13 @@ func (u *updater) fetch(ctx context.Context, a *wbArtifact) (string, error) {
 	u.s.switchMu.Lock()
 	defer u.s.switchMu.Unlock()
 	defer os.RemoveAll(dir)
+	st, err := readState(cfg)
+	if err != nil {
+		return "", err
+	}
+	if st.Skip == a.Digest {
+		return "", errRolledBackDuringDownload
+	}
 	version, added, err := installBundle(cfg, dir)
 	if err != nil {
 		return "", bad("%w", err)
@@ -220,7 +233,7 @@ func (u *updater) fetch(ctx context.Context, a *wbArtifact) (string, error) {
 		}
 		return "", bad("%w", err)
 	}
-	st, err := readState(cfg)
+	st, err = readState(cfg)
 	if err != nil {
 		return "", err
 	}
