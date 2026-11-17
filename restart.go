@@ -79,6 +79,8 @@ func scanRestart(r *recorder, dir string, now time.Time) error {
 		review                   []string
 		// Only a durable host action can establish an old ruling's missing effect.
 		legacyPending, legacyUnknown int
+		heldLines                    map[string]string
+		released                     map[string]bool
 	}
 	sittings := map[string]*open{}
 	var order []string
@@ -92,7 +94,7 @@ func scanRestart(r *recorder, dir string, now time.Time) error {
 			id, _ := l["sitting"].(string)
 			switch l["type"] {
 			case "sitting_start":
-				sittings[id] = &open{start: l}
+				sittings[id] = &open{start: l, heldLines: map[string]string{}, released: map[string]bool{}}
 				order = append(order, id)
 			case "sitting_end":
 				delete(sittings, id)
@@ -101,6 +103,16 @@ func scanRestart(r *recorder, dir string, now time.Time) error {
 					s.name, _ = l["name"].(string)
 					if l["verdict"] == "hold" {
 						s.held++
+						line, _ := l["id"].(string)
+						s.heldLines[line] = "hold"
+					}
+				}
+			case "rescored":
+				if s := sittings[id]; s != nil {
+					line, _ := l["id"].(string)
+					if _, held := s.heldLines[line]; held {
+						verdict, _ := l["verdict"].(string)
+						s.heldLines[line] = verdict
 					}
 				}
 			case "ruling":
@@ -133,7 +145,23 @@ func scanRestart(r *recorder, dir string, now time.Time) error {
 						s.banned = true
 					case core.ActionRelease:
 						lines, _ := l["lines"].([]any)
-						n := min(len(lines), s.legacyPending)
+						n := 0
+						for _, value := range lines {
+							line, ok := value.(string)
+							if !ok || line == "" || s.released[line] {
+								continue
+							}
+							s.released[line] = true
+							if s.heldLines[line] == "deliver" {
+								// Retire a temporary scoring hold only after its durable release.
+								delete(s.heldLines, line)
+								s.held--
+								s.freed++
+							} else {
+								n++
+							}
+						}
+						n = min(n, s.legacyPending)
 						s.kept -= n
 						s.freed += n
 						s.legacyPending -= n
@@ -221,7 +249,7 @@ func readRecordDay(name string) ([]map[string]any, error) {
 		if json.Unmarshal(sc.Bytes(), &l) != nil {
 			continue // a line cut off by a crash
 		}
-		if t, _ := l["type"].(string); slices.Contains([]string{"sitting_start", "sitting_end", "line", "ruling", "action"}, t) {
+		if t, _ := l["type"].(string); slices.Contains([]string{"sitting_start", "sitting_end", "line", "rescored", "ruling", "action"}, t) {
 			out = append(out, l)
 		}
 	}
