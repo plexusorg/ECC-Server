@@ -23,6 +23,9 @@ import (
 
 // Spec is what bundle.json states about scoring a line.
 type Spec struct {
+	ModelText struct {
+		Rule string `json:"rule"`
+	} `json:"model_text"`
 	Coverage struct {
 		Rule string `json:"rule"`
 	} `json:"coverage"`
@@ -83,14 +86,14 @@ type Spec struct {
 // RulesSHA256 is the sha256 of the rules bundle.json states in words and patterns, at the paths of Rules, as this
 // server implements them (the models' inputs here, the channels, the text preparation and the link rule in core). A
 // bundle that states other rules is refused rather than served by the wrong ones.
-const RulesSHA256 = "0b2b32a51a1ee37e441f3971b921bfdc25e0ca5b700b590cf8abcc7e91862826"
+const RulesSHA256 = "27c4a2a1efe65ca67931d8ad4a8db8a0cbd1ddd1ef376e789552a5b8327f66cf"
 
 // Rules is the paths in bundle.json of the rules RulesSHA256 covers, in order.
 var Rules = []string{"context.rule", "sh.line_string", "sh.line_tokens", "sh.slot", "sh.gap", "sh.pos", "c.roles",
 	"c.line_string", "c.input_ids", "channels", "text.rule", "text.whitespace", "text.patterns.section",
 	"text.patterns.codes", "text.patterns.url", "text.patterns.ipv4", "text.patterns.ipv6", "text.patterns.not_secure",
 	"text.patterns.icons", "text.patterns.discord_tags", "text.shown", "text.discord_name", "text.names", "text.repeat",
-	"links.pattern", "links.rule", "coverage.rule"}
+	"links.pattern", "links.rule", "coverage.rule", "model_text.rule"}
 
 // The rules that bundle.json states in words, with the numbers in them this package uses: SH keeps the first
 // shLineIDs ids of a line string, and a gap is at most maxGap.
@@ -184,6 +187,8 @@ func ReadSpec(dir string) (*Spec, error) {
 	}
 	t := s.Thresholds
 	switch {
+	case s.ModelText.Rule != core.ModelTextRule:
+		return nil, errors.New("bundle.json needs model_text.rule v3_meaning_v1")
 	case s.Coverage.Rule != CoverageRule:
 		return nil, errors.New("bundle.json needs coverage.rule complete_target_v1")
 	case s.Special.BOS == nil || s.Special.EOS == nil:

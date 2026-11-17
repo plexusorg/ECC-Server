@@ -49,6 +49,7 @@ type replayEvent struct {
 	Name          string  `json:"name"`
 	Day           string  `json:"day"`
 	CoverageRule  string  `json:"coverage_rule"`
+	ModelTextRule string  `json:"model_text_rule"`
 	CanonicalLink *string `json:"canonical_link"`
 	ID            string  `json:"id"`
 	Time          string  `json:"time"`
@@ -227,8 +228,8 @@ func readReplayEvents(path string) ([]replayEvent, error) {
 			return nil, fmt.Errorf("%s:%d: %w", path, n, err)
 		}
 		if ev.Type == "stream" {
-			if ev.CoverageRule != model.CoverageRule || ev.CanonicalLink == nil {
-				return nil, fmt.Errorf("%s:%d: stream requires canonical_link and coverage_rule %q", path, n, model.CoverageRule)
+			if ev.CoverageRule != model.CoverageRule || ev.CanonicalLink == nil || ev.ModelTextRule != core.ModelTextRule {
+				return nil, fmt.Errorf("%s:%d: stream requires model_text_rule v3_meaning_v1, canonical_link and coverage_rule %q", path, n, model.CoverageRule)
 			}
 			stream = true
 		}

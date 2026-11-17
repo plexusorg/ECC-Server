@@ -496,7 +496,7 @@ func (e *Engine) scorerLine(l Line) Line {
 		l.ID = "L" + strconv.Itoa(e.st.next+1)
 	}
 	l.Stream = e.st.name
-	l.Text = e.links.Replace(l.Text)
+	l.Text = e.links.Replace(ModelText(l.Text))
 	return l
 }
 

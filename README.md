@@ -167,15 +167,18 @@ collapsed, a link over 60 characters cut to its first 50 and `[...]`, a text ove
 rules match as the pipeline's Python patterns do (Unicode whitespace and digits, Python's case folding). A text that
 preparation empties is delivered and dropped: it is not scored and is no context. A chat name loses its codes, the
 client's `[Not Secure]` mark and its icon codes, a Discord name its tags; the judge sees the prepared shown name on chat,
-the prepared Discord name on discord and the account name on every other channel. The models, the context and the
-judge read the prepared text; the record keeps the raw text and name beside it. In the text the scorer sees, the
+the prepared Discord name on discord and the account name on every other channel. The judge reads the prepared text; the record keeps the raw text and name beside it. The models and their context
+read the model text described below. In the text the scorer sees, the
 line's and its context's, each link the allowlist allows is replaced by the bundle's `links.canonical`, the whole
 match of `links.pattern` with its scheme, port and path: an entry `host` or `host/prefix` (Module-ECC sends the list
 with `start`) allows a link whose host is the host or one of its subdomains and whose path, any case, starts with the
 prefix (punctuation after the link counts as path). The record and the judge see the link. The host keeps the last
 allowlist in `<data>/links.json` for its next start; before any `start`, no link is replaced.
 
-**Complete target coverage.** Every bundle must declare `coverage.rule: "complete_target_v1"`. For a line to score,
+**Complete target coverage.** Every bundle must declare `coverage.rule: "complete_target_v1"` and
+`model_text.rule: "v3_meaning_v1"`. For model input only, the host applies the deployed v3 Unicode normalization,
+base64 word decoding and address redaction before allowed-link replacement. The record, judge text and repeat key
+keep their prepared text. For a line to score,
 the host rejects raw text that needs a channel-length cut or URL shortening. It also rejects a target whose complete
 rendered C input cannot fit the bundle's C token budget with its three special tokens. If the complete SH line exceeds
 SH's line budget, the host sends it to C regardless of SH's score. The host checks coverage before it folds a repeat
@@ -495,7 +498,7 @@ of the recorded verdicts (Linux only). `ecc-server replay -h` describes the inpu
 each as the host does (prepared, refused, dropped, folded, links replaced, scored) and writes the format of the
 training pipeline's reference scorer (`ecc.reference`), the prepared texts, keys, token ids and features included with
 `-ids`, to check the host against it (Linux only). `ecc-server score -h` describes the formats.
-Replay input streams must declare `coverage_rule: "complete_target_v1"`. Each stream must also declare `canonical_link`, equal to the replay config. The judge folder must contain the
+Replay input streams must declare `coverage_rule: "complete_target_v1"`. Each stream must also declare `model_text_rule: "v3_meaning_v1"` and `canonical_link`, equal to the replay config. The judge folder must contain the
 producer's `allowlist.txt`. Every line must include `raw_text` and its
 `coverage` route (`cascade`, `c`, `reject`, `context`, `fold` or `dropped`). A reject must carry `verdict: "reject"`.
 Recorded replay preserves that final decision before it opens a sitting. Copies need their own coverage result;

@@ -60,7 +60,7 @@ type Verdict struct {
 }
 
 // Scorer is the fast model. It takes every line of the stream that is not a repeat, in the order the engine takes
-// them, with each link on the plugin's allowlist replaced by the canonical link: Score for a line to score, See for a
+// them, with ModelText applied and each allowed link replaced by the canonical link: Score for a line to score, See for a
 // line that is only context for later lines. It keeps the context it needs from those lines itself.
 type Scorer interface {
 	Score(line Line) (Verdict, error)

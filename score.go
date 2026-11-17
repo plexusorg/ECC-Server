@@ -154,7 +154,7 @@ func scoreLines(args []string) error {
 		keep := func() {
 			if *ids {
 				k := core.RepeatKey(l)
-				out["prepared"], out["text"], out["author"], out["repeat_key"] = l.Text, links.Replace(l.Text),
+				out["prepared"], out["text"], out["author"], out["repeat_key"] = l.Text, links.Replace(core.ModelText(l.Text)),
 					model.AuthorKey(l.Speaker), k[:]
 			}
 		}
