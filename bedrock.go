@@ -110,6 +110,7 @@ type cacheMode struct {
 }
 
 type responsesResponse struct {
+	ID     string `json:"id"`
 	Status string `json:"status"`
 	Error  *struct {
 		Code    string `json:"code"`
@@ -142,6 +143,8 @@ type responsesResponse struct {
 
 // judgeAnswer is a 200 from Bedrock. An incomplete answer is still an answer; the judge checks it.
 type judgeAnswer struct {
+	RequestID  string
+	ResponseID string
 	Status     string // "completed", "incomplete", ...
 	Incomplete string // incomplete_details.reason
 	Text       string // every output_text part of the output messages, joined
@@ -198,6 +201,8 @@ func (b *bedrock) respond(ctx context.Context, prompt string, split, maxTokens i
 	if err != nil {
 		return nil, err
 	}
+	requestID := newUUID()
+	req.Header.Set("X-Client-Request-Id", requestID)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Authorization", "Bearer "+b.key)
@@ -255,7 +260,7 @@ func (b *bedrock) respond(ctx context.Context, prompt string, split, maxTokens i
 	if out.Usage == nil {
 		return nil, &bedrockError{Status: resp.StatusCode, Message: "the answer is not a Responses answer"}
 	}
-	a := &judgeAnswer{Status: out.Status, Tier: out.ServiceTier}
+	a := &judgeAnswer{RequestID: requestID, ResponseID: out.ID, Status: out.Status, Tier: out.ServiceTier}
 	if out.IncompleteDetails != nil {
 		a.Incomplete = out.IncompleteDetails.Reason
 	}

@@ -214,7 +214,11 @@ func (r Render) text(v view, keep []int, player string) shown {
 			b.WriteString(" (sent " + strconv.Itoa(l.Sent) + " times)")
 		}
 		if mine && e.held {
-			b.WriteString(" [held]")
+			if e.released {
+				b.WriteString(" [previously cleared]")
+			} else {
+				b.WriteString(" [held]")
+			}
 		}
 		if mine {
 			for _, k := range e.kinds {

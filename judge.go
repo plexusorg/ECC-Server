@@ -47,6 +47,16 @@ type bedrockJudge struct {
 }
 
 func (j *bedrockJudge) Rule(job *core.Job) (core.Answer, error) {
+	first := job.ProvisionalBan
+	if first != nil && (first.PromptHash != job.Hash || first.PromptHash != core.PromptHash(job.Prompt)) {
+		first, job.ProvisionalBan = nil, nil
+	}
+	answer := func() core.Answer {
+		if first != nil {
+			return *first
+		}
+		return core.Answer{}
+	}
 	invalid := 0
 	var failing time.Time
 	delay := j.backoff
@@ -55,19 +65,19 @@ func (j *bedrockJudge) Rule(job *core.Job) (core.Answer, error) {
 		if err != nil {
 			if !passing(err) {
 				j.stop(err)
-				return core.Answer{}, err
+				return answer(), err
 			}
 			if failing.IsZero() {
 				failing = time.Now()
 			}
 			if time.Since(failing)+delay > j.retryFor {
-				return core.Answer{}, fmt.Errorf("%w for %s: %w", core.ErrPending, time.Since(failing).Round(time.Second), err)
+				return answer(), fmt.Errorf("%w for %s: %w", core.ErrPending, time.Since(failing).Round(time.Second), err)
 			}
 			slog.Warn("the judge's call failed; trying again", "sitting", job.Sitting, "k", job.K, "in", delay.String(),
 				"err", err.Error())
 			select {
 			case <-j.ctx.Done():
-				return core.Answer{}, j.ctx.Err()
+				return answer(), j.ctx.Err()
 			case <-time.After(delay):
 			}
 			delay *= 2
@@ -76,7 +86,18 @@ func (j *bedrockJudge) Rule(job *core.Job) (core.Answer, error) {
 		failing, delay = time.Time{}, j.backoff
 		a, err := checkAnswer(res, job.Mine, job.Cases)
 		if err == nil {
-			return a, nil
+			a.RequestID, a.ResponseID, a.PromptHash, a.Raw = res.RequestID, res.ResponseID, job.Hash, res.Text
+			if first != nil {
+				first.Confirmation = &a
+				return *first, nil
+			}
+			if a.Ruling != core.RulingBan || a.Sure == nil || !*a.Sure {
+				return a, nil
+			}
+			first = &a
+			job.ProvisionalBan = first
+			invalid = 0
+			continue
 		}
 		invalid++
 		slog.Warn("the judge's answer is invalid", "sitting", job.Sitting, "k", job.K, "answer", invalid, "why", err.Error())
@@ -84,7 +105,7 @@ func (j *bedrockJudge) Rule(job *core.Job) (core.Answer, error) {
 			j.stopped("invalid_answers", fmt.Sprintf("ECC: the judge's answer was invalid %d times on one checkpoint "+
 				"(the last: %s). Its held lines stay held and its sitting goes to the review queue.", invalid,
 				truncate(err.Error(), 160)))
-			return core.Answer{}, fmt.Errorf("the judge's answer was invalid %d times: %w", invalid, err)
+			return answer(), fmt.Errorf("the judge's answer was invalid %d times: %w", invalid, err)
 		}
 	}
 }
@@ -124,8 +145,11 @@ func passing(err error) bool {
 	return true
 }
 
-// judgeCall is the record's line for one call: no prompt or answer text.
+// judgeCall records each charged attempt and its raw model answer in the private record.
 type judgeCall struct {
+	RequestID   string      `json:"request_id,omitempty"`
+	ResponseID  string      `json:"response_id,omitempty"`
+	Raw         string      `json:"raw,omitempty"`
 	Time        string      `json:"time"`
 	Sitting     string      `json:"sitting"`
 	K           int         `json:"k"`
@@ -180,6 +204,7 @@ func (j *bedrockJudge) call(job *core.Job, attempt int) (*judgeAnswer, error) {
 		PromptBytes: len(job.Prompt), USD: cost, Seconds: took.Seconds()}
 	if res != nil {
 		rec.Status, rec.Incomplete, rec.Tier, rec.Usage = res.Status, res.Incomplete, res.Tier, &res.Usage
+		rec.RequestID, rec.ResponseID, rec.Raw = res.RequestID, res.ResponseID, res.Text
 	}
 	if err != nil {
 		rec.Error = err.Error()

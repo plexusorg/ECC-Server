@@ -63,8 +63,11 @@ type Job struct {
 	// owner's cases the prompt lists.
 	Mine  []string
 	Cases int
-	end   int
-	day   string
+	// ProvisionalBan belongs to the judge driver while this exact job waits for confirmation.
+	// It is host state, not model JSON. Dropping the job drops this state.
+	ProvisionalBan *Answer `json:"-"`
+	end            int
+	day            string
 }
 
 // Result is what one call to the engine produced.
@@ -102,13 +105,14 @@ type sitting struct {
 	parked  bool
 	retryAt time.Time
 	// unknown counts the player's lines on channels outside Config.Channels.
-	unknown     int
-	banned      bool
-	banLine     string
-	warned      bool
-	unjudged    bool
-	ending      bool
-	checkpoints []CheckpointRecord
+	unknown       int
+	banned        bool
+	banLine       string
+	warned        bool
+	unjudged      bool
+	ending        bool
+	reviewReasons []string
+	checkpoints   []CheckpointRecord
 }
 
 // Engine is the decision core. It is not safe for concurrent use; the server calls it under one lock.
@@ -262,12 +266,14 @@ type CheckpointRecord struct {
 }
 
 type RulingRecord struct {
-	Time    string `json:"time"`
-	Sitting string `json:"sitting"`
-	K       int    `json:"k"`
-	Hash    string `json:"sha256"`
-	Answer  Answer `json:"answer"`
-	Error   string `json:"error,omitempty"`
+	Time      string `json:"time"`
+	Sitting   string `json:"sitting"`
+	K         int    `json:"k"`
+	Hash      string `json:"sha256"`
+	Answer    Answer `json:"answer"`
+	Effective string `json:"effective,omitempty"`
+	Review    string `json:"review,omitempty"`
+	Error     string `json:"error,omitempty"`
 	// Pending: the judge could not be reached; the checkpoint is put again at Retry.
 	Pending bool   `json:"pending,omitempty"`
 	Retry   string `json:"retry,omitempty"`
@@ -898,7 +904,7 @@ func (e *Engine) Rule(job *Job, a Answer, err error) Result {
 	switch {
 	case err != nil:
 		rr.Error = err.Error()
-		if errors.Is(err, ErrNotSent) {
+		if errors.Is(err, ErrNotSent) && a.RequestID == "" {
 			e.calls[job.day]--
 		}
 		s.unjudged = true
@@ -906,7 +912,15 @@ func (e *Engine) Rule(job *Job, a Answer, err error) Result {
 		rr.Error = fmt.Sprintf("the judge answered %q", a.Ruling)
 		s.unjudged = true
 	default:
-		ruling = a.Ruling
+		ruling, rr.Review = a.effect(job)
+		rr.Effective = ruling
+		if rr.Review != "" {
+			if !slices.Contains(s.reviewReasons, rr.Review) {
+				s.reviewReasons = append(s.reviewReasons, rr.Review)
+			}
+			e.rec.Record("review", ReviewRecord{Time: stamp(e.now), Sitting: s.id, Account: s.account,
+				Name: s.name, Why: rr.Review})
+		}
 		covered := s.held[s.ruled:job.K]
 		s.ruled = job.K
 		rr.Covers = len(covered)
@@ -933,7 +947,7 @@ func (e *Engine) Rule(job *Job, a Answer, err error) Result {
 			}
 		case RulingHold:
 			s.kept += len(covered)
-			if !s.warned {
+			if rr.Review == "" && !s.warned {
 				s.warned = true
 				r.Actions = append(r.Actions, Action{Kind: ActionWarn, Account: s.account, Speaker: s.speaker, Sitting: s.id})
 			}
@@ -1028,7 +1042,7 @@ func (e *Engine) closeSitting(s *sitting) {
 	case len(s.released) > 0:
 		out = OutcomeReleased
 	}
-	var why []string
+	why := slices.Clone(s.reviewReasons)
 	switch {
 	case s.banned:
 		why = append(why, "ban")

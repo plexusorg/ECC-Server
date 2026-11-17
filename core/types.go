@@ -89,6 +89,42 @@ type Answer struct {
 	By    string   `json:"by,omitempty"`
 	Like  []string `json:"like,omitempty"`
 	Sure  *bool    `json:"sure,omitempty"`
+	// TrustedHuman is set only by a trusted driver, never from a saved model answer.
+	TrustedHuman bool    `json:"-"`
+	RequestID    string  `json:"request_id,omitempty"`
+	ResponseID   string  `json:"response_id,omitempty"`
+	PromptHash   string  `json:"prompt_sha256,omitempty"`
+	Raw          string  `json:"raw,omitempty"`
+	Confirmation *Answer `json:"confirmation,omitempty"`
+}
+
+// effect separates the model's diagnostic answer from the host's enforcement.
+func (a Answer) effect(job *Job) (string, string) {
+	if a.TrustedHuman {
+		return a.Ruling, ""
+	}
+	if a.Sure == nil || !*a.Sure {
+		return RulingHold, "the judge was not firm"
+	}
+	if a.Ruling != RulingBan {
+		return a.Ruling, ""
+	}
+	b := a.Confirmation
+	if b == nil {
+		return RulingHold, "the ban has no independent confirmation"
+	}
+	if b.Sure == nil || !*b.Sure {
+		return RulingHold, "the ban confirmation was not firm"
+	}
+	if b.Ruling != RulingBan {
+		return RulingHold, "the firm judge rulings disagree"
+	}
+	if a.RequestID == "" || b.RequestID == "" || a.RequestID == b.RequestID ||
+		a.ResponseID == "" || b.ResponseID == "" || a.ResponseID == b.ResponseID ||
+		a.PromptHash != job.Hash || b.PromptHash != job.Hash {
+		return RulingHold, "the ban confirmation has no independent response on this prompt"
+	}
+	return RulingBan, ""
 }
 
 // Judge rules one checkpoint: its Prompt, with Mine and Cases to check the answer against.
