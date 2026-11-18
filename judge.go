@@ -18,7 +18,7 @@ import (
 // The judge's retries. An invalid answer is asked again, up to judgeAttempts answers. A call that fails (throttling,
 // a server error, a response whose status is failed or cancelled, a timeout, the network) is made again after judgeBackoff, doubling each time, while the failures
 // have lasted less than judgeRetryFor; then the checkpoint is pending and the core puts it again judgeRetryAfter
-// later, until the sitting ends. A call the budget refuses, or one Bedrock refuses for the key (401, 403) or as a bad
+// later, until the session ends. A call the budget refuses, or one Bedrock refuses for the key (401, 403) or as a bad
 // request, is not made again. The rig sets shorter times ([test]).
 const (
 	judgeAttempts   = 3
@@ -73,7 +73,7 @@ func (j *bedrockJudge) Rule(job *core.Job) (core.Answer, error) {
 			if time.Since(failing)+delay > j.retryFor {
 				return answer(), fmt.Errorf("%w for %s: %w", core.ErrPending, time.Since(failing).Round(time.Second), err)
 			}
-			slog.Warn("the judge's call failed; trying again", "sitting", job.Sitting, "k", job.K, "in", delay.String(),
+			slog.Warn("the judge's call failed; trying again", "session", job.Session, "k", job.K, "in", delay.String(),
 				"err", err.Error())
 			select {
 			case <-j.ctx.Done():
@@ -100,10 +100,10 @@ func (j *bedrockJudge) Rule(job *core.Job) (core.Answer, error) {
 			continue
 		}
 		invalid++
-		slog.Warn("the judge's answer is invalid", "sitting", job.Sitting, "k", job.K, "answer", invalid, "why", err.Error())
+		slog.Warn("the judge's answer is invalid", "session", job.Session, "k", job.K, "answer", invalid, "why", err.Error())
 		if invalid == judgeAttempts {
 			j.stopped("invalid_answers", fmt.Sprintf("ECC: the judge's answer was invalid %d times on one checkpoint "+
-				"(the last: %s). Its held lines stay held and its sitting goes to the review queue.", invalid,
+				"(the last: %s). Its held lines stay held and its session goes to the review queue.", invalid,
 				truncate(err.Error(), 160)))
 			return answer(), fmt.Errorf("the judge's answer was invalid %d times: %w", invalid, err)
 		}
@@ -113,7 +113,7 @@ func (j *bedrockJudge) Rule(job *core.Job) (core.Answer, error) {
 // errNoKey: no Bedrock key is set.
 var errNoKey = errors.New("no Bedrock key is set; set one with sudo ecc-server bedrock login")
 
-const stillHeld = "Held lines stay held and their sittings go to the review queue."
+const stillHeld = "Held lines stay held and their sessions go to the review queue."
 
 // stop tells staff why a call that is not made again stopped judging: no key, the key or the request refused. The
 // budget's notice is sent by call; the host stopping sends none.
@@ -151,7 +151,7 @@ type judgeCall struct {
 	ResponseID  string      `json:"response_id,omitempty"`
 	Raw         string      `json:"raw,omitempty"`
 	Time        string      `json:"time"`
-	Sitting     string      `json:"sitting"`
+	Session     string      `json:"session"`
 	K           int         `json:"k"`
 	Hash        string      `json:"sha256"`
 	Attempt     int         `json:"attempt"`
@@ -181,7 +181,7 @@ func (j *bedrockJudge) call(job *core.Job, attempt int) (*judgeAnswer, error) {
 			slog.Error("the judge's budget is used up; held lines wait for review", "budget", over.period,
 				"usd", fmt.Sprintf("%.2f", over.budget))
 			j.stopped("budget", fmt.Sprintf("ECC: the judge's %s budget of $%.2f is used up. Until %s, held lines "+
-				"stay held and their sittings go to the review queue.", over.period, over.budget, until))
+				"stay held and their sessions go to the review queue.", over.period, over.budget, until))
 		}
 		return nil, fmt.Errorf("%w: %w", core.ErrNotSent, err)
 	}
@@ -200,7 +200,7 @@ func (j *bedrockJudge) call(job *core.Job, attempt int) (*judgeAnswer, error) {
 	j.spend.settle(r, cost)
 	took := time.Since(start)
 	j.br.record(err, len(job.Prompt), res, cost, took)
-	rec := judgeCall{Time: stamp(time.Now()), Sitting: job.Sitting, K: job.K, Hash: job.Hash, Attempt: attempt,
+	rec := judgeCall{Time: stamp(time.Now()), Session: job.Session, K: job.K, Hash: job.Hash, Attempt: attempt,
 		PromptBytes: len(job.Prompt), USD: cost, Seconds: took.Seconds()}
 	if res != nil {
 		rec.Status, rec.Incomplete, rec.Tier, rec.Usage = res.Status, res.Incomplete, res.Tier, &res.Usage

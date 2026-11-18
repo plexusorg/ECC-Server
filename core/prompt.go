@@ -15,8 +15,8 @@ import (
 type entry struct {
 	pos  int
 	line Line
-	// sitting is the sitting whose player said the line ("" for a context line).
-	sitting string
+	// session is the session whose player said the line ("" for a context line).
+	session string
 	held    bool
 	kinds   []string
 	// verdict is the line's verdict; released marks a held line a ruling delivered.
@@ -33,7 +33,7 @@ type lineRef struct {
 	n   int
 }
 
-// stream is every line since the game server started, in arrival order, numbered from 0. Lines no open sitting can
+// stream is every line since the game server started, in arrival order, numbered from 0. Lines no open session can
 // show any more are dropped; of a private conversation the last Window.Before lines before the drop point are kept,
 // since a private line's window counts that conversation's lines only.
 type stream struct {
@@ -64,7 +64,7 @@ func (s *stream) get(p int) *entry {
 	}
 	e := s.kept[p]
 	if e == nil {
-		panic(fmt.Sprintf("stream %s: line %d was dropped while a sitting could show it", s.name, p))
+		panic(fmt.Sprintf("stream %s: line %d was dropped while a session could show it", s.name, p))
 	}
 	return e
 }
@@ -98,12 +98,12 @@ func (s *stream) prune(from, tail int) {
 	s.base = from
 }
 
-// Render holds how a checkpoint's sitting is shown to the judge.
+// Render holds how a checkpoint's session is shown to the judge.
 type Render struct {
 	// Lines before and after each of the player's marked lines that the judge sees.
 	Before int `toml:"before"`
 	After  int `toml:"after"`
-	// A sitting longer than MaxChars characters is cut: the held lines' windows only, then the held lines' with
+	// A session longer than MaxChars characters is cut: the held lines' windows only, then the held lines' with
 	// CutBefore and CutAfter, then as many held lines spread evenly as fit.
 	MaxChars  int `toml:"max_chars"`
 	CutBefore int `toml:"cut_before"`
@@ -114,10 +114,10 @@ type Render struct {
 
 var errTooLong = errors.New("one held line does not fit in the case's size")
 
-// view is a sitting as of one line of the stream: what a checkpoint at that line shows.
+// view is a session as of one line of the stream: what a checkpoint at that line shows.
 type view struct {
 	st      *stream
-	sitting string
+	session string
 	end     int   // the last position shown
 	mine    []int // the player's lines up to end
 	held    []int // of them, the held ones
@@ -191,7 +191,7 @@ func (r Render) text(v view, keep []int, player string) shown {
 			b.WriteString("···\n")
 		}
 		last = p
-		mine := e.sitting != "" && e.sitting == v.sitting
+		mine := e.session != "" && e.session == v.session
 		if mine {
 			b.WriteString(">> ")
 			ids = append(ids, e.line.ID)

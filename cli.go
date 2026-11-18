@@ -128,7 +128,7 @@ func bedrockLogin(cfg Config) error {
 }
 
 // status prints the bundle a running host serves, its health, its W&B updates, its judge calls, the judge's spend
-// and its sittings.
+// and its sessions.
 func status(cfg Config) error {
 	token, err := readToken(cfg)
 	if err != nil {
@@ -198,9 +198,9 @@ func status(cfg Config) error {
 		fmt.Printf("; $%.4f of it reserved for calls in flight", sp.ReservedUSD)
 	}
 	fmt.Println()
-	st := h.Sittings
-	fmt.Printf("sittings: %d open, %d held lines unruled, %d judge calls in flight, %d checkpoints pending\n",
-		st.Sittings, st.Unruled, st.InFlight, st.Pending)
+	st := h.Sessions
+	fmt.Printf("sessions: %d open, %d held lines unruled, %d judge calls in flight, %d checkpoints pending\n",
+		st.Sessions, st.Unruled, st.InFlight, st.Pending)
 	for c, n := range st.UnknownChannels {
 		fmt.Printf("lines on a channel this server does not know: %s %d\n", c, n)
 	}

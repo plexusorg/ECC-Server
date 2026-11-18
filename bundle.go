@@ -36,17 +36,17 @@ type Bundle struct {
 		// question.md (the prompt's fixed strings, in a JSON block) and examples.json (the owner's cases).
 		Question string `json:"question"`
 		Examples string `json:"examples"`
-		// Checkpoints: after these held-line counts of a sitting, then every Every-th; when a held line has waited
-		// WaitSeconds; a sitting ends SittingEndSeconds after the player's leave; a sitting that ends with ReviewHeld
+		// Checkpoints: after these held-line counts of a session, then every Every-th; when a held line has waited
+		// WaitSeconds; a session ends SessionEndSeconds after the player's leave; a session that ends with ReviewHeld
 		// held lines goes on the review queue.
 		Checkpoints struct {
 			Schedule          []int `json:"schedule"`
 			Every             int   `json:"every"`
 			WaitSeconds       int   `json:"wait_seconds"`
-			SittingEndSeconds int   `json:"sitting_end_seconds"`
+			SessionEndSeconds int   `json:"session_end_seconds"`
 			ReviewHeld        int   `json:"review_held"`
 		} `json:"checkpoints"`
-		// Render: how a sitting is shown to the judge (core.Render).
+		// Render: how a session is shown to the judge (core.Render).
 		Render struct {
 			Before    int               `json:"before"`
 			After     int               `json:"after"`
@@ -142,8 +142,8 @@ func loadBundle(dir string) (*Bundle, error) {
 	}
 	cp, r := b.Judge.Checkpoints, b.Judge.Render
 	switch {
-	case len(cp.Schedule) == 0 || cp.Every < 0 || cp.WaitSeconds < 0 || cp.SittingEndSeconds < 1 || cp.ReviewHeld < 0:
-		return bad("judge.checkpoints needs schedule, every, wait_seconds, sitting_end_seconds and review_held")
+	case len(cp.Schedule) == 0 || cp.Every < 0 || cp.WaitSeconds < 0 || cp.SessionEndSeconds < 1 || cp.ReviewHeld < 0:
+		return bad("judge.checkpoints needs schedule, every, wait_seconds, session_end_seconds and review_held")
 	case r.Before < 0 || r.After < 0 || r.MaxChars < 1 || r.CutBefore < 0 || r.CutAfter < 0:
 		return bad("judge.render needs before, after, max_chars, cut_before and cut_after")
 	case strings.TrimSpace(b.Links.Canonical) == "":
@@ -260,7 +260,7 @@ func coreConfig(cfg Config, b *Bundle) core.Config {
 	cp, r := b.Judge.Checkpoints, b.Judge.Render
 	sec := func(n int) time.Duration { return time.Duration(n) * time.Second }
 	c := core.Config{Schedule: cp.Schedule, Every: cp.Every, Wait: sec(cp.WaitSeconds),
-		SittingEnd: sec(cp.SittingEndSeconds), ReviewHeld: cp.ReviewHeld,
+		SessionEnd: sec(cp.SessionEndSeconds), ReviewHeld: cp.ReviewHeld,
 		Render: core.Render{Before: r.Before, After: r.After, MaxChars: r.MaxChars, CutBefore: r.CutBefore,
 			CutAfter: r.CutAfter, Kinds: r.Kinds},
 		CanonicalLink: b.Links.Canonical, MaxPromptChars: cfg.Budget.MaxPromptChars,

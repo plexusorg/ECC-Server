@@ -53,11 +53,11 @@ func (r *recorder) Record(kind string, v any) {
 	}
 }
 
-// restartEnd is the end the restart scan records for a sitting the previous run left open.
+// restartEnd is the end the restart scan records for a session the previous run left open.
 type restartEnd struct {
 	Time    string `json:"time"`
 	Stream  string `json:"stream"`
-	Sitting string `json:"sitting"`
+	Session string `json:"session"`
 	Account string `json:"account"`
 	Start   string `json:"start"`
 	Held    int    `json:"held"`
@@ -67,7 +67,7 @@ type restartEnd struct {
 	EndedBy string `json:"ended_by"`
 }
 
-// scanRestart ends the sittings the previous run left open. It recovers host outcomes and review reasons from the
+// scanRestart ends the sessions the previous run left open. It recovers host outcomes and review reasons from the
 // last two days' record. Historical rulings without an effective outcome need durable action evidence; otherwise
 // their lines stay held for review. The scan records each end and sends no actions.
 func scanRestart(r *recorder, dir string, now time.Time) error {
@@ -82,7 +82,7 @@ func scanRestart(r *recorder, dir string, now time.Time) error {
 		heldLines                    map[string]string
 		released                     map[string]bool
 	}
-	sittings := map[string]*open{}
+	sessions := map[string]*open{}
 	var order []string
 	for _, day := range []time.Time{now.AddDate(0, 0, -1), now} {
 		name := filepath.Join(dir, day.UTC().Format(time.DateOnly)+".jsonl")
@@ -91,15 +91,15 @@ func scanRestart(r *recorder, dir string, now time.Time) error {
 			return err
 		}
 		for _, l := range lines {
-			id, _ := l["sitting"].(string)
+			id, _ := l["session"].(string)
 			switch l["type"] {
-			case "sitting_start":
-				sittings[id] = &open{start: l, heldLines: map[string]string{}, released: map[string]bool{}}
+			case "session_start":
+				sessions[id] = &open{start: l, heldLines: map[string]string{}, released: map[string]bool{}}
 				order = append(order, id)
-			case "sitting_end":
-				delete(sittings, id)
+			case "session_end":
+				delete(sessions, id)
 			case "line":
-				if s := sittings[id]; s != nil {
+				if s := sessions[id]; s != nil {
 					s.name, _ = l["name"].(string)
 					if l["verdict"] == "hold" {
 						s.held++
@@ -108,7 +108,7 @@ func scanRestart(r *recorder, dir string, now time.Time) error {
 					}
 				}
 			case "rescored":
-				if s := sittings[id]; s != nil {
+				if s := sessions[id]; s != nil {
 					line, _ := l["id"].(string)
 					if _, held := s.heldLines[line]; held {
 						verdict, _ := l["verdict"].(string)
@@ -116,7 +116,7 @@ func scanRestart(r *recorder, dir string, now time.Time) error {
 					}
 				}
 			case "ruling":
-				if s := sittings[id]; s != nil {
+				if s := sessions[id]; s != nil {
 					covers, _ := l["covers"].(float64)
 					n := int(covers)
 					s.ruled += n
@@ -139,7 +139,7 @@ func scanRestart(r *recorder, dir string, now time.Time) error {
 					}
 				}
 			case "action":
-				if s := sittings[id]; s != nil {
+				if s := sessions[id]; s != nil {
 					switch l["kind"] {
 					case core.ActionBan:
 						s.banned = true
@@ -176,13 +176,13 @@ func scanRestart(r *recorder, dir string, now time.Time) error {
 	}
 	at := stamp(now)
 	for _, id := range order {
-		s := sittings[id]
+		s := sessions[id]
 		if s == nil {
 			continue
 		}
-		sittings[id] = nil
+		sessions[id] = nil
 		str := func(k string) string { v, _ := s.start[k].(string); return v }
-		e := restartEnd{Time: at, Stream: str("stream"), Sitting: id, Account: str("account"), Start: str("time"),
+		e := restartEnd{Time: at, Stream: str("stream"), Session: id, Account: str("account"), Start: str("time"),
 			Held: s.held, Unruled: s.held - s.ruled, EndedBy: "restart"}
 		switch {
 		case s.banned:
@@ -206,10 +206,10 @@ func scanRestart(r *recorder, dir string, now time.Time) error {
 			}
 		}
 		e.Review = strings.Join(why, "; ")
-		r.Record("sitting_end", e)
+		r.Record("session_end", e)
 		if e.Review != "" {
-			r.Record("review", core.ReviewRecord{Time: at, Sitting: id, Account: e.Account, Name: s.name, Why: e.Review})
-			slog.Warn("a sitting the previous run left open goes on the review queue", "sitting", id,
+			r.Record("review", core.ReviewRecord{Time: at, Session: id, Account: e.Account, Name: s.name, Why: e.Review})
+			slog.Warn("a session the previous run left open goes on the review queue", "session", id,
 				"unruled", e.Unruled)
 		}
 	}
@@ -249,7 +249,7 @@ func readRecordDay(name string) ([]map[string]any, error) {
 		if json.Unmarshal(sc.Bytes(), &l) != nil {
 			continue // a line cut off by a crash
 		}
-		if t, _ := l["type"].(string); slices.Contains([]string{"sitting_start", "sitting_end", "line", "rescored", "ruling", "action"}, t) {
+		if t, _ := l["type"].(string); slices.Contains([]string{"session_start", "session_end", "line", "rescored", "ruling", "action"}, t) {
 			out = append(out, l)
 		}
 	}

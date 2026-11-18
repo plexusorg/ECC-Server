@@ -25,7 +25,7 @@ const replayUsage = `ecc-server replay -config FILE -lines FILE -fold DIR -out D
 
 Feeds recorded lines through the decision core on a virtual clock, with the fast model's recorded verdicts (or, with
 -bundle, the bundle's models scoring every line) and the judge's saved answers, and writes the record, one line per
-sitting and a summary to DIR. The core's timers run at their time; a ruling arrives -judge-delay after its checkpoint
+session and a summary to DIR. The core's timers run at their time; a ruling arrives -judge-delay after its checkpoint
 (after the call is put, for a call that waited for another), as an event of its own, the lines before it handled
 first.
 
@@ -33,12 +33,12 @@ first.
   -lines   the lines, one JSON event a line: {"type":"stream", "name", "day"}, {"type":"line",...} or
            {"type":"presence", "kind": "join"|"leave", "account", "time"}; text and names prepared
   -fold    question.md, format.md, allowlist.txt, cases.json, answers.json (sha256 of the prompt -> answer), expected.json
-  -mode    parity: sittings and the sitting-end checkpoint as the lines name them, no waiting-time or every-n-th
-           checkpoint, rulings at once (as the measured replay ruled); checkpoints of sittings not in
-           expected.json's judged_sittings are built and not sent, and a prompt with no saved answer stops the replay
+  -mode    parity: sessions and the session-end checkpoint as the lines name them, no waiting-time or every-n-th
+           checkpoint, rulings at once (as the measured replay ruled); checkpoints of sessions not in
+           expected.json's judged_sessions are built and not sent, and a prompt with no saved answer stops the replay
            (with -keep-going it is counted and its lines stay held).
-  -dump    writes every judge call's sitting, held count, sha256 and the prompt from the new case on, one JSON a line
-           live: sittings from presence and silence, the waiting-time checkpoint; a prompt with no saved answer is
+  -dump    writes every judge call's session, held count, sha256 and the prompt from the new case on, one JSON a line
+           live: sessions from presence and silence, the waiting-time checkpoint; a prompt with no saved answer is
            counted and its lines stay held.
 `
 
@@ -67,7 +67,7 @@ type replayEvent struct {
 	Sent     int      `json:"sent"`
 	Trusted  bool     `json:"trusted"`
 	Context  bool     `json:"context"`
-	Sitting  string   `json:"sitting"`
+	Session  string   `json:"session"`
 	Verdict  string   `json:"verdict"`
 	Coverage string   `json:"coverage"`
 	Kinds    []string `json:"kinds"`
@@ -88,13 +88,13 @@ func (ev replayEvent) ref() string {
 
 // coreLine is the input's line: its text and names prepared already. The repeat key is made as the server makes it,
 // from the raw text and shown name when the input has them, else from the prepared ones.
-func (ev replayEvent) coreLine(t time.Time, sitting string) core.Line {
+func (ev replayEvent) coreLine(t time.Time, session string) core.Line {
 	account := strings.TrimPrefix(ev.Speaker, "discord:")
 	l := core.Line{ID: ev.ID, Ref: ev.ref(), Time: t, Channel: ev.Channel, Conversation: ev.Conversation,
 		Private: ev.Private, Account: ev.Account, Name: ev.Shown, Speaker: ev.Speaker, RawName: ev.Shown,
 		TargetAccount: ev.TargetAccount, Target: ev.Target, Text: ev.Text, Raw: ev.Text, Key: ev.Text,
 		KeyName: core.KeyName(ev.Channel, ev.Shown, account), Sent: ev.Sent, Context: ev.Context || ev.Trusted || ev.Channel == "discord",
-		Sitting: sitting}
+		Session: session}
 	if ev.RawText != nil {
 		l.Raw = *ev.RawText
 		l.Key, _ = core.PrepareText(l.Raw, ev.Channel)
@@ -133,8 +133,8 @@ type expectedOutcome struct {
 
 type expected struct {
 	Prompts         map[string]string          `json:"prompts"`
-	JudgedSittings  []string                   `json:"judged_sittings"`
-	ExampleSittings []string                   `json:"example_sittings"`
+	JudgedSessions  []string                   `json:"judged_sessions"`
+	ExampleSessions []string                   `json:"example_sessions"`
 	Outcomes        map[string]expectedOutcome `json:"outcomes"`
 }
 
@@ -180,11 +180,11 @@ func (j *savedJudge) Rule(job *core.Job) (core.Answer, error) {
 	return core.Answer{Ruling: a.Ruling, By: a.By, Like: a.Like, Sure: a.Sure}, nil
 }
 
-// replayRecorder writes the record and keeps the checkpoints and sitting ends for the comparison.
+// replayRecorder writes the record and keeps the checkpoints and session ends for the comparison.
 type replayRecorder struct {
 	w        *bufio.Writer
 	err      error
-	sittings []core.SittingRecord
+	sessions []core.SessionRecord
 	actions  map[string]int
 	reviews  int
 	repeats  int
@@ -200,8 +200,8 @@ func (r *replayRecorder) Record(kind string, v any) {
 		_, r.err = fmt.Fprintf(r.w, "{\"type\":%q,%s\n", kind, body[1:])
 	}
 	switch x := v.(type) {
-	case core.SittingRecord:
-		r.sittings = append(r.sittings, x)
+	case core.SessionRecord:
+		r.sessions = append(r.sessions, x)
 	case core.Action:
 		r.actions[x.Kind]++
 	case core.ReviewRecord:
@@ -300,10 +300,10 @@ func replay(args []string) error {
 	cfg := rc.Core
 	delay := *judgeDelay
 	if parity {
-		cfg.DriverSittings, cfg.LastHeldView, cfg.Wait, cfg.Every = true, true, 0, 0
+		cfg.DriverSessions, cfg.LastHeldView, cfg.Wait, cfg.Every = true, true, 0, 0
 		delay = 0
 	} else {
-		cfg.DriverSittings, cfg.LastHeldView = false, false
+		cfg.DriverSessions, cfg.LastHeldView = false, false
 	}
 
 	var texts core.Texts
@@ -387,14 +387,14 @@ func replay(args []string) error {
 	}
 
 	judged := map[string]bool{}
-	for _, s := range exp.JudgedSittings {
+	for _, s := range exp.JudgedSessions {
 		judged[s] = true
 	}
-	// parity: the index of each sitting's last line, after which the sitting ends
+	// parity: the index of each session's last line, after which the session ends
 	lastOf := map[string]int{}
 	for i, ev := range events {
-		if ev.Type == "line" && ev.Sitting != "" {
-			lastOf[ev.Sitting] = i
+		if ev.Type == "line" && ev.Session != "" {
+			lastOf[ev.Session] = i
 		}
 	}
 
@@ -413,15 +413,15 @@ func replay(args []string) error {
 		for _, j := range r.Jobs {
 			p := ruling{job: j, due: later(j.At, at).Add(delay)}
 			if dump != nil {
-				dump.Encode(map[string]any{"sitting": j.Sitting, "k": j.K, "sha256": j.Hash, "case": j.Prompt[j.Split:]})
+				dump.Encode(map[string]any{"session": j.Session, "k": j.K, "sha256": j.Hash, "case": j.Prompt[j.Split:]})
 			}
-			if parity && !judged[j.Sitting] {
+			if parity && !judged[j.Session] {
 				notSent++
 				p.due, p.err = later(j.At, at), core.ErrNotSent
 			} else {
 				p.a, p.err = judge.Rule(j)
 				if p.err != nil && parity && !*keepGoing && stop == nil {
-					stop = fmt.Errorf("checkpoint %s#%d (sha256 %s): %w", j.Sitting, j.K, j.Hash, p.err)
+					stop = fmt.Errorf("checkpoint %s#%d (sha256 %s): %w", j.Session, j.K, j.Hash, p.err)
 				}
 			}
 			i := sort.Search(len(pending), func(i int) bool { return pending[i].due.After(p.due) })
@@ -488,7 +488,7 @@ func replay(args []string) error {
 			if *bundle != "" && ev.Speaker == "" {
 				return fmt.Errorf("line %s has no speaker, which the models need", ev.ID)
 			}
-			sit := ev.Sitting
+			sit := ev.Session
 			if !parity {
 				sit = ""
 			}
@@ -508,9 +508,9 @@ func replay(args []string) error {
 				}
 			}
 			put(result, t)
-			if parity && ev.Sitting != "" && lastOf[ev.Sitting] == i {
+			if parity && ev.Session != "" && lastOf[ev.Session] == i {
 				until(t)
-				put(eng.End(ev.Sitting, t), t)
+				put(eng.End(ev.Session, t), t)
 			}
 		default:
 			return fmt.Errorf("unknown event type %q", ev.Type)
@@ -536,13 +536,13 @@ func replay(args []string) error {
 		return rec.err
 	}
 
-	sf, err := os.Create(filepath.Join(*outDir, "sittings.jsonl"))
+	sf, err := os.Create(filepath.Join(*outDir, "sessions.jsonl"))
 	if err != nil {
 		return err
 	}
 	defer sf.Close()
 	sw := bufio.NewWriter(sf)
-	for _, s := range rec.sittings {
+	for _, s := range rec.sessions {
 		b, _ := json.Marshal(s)
 		sw.Write(append(b, '\n'))
 	}
@@ -567,7 +567,7 @@ func later(a, b time.Time) time.Time {
 	return a
 }
 
-// parityHeldSets is each input sitting's held lines, keyed as summarize keys a replayed sitting's.
+// parityHeldSets is each input session's held lines, keyed as summarize keys a replayed session's.
 func parityHeldSets(events []replayEvent) map[string]bool {
 	by := map[string][]string{}
 	stream := map[string]string{}
@@ -578,8 +578,8 @@ func parityHeldSets(events []replayEvent) map[string]bool {
 			continue
 		}
 		if ev.Verdict == "hold" && !ev.Trusted {
-			by[ev.Sitting] = append(by[ev.Sitting], ev.ID)
-			stream[ev.Sitting] = cur
+			by[ev.Session] = append(by[ev.Session], ev.ID)
+			stream[ev.Session] = cur
 		}
 	}
 	out := map[string]bool{}
@@ -591,8 +591,8 @@ func parityHeldSets(events []replayEvent) map[string]bool {
 
 type replaySummary struct {
 	Mode         string         `json:"mode"`
-	Sittings     int            `json:"sittings"`
-	WithHeld     int            `json:"sittings_with_a_held_line"`
+	Sessions     int            `json:"sessions"`
+	WithHeld     int            `json:"sessions_with_a_held_line"`
 	Outcomes     map[string]int `json:"outcomes"`
 	Checkpoints  map[string]int `json:"checkpoints_by_reason"`
 	PromptsBuilt int            `json:"prompts_built"`
@@ -652,12 +652,12 @@ func checkCopies(events []replayEvent, folded map[string]string) *copyCheck {
 type parityResult struct {
 	PromptsCompared   int      `json:"prompts_compared"`
 	PromptsEqual      int      `json:"prompts_equal"`
-	PromptsOfExamples int      `json:"prompts_of_example_sittings"`
+	PromptsOfExamples int      `json:"prompts_of_example_sessions"`
 	PromptDiffs       []string `json:"prompt_differences"`
 	MissingCheckpoint []string `json:"python_checkpoints_not_built"`
-	SittingsCompared  int      `json:"sittings_compared"`
-	SittingsEqual     int      `json:"sittings_equal"`
-	SittingDiffs      []string `json:"sitting_differences"`
+	SessionsCompared  int      `json:"sessions_compared"`
+	SessionsEqual     int      `json:"sessions_equal"`
+	SessionDiffs      []string `json:"session_differences"`
 }
 
 type liveResult struct {
@@ -666,17 +666,17 @@ type liveResult struct {
 	DifferentText    int `json:"checkpoints_whose_text_differs"`
 	WithAnswer       int `json:"checkpoints_with_a_saved_answer"`
 	WithoutAnswer    int `json:"checkpoints_without_a_saved_answer"`
-	// live sittings with a held line whose held lines are exactly one parity sitting's, and the others
-	SameHeldLines  int `json:"sittings_holding_one_parity_sittings_lines"`
-	OtherHeldLines int `json:"sittings_holding_other_sets"`
+	// live sessions with a held line whose held lines are exactly one parity session's, and the others
+	SameHeldLines  int `json:"sessions_holding_one_parity_sessions_lines"`
+	OtherHeldLines int `json:"sessions_holding_other_sets"`
 }
 
 func summarize(mode string, rec *replayRecorder, judge *savedJudge, notSent int, exp expected,
 	answers map[string]savedAnswer, pyHeld map[string]bool) replaySummary {
-	s := replaySummary{Mode: mode, Sittings: len(rec.sittings), Outcomes: map[string]int{},
+	s := replaySummary{Mode: mode, Sessions: len(rec.sessions), Outcomes: map[string]int{},
 		Checkpoints: map[string]int{}, Actions: rec.actions, Reviews: rec.reviews, Repeats: rec.repeats, NotSent: notSent,
 		NoAnswer: judge.missing}
-	for _, st := range rec.sittings {
+	for _, st := range rec.sessions {
 		s.Outcomes[st.Outcome]++
 		if len(st.Held) > 0 {
 			s.WithHeld++
@@ -707,7 +707,7 @@ func summarize(mode string, rec *replayRecorder, judge *savedJudge, notSent int,
 		parityHashes[h] = true
 	}
 	lr := &liveResult{}
-	for _, st := range rec.sittings {
+	for _, st := range rec.sessions {
 		for _, c := range st.Checkpoints {
 			if c.Hash == "" {
 				continue
@@ -728,7 +728,7 @@ func summarize(mode string, rec *replayRecorder, judge *savedJudge, notSent int,
 		}
 	}
 	held := map[string][]string{}
-	for _, st := range rec.sittings {
+	for _, st := range rec.sessions {
 		if len(st.Held) > 0 {
 			held[st.Stream+"/"+fmt.Sprint(st.Held)] = st.Held
 		}
@@ -747,10 +747,10 @@ func summarize(mode string, rec *replayRecorder, judge *savedJudge, notSent int,
 func compareParity(rec *replayRecorder, exp expected) *parityResult {
 	p := &parityResult{}
 	examples := map[string]bool{}
-	for _, s := range exp.ExampleSittings {
+	for _, s := range exp.ExampleSessions {
 		examples[s] = true
 	}
-	// Python's checkpoints per sitting, by held-line count
+	// Python's checkpoints per session, by held-line count
 	pyKs := map[string][]int{}
 	for id := range exp.Prompts {
 		i := len(id) - 1
@@ -760,10 +760,10 @@ func compareParity(rec *replayRecorder, exp expected) *parityResult {
 		k, _ := strconv.Atoi(id[i+1:])
 		pyKs[id[:i]] = append(pyKs[id[:i]], k)
 	}
-	got := map[string]core.SittingRecord{}
-	for _, st := range rec.sittings {
-		got[st.Sitting] = st
-		if examples[st.Sitting] {
+	got := map[string]core.SessionRecord{}
+	for _, st := range rec.sessions {
+		got[st.Session] = st
+		if examples[st.Session] {
 			for _, c := range st.Checkpoints {
 				if c.Hash != "" {
 					p.PromptsOfExamples++
@@ -773,7 +773,7 @@ func compareParity(rec *replayRecorder, exp expected) *parityResult {
 		}
 		var ks []int
 		for _, c := range st.Checkpoints {
-			id := st.Sitting + "#" + strconv.Itoa(c.K)
+			id := st.Session + "#" + strconv.Itoa(c.K)
 			ks = append(ks, c.K)
 			p.PromptsCompared++
 			want, ok := exp.Prompts[id]
@@ -786,16 +786,16 @@ func compareParity(rec *replayRecorder, exp expected) *parityResult {
 				p.PromptsEqual++
 			}
 		}
-		want := pyKs[st.Sitting]
+		want := pyKs[st.Session]
 		sort.Ints(want)
-		// Python built every checkpoint of the sitting; the core stops at a ban
+		// Python built every checkpoint of the session; the core stops at a ban
 		n := len(want)
 		if st.Outcome == core.OutcomeBanned {
 			n = len(ks)
 		}
 		for _, k := range want[:min(n, len(want))] {
 			if !slices.Contains(ks, k) {
-				p.MissingCheckpoint = append(p.MissingCheckpoint, st.Sitting+"#"+strconv.Itoa(k))
+				p.MissingCheckpoint = append(p.MissingCheckpoint, st.Session+"#"+strconv.Itoa(k))
 			}
 		}
 	}
@@ -806,10 +806,10 @@ func compareParity(rec *replayRecorder, exp expected) *parityResult {
 	sort.Strings(names)
 	for _, id := range names {
 		w := exp.Outcomes[id]
-		p.SittingsCompared++
+		p.SessionsCompared++
 		g, ok := got[id]
 		if !ok {
-			p.SittingDiffs = append(p.SittingDiffs, id+": no such sitting in the replay")
+			p.SessionDiffs = append(p.SessionDiffs, id+": no such session in the replay")
 			continue
 		}
 		out := g.Outcome
@@ -840,9 +840,9 @@ func compareParity(rec *replayRecorder, exp expected) *parityResult {
 			diffs = append(diffs, fmt.Sprintf("rulings %v, online-1 %v", rulings, w.Rulings))
 		}
 		if len(diffs) == 0 {
-			p.SittingsEqual++
+			p.SessionsEqual++
 		} else {
-			p.SittingDiffs = append(p.SittingDiffs, fmt.Sprintf("%s: %v", id, diffs))
+			p.SessionDiffs = append(p.SessionDiffs, fmt.Sprintf("%s: %v", id, diffs))
 		}
 	}
 	return p

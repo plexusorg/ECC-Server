@@ -14,7 +14,7 @@ import (
 
 // wordScorer is the end-to-end rig's scorer, set with [test] hold_words_file: it holds a line that contains one of
 // the file's words (one a line, any case) and delivers every other line. It stands in for the fast model so the rig
-// can drive the server's sittings, checkpoints and actions; it filters nothing a game server needs filtered. A line
+// can drive the server's sessions, checkpoints and actions; it filters nothing a game server needs filtered. A line
 // that contains [test] slow_word takes [test] slow_for to score, as a slow model call.
 type wordScorer struct {
 	words    []string

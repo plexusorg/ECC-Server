@@ -108,7 +108,7 @@ func run(cfg Config) error {
 		return err
 	}
 	if err := scanRestart(s.recorder, s.rec.dir, time.Now()); err != nil {
-		return fmt.Errorf("reading the record for sittings left open: %w", err)
+		return fmt.Errorf("reading the record for sessions left open: %w", err)
 	}
 	if s.spend, err = openSpend(cfg); err != nil {
 		return err
@@ -181,7 +181,7 @@ func run(cfg Config) error {
 	shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(shutdown)
-	// Judge calls in flight end with the host's context; their sittings are ended by the next start's scan.
+	// Judge calls in flight end with the host's context; their sessions are ended by the next start's scan.
 	done := make(chan struct{})
 	go func() { s.jobs.Wait(); close(done) }()
 	select {
@@ -221,7 +221,7 @@ func (s *server) scorerFor(b *Bundle) (core.Scorer, error) {
 }
 
 // use serves a bundle's judge texts, settings and scorer: the engine is made with the first bundle and takes later
-// ones in place, keeping its sittings. The switch waits for the line being scored, if any; the new models take the
+// ones in place, keeping its sessions. The switch waits for the line being scored, if any; the new models take the
 // previous models' context, and the previous models are freed.
 func (s *server) use(b *Bundle, sc core.Scorer) {
 	cc := coreConfig(s.cfg, b)
@@ -266,7 +266,7 @@ func (s *server) now() time.Time {
 	return t
 }
 
-// tick runs the waiting-time checkpoints and sitting ends once a second, on the host's clock.
+// tick runs the waiting-time checkpoints and session ends once a second, on the host's clock.
 func (s *server) tick() {
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
@@ -303,12 +303,12 @@ func (s *server) runJob(j *core.Job) {
 	a, err := s.judge.Rule(j)
 	switch {
 	case errors.Is(err, core.ErrPending):
-		slog.Warn("the judge could not be reached; the checkpoint is put again later", "sitting", j.Sitting, "k", j.K,
+		slog.Warn("the judge could not be reached; the checkpoint is put again later", "session", j.Session, "k", j.K,
 			"err", err.Error())
 	case err != nil:
-		slog.Warn("checkpoint not ruled; its lines stay held", "sitting", j.Sitting, "k", j.K, "err", err.Error())
+		slog.Warn("checkpoint not ruled; its lines stay held", "session", j.Session, "k", j.K, "err", err.Error())
 	default:
-		slog.Info("ruling", "sitting", j.Sitting, "k", j.K, "ruling", a.Ruling, "by", a.By)
+		slog.Info("ruling", "session", j.Session, "k", j.K, "ruling", a.Ruling, "by", a.By)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -481,7 +481,7 @@ const slowCall = 10 * time.Second
 // Notice kind of a slow model call.
 const noticeSlowModel = "slow_model"
 
-// rescore scores a line answered hold before its models ran and hands its verdict to the engine, unless its sitting
+// rescore scores a line answered hold before its models ran and hands its verdict to the engine, unless its session
 // settled it meanwhile. A line the models since replaced took (a bundle switch) is held without a score.
 func (s *server) rescore(l laterLine) {
 	s.scoreMu.Lock()
@@ -512,7 +512,7 @@ func (s *server) scoreLine(j *lineJob) (later laterLine, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.eng.Known(l.Channel) {
-		slog.Error("a line on a channel this server does not know is held; its sitting goes on the review queue",
+		slog.Error("a line on a channel this server does not know is held; its session goes on the review queue",
 			"channel", l.Channel, "id", j.req.ID)
 	}
 	var call scoreCall
@@ -624,7 +624,7 @@ func (s *server) answer(j *lineJob, res core.Result) {
 	close(j.done)
 }
 
-// handlePresence takes the plugin's start (a new stream: every open sitting ends; the allowlist of links) and
+// handlePresence takes the plugin's start (a new stream: every open session ends; the allowlist of links) and
 // players' joins and leaves.
 func (s *server) handlePresence(w http.ResponseWriter, r *http.Request) {
 	var req struct {
@@ -659,7 +659,7 @@ func (s *server) handlePresence(w http.ResponseWriter, r *http.Request) {
 	now := s.now()
 	switch req.Kind {
 	case "start":
-		slog.Info("the game server started: a new stream, every open sitting ends", "allowed_links", len(req.AllowedLinks))
+		slog.Info("the game server started: a new stream, every open session ends", "allowed_links", len(req.AllowedLinks))
 		s.dispatch(s.eng.Start(stamp(now), now))
 	default:
 		s.dispatch(s.eng.Presence(req.UUID, req.Kind == "join", now))
@@ -735,7 +735,7 @@ type hostStatus struct {
 	Wandb          *wandbStatus   `json:"wandb"`              // null when no W&B key is set
 	Judge          *bedrockStatus `json:"judge"`
 	Spend          spendStatus    `json:"spend"`
-	Sittings       core.Status    `json:"sittings"`
+	Sessions       core.Status    `json:"sessions"`
 	Unacknowledged int            `json:"unacknowledged_actions"`
 }
 
@@ -754,7 +754,7 @@ func (s *server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if s.eng == nil {
 		h.Status, code = "no bundle", http.StatusServiceUnavailable
 	} else {
-		h.Version, h.Sittings, h.Scorer = s.bundle.Version, s.eng.Status(), s.scorerIs
+		h.Version, h.Sessions, h.Scorer = s.bundle.Version, s.eng.Status(), s.scorerIs
 	}
 	s.mu.Unlock()
 	writeJSON(w, code, h)

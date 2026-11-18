@@ -1,4 +1,4 @@
-// Package core is ECC-Server's decision core: per line a verdict from the fast model, per player a sitting with its
+// Package core is ECC-Server's decision core: per line a verdict from the fast model, per player a session with its
 // held lines, at the checkpoints of the schedule a prompt for the judge, and the actions its ruling calls for. It has
 // no clock, network or file of its own: the HTTP server and the replay drive it with the same calls, and run the
 // judge calls it asks for.
@@ -41,10 +41,10 @@ type Line struct {
 	// Sent is how many times the line was sent (1 for a single send): it and its repeats.
 	Sent int
 	// Context marks a line that is context for other lines only: no player's own (a Discord relay), or a trusted
-	// player's, which the plugin delivered at once. It is never scored, held or judged and opens no sitting.
+	// player's, which the plugin delivered at once. It is never scored, held or judged and opens no session.
 	Context bool
-	// Sitting names the sitting the line belongs to when the driver defines sittings (Config.DriverSittings).
-	Sitting string
+	// Session names the session the line belongs to when the driver defines sessions (Config.DriverSessions).
+	Session string
 	// Ref is the driver's own id for the line (the plugin's line id); a release action lists the refs of the lines it
 	// delivers.
 	Ref string
@@ -133,8 +133,8 @@ type Judge interface {
 }
 
 // ErrLater is the driver's error for a line it answered hold before its score (errors.Is): it hands the verdict to
-// Engine.Rescored once the line is scored. Until then the line is held but none of its sitting's held lines for the
-// judge, and the sitting's checkpoints wait for it.
+// Engine.Rescored once the line is scored. Until then the line is held but none of its session's held lines for the
+// judge, and the session's checkpoints wait for it.
 var ErrLater = errors.New("answered before its score")
 
 // ErrNotSent is the error a driver hands to Engine.Rule for a checkpoint whose prompt it chose not to send.
@@ -152,14 +152,14 @@ const (
 	ActionRelease = "release" // deliver these held lines late, in order
 )
 
-// Action is one thing the plugin is told to do, for the sitting's player: Account is their key (Line.Account) and
+// Action is one thing the plugin is told to do, for the session's player: Account is their key (Line.Account) and
 // Speaker their account name (Line.Speaker), never a shown name. A release names its lines by stream id (Lines) and by
 // the driver's refs (Refs: the lines' own and their repeats', in the order they arrived).
 type Action struct {
 	Kind    string   `json:"kind"`
 	Account string   `json:"account"`
 	Speaker string   `json:"speaker"`
-	Sitting string   `json:"sitting"`
+	Session string   `json:"session"`
 	Lines   []string `json:"lines,omitempty"`
 	Refs    []string `json:"refs,omitempty"`
 }
@@ -174,7 +174,7 @@ type Example struct {
 	Text   string `json:"text"`
 }
 
-// Texts is what the judge's prompt carries besides the sitting: the question, the owner's cases and the answer
+// Texts is what the judge's prompt carries besides the session: the question, the owner's cases and the answer
 // format.
 type Texts struct {
 	Question string

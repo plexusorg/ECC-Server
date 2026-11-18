@@ -3,8 +3,8 @@
 The chat-safety decision maker for Module-ECC. It is one Go binary beside the game server, with the OpenVINO runtime its models
 run on. Module-ECC asks it
 for a verdict on every line a player writes before the line is delivered, and carries out the actions it gives; every
-decision is made here: the verdict on each line (`deliver`, `hold` or `reject`), each player's sitting and its held lines, the
-checkpoints at which a judge (a model on Amazon Bedrock) reads the sitting and rules `nothing`, `hold` or `ban`, the
+decision is made here: the verdict on each line (`deliver`, `hold` or `reject`), each player's session and its held lines, the
+checkpoints at which a judge (a model on Amazon Bedrock) reads the session and rules `nothing`, `hold` or `ban`, the
 actions that carry out each ruling, the judge's spend budget, the review queue and the daily record. The judge's
 question, the owner's ruled cases it is shown, the checkpoint settings and the fast model's thresholds come from the
 bundle the Module-ECC training pipeline writes; with a W&B API key, the host fetches the bundle the pipeline promoted to
@@ -42,7 +42,7 @@ sudo apt update
 sudo apt install ecc-server     # enables and starts the service
 sudo ecc-server wandb login     # paste the W&B API key at the hidden prompt
 sudo ecc-server bedrock login   # paste the Amazon Bedrock API key at the hidden prompt
-sudo ecc-server status          # the bundle, W&B, the judge, its spend and the sittings
+sudo ecc-server status          # the bundle, W&B, the judge, its spend and the sessions
 sudo ecc-server token           # the token to paste into Module-ECC's config (see Connecting Module-ECC)
 ```
 
@@ -50,7 +50,7 @@ The host starts without a bundle and answers `503` to lines until it has one. Wi
 production bundle on its first check and serves it. Without W&B, install a bundle folder copied onto the host instead:
 `sudo -u ecc-server ecc-server use /path/to/bundle` (the folder must be readable by `ecc-server`).
 
-Upgrade with `sudo apt update && sudo apt upgrade`. The service restarts: open sittings end (see Restart); the
+Upgrade with `sudo apt update && sudo apt upgrade`. The service restarts: open sessions end (see Restart); the
 installed bundle, the token, the W&B and Bedrock keys, your edited `config.toml`, the unacknowledged actions, the
 judge's spend, the review queue and the records stay. Remove with `sudo apt remove ecc-server` (stops and disables the
 service, keeps `/etc/ecc-server`, the keys and the data folder); `sudo apt purge ecc-server` also deletes
@@ -80,9 +80,9 @@ reads:
   and the separators, which must be the ones the host lays the prompt out with, or the bundle is refused);
 - `judge.examples`: `examples.json`, the owner's ruled cases (`examples`: `id`, `ruling`, `date`, `text`) in the
   order the prompt lists them, and its `header`, which must be `## C<n>: ruling: <ruling>`;
-- `judge.checkpoints`: `schedule`, `every`, `wait_seconds`, `sitting_end_seconds`, `review_held` (see Sittings and
+- `judge.checkpoints`: `schedule`, `every`, `wait_seconds`, `session_end_seconds`, `review_held` (see Sessions and
   checkpoints);
-- `judge.render`: how a sitting is shown to the judge: `before`, `after`, `max_chars`, `cut_before`, `cut_after`, and
+- `judge.render`: how a session is shown to the judge: `before`, `after`, `max_chars`, `cut_before`, `cut_after`, and
   `kinds`, the name the judge reads for each kind the fast model marks;
 - `links`: `canonical`, the link the models were trained with in place of an allowed link, and the link `pattern` and
   `rule` (see A line).
@@ -141,10 +141,10 @@ the earlier version in W&B also switches the host back, at its next check. With 
 name the console shows. The host times it when the request arrives and numbers it `L<n>` in the current stream (a
 stream runs from one game server start to the next). A line on a channel `bundle.json` does not name is held, never
 scored and never context; the host logs it with the channel's name, counts it in `/status` (`unknown_channels`) and
-puts the player's sitting on the review queue when it ends. A Discord relay line (channel `discord`, no speaker UUID)
+puts the player's session on the review queue when it ends. A Discord relay line (channel `discord`, no speaker UUID)
 or a line marked `trusted` (Module-ECC delivered it at once: its speaker is in one of the module's trusted groups or
 holds the bypass permission) is kept as context for other players' lines only: never scored, held or judged, and in no
-sitting. A private message is a `msg` line; its conversation is the pair of the two account names. Every other line is
+session. A private message is a `msg` line; its conversation is the pair of the two account names. Every other line is
 scored by the fast model with the lines before it that the bundle's `context` names (the public lines, a private
 message's earlier messages between the same two players, a placed line's author's earlier placed lines: the last 30
 within 30 minutes); a line the scorer cannot score is held. Lines are scored one at a time, in the order they arrive,
@@ -152,9 +152,9 @@ and a model call always runs to its end. A line still waiting for its verdict `[
 answered hold, so neither a burst nor a slow call keeps Module-ECC waiting past its own timeout, and is context for
 later lines at once. If its models are running then, their verdict is applied when they end; if they had not started,
 the line is scored, with the context it had, as soon as no line is waiting. Either way a line the models would hold
-becomes one of its sitting's held lines, with its kinds, and a line they would deliver is released with its repeats
-(`release`). Until then its sitting's checkpoints wait for it, so the judge never sees it unscored; only when the
-sitting ends, or the line has waited `[chat] wait`, first is it put to the judge as held without a kind. `/status`
+becomes one of its session's held lines, with its kinds, and a line they would deliver is released with its repeats
+(`release`). Until then its session's checkpoints wait for it, so the judge never sees it unscored; only when the
+session ends, or the line has waited `[chat] wait`, first is it put to the judge as held without a kind. `/status`
 counts such lines (`held_unscored`). A model call that has run 10 seconds is logged as an error and staff are told
 (notice `slow_model`); `/status` shows how long the call in progress has run (`model_call_seconds`). The lines behind
 it wait in the queue, and Module-ECC holds each one it got no verdict for and asks again. A bundle switch comes between two lines: the new models take the lists of earlier lines
@@ -197,11 +197,11 @@ held lines and their repeats in the order they arrived.
 The judge sees the player's marked lines with the kinds' names from `judge.render.kinds`, and a marked line, held or
 not, is shown with the lines around it.
 
-**Sittings and checkpoints.** A sitting runs from a player's first scored line after they join until
-`sitting_end_seconds` after they leave (with no leave known, after their last line); a game server start ends every
-sitting. The judge is called at a sitting's checkpoints: after each held-line count in the schedule, then every
-`every`-th held line; when a held line has waited the wait without a ruling; and at the sitting's end while held lines
-are unruled. One call per sitting is in flight; a later checkpoint waits for its answer. The case the judge reads is
+**Sessions and checkpoints.** A session runs from a player's first scored line after they join until
+`session_end_seconds` after they leave (with no leave known, after their last line); a game server start ends every
+session. The judge is called at a session's checkpoints: after each held-line count in the schedule, then every
+`every`-th held line; when a held line has waited the wait without a ruling; and at the session's end while held lines
+are unruled. One call per session is in flight; a later checkpoint waits for its answer. The case the judge reads is
 headed with the UTC date of its first line and shows each line at its UTC time of day. A ruling covers the held lines
 up to its checkpoint's last line:
 
@@ -211,9 +211,9 @@ ruling. For live model answers:
 | firm result | action |
 | --- | --- |
 | `nothing`, `sure: true` | `release`: deliver those held lines and their repeats in arrival order |
-| `hold`, `sure: true` | keep the lines held; `warn` the player once per sitting |
-| two independent valid `ban` answers, both `sure: true` | `ban`: apply the existing indefinite ban and immediate kick; drop the player's held lines and end the sitting |
-| any uncertain answer or conflicting confirmation | keep the lines held and add the sitting to the review queue at once |
+| `hold`, `sure: true` | keep the lines held; `warn` the player once per session |
+| two independent valid `ban` answers, both `sure: true` | `ban`: apply the existing indefinite ban and immediate kick; drop the player's held lines and end the session |
+| any uncertain answer or conflicting confirmation | keep the lines held and add the session to the review queue at once |
 
 A ban requires two separate requests and responses for the identical frozen prompt. Both answers must cite a valid
 line from the player. One cached answer cannot supply both confirmations. An uncertain or conflicting answer cannot
@@ -221,21 +221,21 @@ release a line, ban or kick a player, or write an IP ban. A previously released 
 but the render marks it as previously cleared.
 
 A checkpoint the judge does not rule (three invalid answers, a refusal by Bedrock, a prompt over `max_prompt_chars`,
-the day's calls or a budget used up, no Bedrock key, or a judge it could not reach before the sitting ended) leaves
+the day's calls or a budget used up, no Bedrock key, or a judge it could not reach before the session ended) leaves
 its lines held.
 
-**The review queue.** The host adds a sitting to `<data>/review/queue.jsonl` at once after an uncertain answer or
-conflicting confirmation. It also adds each ban, each sitting that ends with
-`review_held` or more held lines and no ban, each sitting with a checkpoint the judge did not rule, each sitting with a
-line on a channel the bundle does not name, and each sitting a restart ended with held lines no ruling covered.
+**The review queue.** The host adds a session to `<data>/review/queue.jsonl` at once after an uncertain answer or
+conflicting confirmation. It also adds each ban, each session that ends with
+`review_held` or more held lines and no ban, each session with a checkpoint the judge did not rule, each session with a
+line on a channel the bundle does not name, and each session a restart ended with held lines no ruling covered.
 
-**Restart.** At start, the host reads the last two days' record for sittings that started and did not end.
-It records each sitting's end. It uses the recorded effective ruling and review reason. An uncertain or conflicting
+**Restart.** At start, the host reads the last two days' record for sessions that started and did not end.
+It records each session's end. It uses the recorded effective ruling and review reason. An uncertain or conflicting
 answer leaves its lines held. A pending answer covers no lines. For older records without an effective ruling,
 the host keeps the lines held for review unless a recorded action proves release, hold or ban. A firm hold does not
 add a review reason merely because the host restarted. Recovery sends no new action.
 
-The host does not reload the sitting as a live case. Held lines stay held until Module-ECC receives a `release`.
+The host does not reload the session as a live case. Held lines stay held until Module-ECC receives a `release`.
 Module-ECC sends `start` when it starts, so a host and plugin restarted together begin a clean stream.
 
 **Actions** wait in `<data>/actions.json` (written atomically) until Module-ECC acknowledges each with `ok: true`;
@@ -244,14 +244,14 @@ acknowledged.
 
 **The record.** `<data>/record/YYYY-MM-DD.jsonl` (UTC days), one JSON line per event, each with `type` and `server`
 (the config's `server`): every `line` (stream, id, ref: Module-ECC's id for it, time, channel, conversation, account, name and the raw name,
-target, the prepared and the raw text, sitting, verdict, kinds, score), `rescored` (the verdict, kinds and scores of a
+target, the prepared and the raw text, session, verdict, kinds, score), `rescored` (the verdict, kinds and scores of a
 line answered hold at `max_wait`, once its models end), `unscored` (such a line put to the judge without a score), `repeat`,
-`sitting_start`, `checkpoint` (the
+`session_start`, `checkpoint` (the
 held-line count it covers, why it was made, the prompt's size and SHA-256, whether it was sent), `judge_call` (each
 call: attempt, status, the usage's input, cached, cache-write, output and reasoning tokens, cost, duration, or the
 error, request/response identifiers and raw answer), `ruling` (the raw answer, confidence, confirmation evidence,
 effective ruling and review reason, the error, or `pending` with the time it is put again), `checkpoint_again`,
-`action` (the core's, by line id), `action_sent` (as Module-ECC gets it), `ack`, `presence`, `sitting_end` (outcome, held, released and unruled
+`action` (the core's, by line id), `action_sent` (as Module-ECC gets it), `ack`, `presence`, `session_end` (outcome, held, released and unruled
 lines, the checkpoints) and `review`. Lines are flushed one at a time. Just after midnight UTC the day's file is
 compressed to `YYYY-MM-DD.jsonl.zst`; compressed files older than `record_retention_days` are deleted.
 
@@ -284,7 +284,7 @@ https://bedrock-runtime.<region>.amazonaws.com/openai/v1/responses` with `Author
    {"type": "input_text", "text": "<the new case and the answer format>"}]}]}
 ```
 
-The two parts, joined, are the prompt: the question, the owner's cases, the sitting so far with the held lines marked
+The two parts, joined, are the prompt: the question, the owner's cases, the session so far with the held lines marked
 `[held]` and previously cleared lines marked separately, and the answer format. The first part is the same in every call and ends at an explicit cache breakpoint, so
 Bedrock serves it from its prompt cache (at least 30 minutes; a hit resets the time, and a request another server takes
 writes a new entry). `store` is false: Bedrock keeps no copy of the prompt or the answer. The answer is the output
@@ -295,7 +295,7 @@ case `N1`: `ruling` `nothing`, `hold` or `ban` (`not ban`, a ruling of the owner
 ids; `sure` true or false. The host records both requests and responses when it seeks ban confirmation.
 An invalid answer is asked for again, up to three invalid answers per confirmation stage. A call that fails (`429`, a
 `5xx`, an answer whose `status` is `failed` or `cancelled`, the `timeout`, the network) is made again after 5 seconds, then 10, 20, ..., while the failures have lasted
-less than 5 minutes; then the checkpoint is pending: it is put again 5 minutes later, and so on until the sitting ends
+less than 5 minutes; then the checkpoint is pending: it is put again 5 minutes later, and so on until the session ends
 (`/status` counts the pending ones). A confirmation failure leaves the lines held. The host keeps the first firm
 ban with that pending job and seeks a separate valid confirmation when it retries. It applies no partial ban.
 A call refused by the budget, or by Bedrock for the key (`401`, `403`) or as a
@@ -310,7 +310,7 @@ prompt a token at the dearest input price, plus `max_output_tokens` at the outpu
 spent at once and is saved, so a call cut off by a crash or a restart stays charged its worst case; when the call
 returns, its cost replaces the reservation (nothing when Bedrock refused the request). A call whose worst case would
 take the day's or the month's total past its budget waits while other calls are in flight, and is not made once none
-is: its lines stay held, its sitting goes to the review queue, and the first refusal in a day (or month) sends a
+is: its lines stay held, its session goes to the review queue, and the first refusal in a day (or month) sends a
 `notice` that staff with the alert permission see. `sudo ecc-server status` shows the totals.
 
 ## Building the package
@@ -395,7 +395,7 @@ Every command except `version` and `replay` takes `-config FILE` before its argu
 - `ecc-server use FOLDER`: install a bundle folder into the store and switch to it. Every file is checked against the
   manifest's SHA-256 and size, and `bundle.json` and the judge's files are read as the host reads them; files are
   hardlinked when the folder is on the same volume, otherwise copied. With the host running, it takes the new
-  bundle's texts and settings at once and its open sittings carry on; a bundle that fails to load is discarded and the
+  bundle's texts and settings at once and its open sessions carry on; a bundle that fails to load is discarded and the
   current one keeps serving. Without a running host, the bundle is served from the next start.
 - `ecc-server rollback`: switch back to the previous bundle, the same way. The store keeps the current and the
   previous bundle and deletes older ones.
@@ -403,7 +403,7 @@ Every command except `version` and `replay` takes `-config FILE` before its argu
   production bundle. It also installs a production version a rollback skipped or one that failed before.
 - `sudo ecc-server status`: print the bundle the running host serves, its health and scorer; with a W&B key the last
   check's time and result, the version W&B's `production` names, and any download in progress; the judge's model,
-  tier, key and last call; the judge's spend today and this month against the budgets; the open sittings, their
+  tier, key and last call; the judge's spend today and this month against the budgets; the open sessions, their
   unruled held lines and the judge calls in flight; and the unacknowledged actions. Exit status 1 when no host is
   listening or the host is not ready.
 - `sudo ecc-server token`: print the token (see Connecting Module-ECC).
@@ -433,7 +433,7 @@ All bodies are JSON. Module-ECC uses the first four; every endpoint needs the to
 ```
 
 `{"verdict": "deliver"}`, `{"verdict": "hold"}` or `{"verdict": "reject"}`. A `reject` is final and nonpunitive.
-Module-ECC drops its pending payload and asks the player to shorten it. The line enters no context or sitting, and
+Module-ECC drops its pending payload and asks the player to shorten it. The line enters no context or session, and
 the judge cannot release it. `id` is Module-ECC's own id for the line: Module-ECC keeps a held
 line by it until a `release` names it or a `ban` drops it, and a line sent again with the same id gets the same verdict
 and is not counted twice. `channel` is one of `bundle.json` `channels` (another is held, see A line). `speaker` is the
@@ -444,7 +444,7 @@ prepares it. A line with `trusted: true`, or on `discord`, is context only. `400
 no bundle is served, or while 10,000 lines wait to be scored (Module-ECC asks again).
 
 `POST /presence` with `{"kind": "start", "allowed_links": ["example.org", "discord.gg/<code>"]}` when Module-ECC starts
-(a new stream: every open sitting ends; the allowlist of links, each `host` or `host/prefix`, `400` naming an entry
+(a new stream: every open session ends; the allowlist of links, each `host` or `host/prefix`, `400` naming an entry
 that is not), or `{"kind": "join" | "leave", "uuid": "<uuid>", "name": "Name"}`: `200 {"boot": "<boot id>"}`.
 `GET /actions` long-polls: it answers as soon as there is an unacknowledged action, or after 30 seconds, with every
 unacknowledged action, oldest first:
@@ -455,7 +455,7 @@ unacknowledged action, oldest first:
 ```
 
 **The boot id** is a random id the host makes each time it starts; `GET /actions`, `POST /presence` and `GET /status`
-return it. The host keeps no sitting, presence or verdict across a restart, so when Module-ECC sees a boot id other
+return it. The host keeps no session, presence or verdict across a restart, so when Module-ECC sees a boot id other
 than the last one it sends `start` (with its `allowed_links`), a `join` for every online player, then every line it
 holds without a verdict again.
 
@@ -466,7 +466,7 @@ holds without a verdict again.
 | `release` | `uuid`, `account`, `ids` | deliver the held lines with these ids in the order they were written (the host lists the lines and their repeats in the order they arrived) |
 | `notice` | `kind`, `text` | show `text` to staff with the alert permission |
 
-`uuid` and `account` are the sitting's player as Module-ECC sent them, `speaker_uuid` and `speaker`: the UUID and the
+`uuid` and `account` are the session's player as Module-ECC sent them, `speaker_uuid` and `speaker`: the UUID and the
 account name, never the shown name. A notice tells staff that judging stopped, and why, or that a model call is slow
 (`kind`):
 
@@ -490,8 +490,8 @@ progress has run, `0` when none), `slow_model_calls` (calls since start that ran
 `region`, `model`, `service_tier`, `reasoning_effort`, `since_start` (calls, answered calls and their summed usage), and
 after the first call `last_call`, `result` and `last_usage`: `input_tokens`, `cached_tokens`, `cache_write_tokens`,
 `output_tokens`, `reasoning_tokens`), `spend` (`day`, `day_usd`,
-`daily_budget_usd`, `day_calls`, `month`, `month_usd`, `monthly_budget_usd`, `in_flight_reserved_usd`), `sittings`
-(`stream`, `open_sittings`, `held_unruled`, `held_unscored`, `judge_calls_in_flight`, `checkpoints_pending`, `unknown_channels` by
+`daily_budget_usd`, `day_calls`, `month`, `month_usd`, `monthly_budget_usd`, `in_flight_reserved_usd`), `sessions`
+(`stream`, `open_sessions`, `held_unruled`, `held_unscored`, `judge_calls_in_flight`, `checkpoints_pending`, `unknown_channels` by
 channel) and `unacknowledged_actions`.
 
 `POST /switch` with `{"version": "..."}` switches to an installed bundle; `use` and `rollback` call it.
@@ -505,11 +505,11 @@ without a key; `update` calls it.
 [-dump FILE]` feeds recorded
 lines (prepared already, with presence events) through the decision core on a virtual clock, with the fast model's
 recorded verdicts and the judge's saved answers (by the SHA-256 of the prompt), and writes the record, one line per
-sitting and a summary to `DIR`. `-config` is a TOML file with the core's settings in a `[core]` table. The core's
+session and a summary to `DIR`. `-config` is a TOML file with the core's settings in a `[core]` table. The core's
 timers run at their time, and a ruling arrives `-judge-delay` after its checkpoint, as an event of its own: the lines
-before then are handled first. Parity mode takes the sittings from the lines, rules at once, and checks every prompt
-and every sitting's outcome against the measured run (a prompt with no saved answer stops it, or with `-keep-going`
-is counted); live mode makes sittings from presence and silence and uses the
+before then are handled first. Parity mode takes the sessions from the lines, rules at once, and checks every prompt
+and every session's outcome against the measured run (a prompt with no saved answer stops it, or with `-keep-going`
+is counted); live mode makes sessions from presence and silence and uses the
 waiting-time checkpoint. With `-bundle DIR` (`-threads`, `-threshold`) the bundle's models score every line in place
 of the recorded verdicts (Linux only). `ecc-server replay -h` describes the inputs.
 
@@ -521,5 +521,5 @@ Replay input streams must declare `scoring_mode: "c_only"` and `coverage_rule: "
 Each stream must also declare `model_text_rule: "v3_meaning_v1"` and `canonical_link`, equal to the replay config.
 The judge folder must contain the producer's `allowlist.txt`. Every line must include `raw_text` and its
 `coverage` route (`c`, `reject`, `context`, `fold` or `dropped`). A reject must carry `verdict: "reject"`.
-Recorded replay preserves that final decision before it opens a sitting. Copies need their own coverage result;
+Recorded replay preserves that final decision before it opens a session. Copies need their own coverage result;
 they can reject before folding even when the original line fit.

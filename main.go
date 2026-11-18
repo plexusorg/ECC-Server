@@ -1,5 +1,5 @@
 // ECC-Server makes Module-ECC's chat-safety decisions: it gives every chat line a verdict before delivery, keeps
-// each player's sitting with its held lines, asks a judge on Amazon Bedrock for a ruling at the sitting's checkpoints
+// each player's session with its held lines, asks a judge on Amazon Bedrock for a ruling at the session's checkpoints
 // within a spend budget, keeps the record, and tells Module-ECC whom to ban or warn and which held lines to deliver,
 // over HTTP with a shared token.
 package main
@@ -205,7 +205,7 @@ const usage = `ecc-server <command> [-config FILE] [FOLDER]
   use FOLDER       install a bundle folder (bundle.json, manifest.json and the files they name) and switch to it
   rollback         switch back to the previous bundle
   update           have the running host check W&B for a new production bundle now (run with sudo)
-  status           (run with sudo) print the running host's bundle, health, W&B updates, judge calls, spend and sittings
+  status           (run with sudo) print the running host's bundle, health, W&B updates, judge calls, spend and sessions
   token            print the token Module-ECC needs (run with sudo)
   wandb login      store the W&B API key, encrypted for the service (run with sudo)
   wandb logout     remove the stored W&B API key (run with sudo)

@@ -99,11 +99,11 @@ func scoreLines(args []string) error {
 	}
 	defer sc.Close()
 	fmt.Fprintf(os.Stderr, "models loaded in %.1f s\n", time.Since(t0).Seconds())
-	// The server's core with no checkpoint and no sitting end: it prepares, folds and keeps the lines as the server
+	// The server's core with no checkpoint and no session end: it prepares, folds and keeps the lines as the server
 	// does; the models score the lines it would score.
 	rec := &repeatRecorder{}
 	eng := core.NewEngine(core.Config{Channels: b.Channels, CanonicalLink: b.Links.Canonical,
-		SittingEnd: 100 * 365 * 24 * time.Hour}, core.Texts{}, sc, rec)
+		SessionEnd: 100 * 365 * 24 * time.Hour}, core.Texts{}, sc, rec)
 	if err := eng.AllowLinks(allow); err != nil {
 		return err
 	}
