@@ -214,8 +214,8 @@ func (s *server) scorerFor(b *Bundle) (core.Scorer, error) {
 	}
 	slog.Info("models loaded", "bundle", b.Version, "seconds", fmt.Sprintf("%.1f", time.Since(t0).Seconds()),
 		"threads", m.Threads, "threshold", sc.Threshold())
-	if !sc.MarksKinds() {
-		slog.Warn("the bundle sets no kind thresholds; no line is marked with a kind", "bundle", b.Version)
+	if !sc.MarksCategories() {
+		slog.Warn("the bundle sets no category thresholds; no line is marked with a category", "bundle", b.Version)
 	}
 	return sc, nil
 }

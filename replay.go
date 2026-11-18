@@ -63,14 +63,14 @@ type replayEvent struct {
 	Target        string  `json:"target"`
 	Text          string  `json:"text"`
 	// Speaker is the speaker's account name as the models know them (a Discord relay: "discord:" and the shown name).
-	Speaker  string   `json:"speaker"`
-	Sent     int      `json:"sent"`
-	Trusted  bool     `json:"trusted"`
-	Context  bool     `json:"context"`
-	Session  string   `json:"session"`
-	Verdict  string   `json:"verdict"`
-	Coverage string   `json:"coverage"`
-	Kinds    []string `json:"kinds"`
+	Speaker    string   `json:"speaker"`
+	Sent       int      `json:"sent"`
+	Trusted    bool     `json:"trusted"`
+	Context    bool     `json:"context"`
+	Session    string   `json:"session"`
+	Verdict    string   `json:"verdict"`
+	Coverage   string   `json:"coverage"`
+	Categories []string `json:"categories"`
 	// Key is the line's own id, unique in its stream (the rendered id may not be); CopyOf names the line a copy
 	// repeats; RawText and RawShown are the text and the shown name before preparation.
 	Key      string  `json:"key"`
@@ -462,7 +462,7 @@ func replay(args []string) error {
 				if x.Verdict == "reject" {
 					scorer.rejects[x.ref()] = true
 				} else if x.Verdict != "" {
-					scorer.verdicts[x.ref()] = core.Verdict{Hold: x.Verdict == "hold", Kinds: x.Kinds}
+					scorer.verdicts[x.ref()] = core.Verdict{Hold: x.Verdict == "hold", Categories: x.Categories}
 				}
 			}
 			day = later(day, last)

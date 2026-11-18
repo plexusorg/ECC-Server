@@ -16,9 +16,9 @@ type entry struct {
 	pos  int
 	line Line
 	// session is the session whose player said the line ("" for a context line).
-	session string
-	held    bool
-	kinds   []string
+	session    string
+	held       bool
+	categories []string
 	// verdict is the line's verdict; released marks a held line a ruling delivered.
 	verdict  string
 	released bool
@@ -108,8 +108,8 @@ type Render struct {
 	MaxChars  int `toml:"max_chars"`
 	CutBefore int `toml:"cut_before"`
 	CutAfter  int `toml:"cut_after"`
-	// Kinds names each kind as the judge reads it.
-	Kinds map[string]string `toml:"kinds"`
+	// Categories names each category as the judge reads it.
+	Categories map[string]string `toml:"categories"`
 }
 
 var errTooLong = errors.New("one held line does not fit in the case's size")
@@ -221,8 +221,8 @@ func (r Render) text(v view, keep []int, player string) shown {
 			}
 		}
 		if mine {
-			for _, k := range e.kinds {
-				name, ok := r.Kinds[k]
+			for _, k := range e.categories {
+				name, ok := r.Categories[k]
 				if !ok {
 					name = k
 				}
@@ -240,7 +240,7 @@ func (r Render) render(v view) (shown, error) {
 	player := v.player()
 	var flagged []int
 	for _, p := range v.mine {
-		if e := v.st.get(p); e.held || len(e.kinds) > 0 {
+		if e := v.st.get(p); e.held || len(e.categories) > 0 {
 			flagged = append(flagged, p)
 		}
 	}

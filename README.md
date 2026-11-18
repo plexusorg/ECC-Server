@@ -64,7 +64,7 @@ as `models/c.bin`) and the files `bundle.json` names: the fast model's graphs an
 `question.md` and `examples.json`. A manifest name that would leave the folder is refused. From `bundle.json` the host
 reads:
 
-- `graphs`, `tokenizers`, `special_tokens`, `outputs`, `kinds`, `openvino` (the release and the compile
+- `graphs`, `tokenizers`, `special_tokens`, `outputs`, `categories`, `openvino` (the release and the compile
   settings), `context` (the lists of earlier lines a line is scored with) and `c` (the classifier input);
 - `scoring.mode`: must be `c_only`. The bundle must contain exactly graph `c` and tokenizer `c`. SH metadata and
   old cascade bundles are refused;
@@ -73,8 +73,8 @@ reads:
 - `rules`: the paths of every rule the host implements in code, from `context.rule` through `model_text.rule` and
   `scoring.mode`. The host checks the path list and digest, then hashes the values as `rules.how` states; a bundle whose rules hash differently from the ones this host
   implements is refused, and so is one whose text limits, marks, whitespace or link pattern differ;
-- `thresholds`: `hold` (by name), `default` and optional `kinds`. Leave the configured threshold empty to use
-  the bundle's default. Set an explicit hold key to select another operating point. Kind thresholds add hints;
+- `thresholds`: `hold` (by name), `default` and optional `categories`. Leave the configured threshold empty to use
+  the bundle's default. Set an explicit hold key to select another operating point. Category thresholds add hints;
   they do not clear a hold;
 - `judge.question`: `question.md`, whose `json` block holds the prompt's fixed strings (`QUESTION`, `ADDED`, `FORMAT`
   and the separators, which must be the ones the host lays the prompt out with, or the bundle is refused);
@@ -83,7 +83,7 @@ reads:
 - `judge.checkpoints`: `schedule`, `every`, `wait_seconds`, `session_end_seconds`, `review_held` (see Sessions and
   checkpoints);
 - `judge.render`: how a session is shown to the judge: `before`, `after`, `max_chars`, `cut_before`, `cut_after`, and
-  `kinds`, the name the judge reads for each kind the fast model marks;
+  `categories`, the name the judge reads for each category the fast model marks;
 - `links`: `canonical`, the link the models were trained with in place of an allowed link, and the link `pattern` and
   `rule` (see A line).
 
@@ -152,9 +152,9 @@ and a model call always runs to its end. A line still waiting for its verdict `[
 answered hold, so neither a burst nor a slow call keeps Module-ECC waiting past its own timeout, and is context for
 later lines at once. If its models are running then, their verdict is applied when they end; if they had not started,
 the line is scored, with the context it had, as soon as no line is waiting. Either way a line the models would hold
-becomes one of its session's held lines, with its kinds, and a line they would deliver is released with its repeats
+becomes one of its session's held lines, with its categories, and a line they would deliver is released with its repeats
 (`release`). Until then its session's checkpoints wait for it, so the judge never sees it unscored; only when the
-session ends, or the line has waited `[chat] wait`, first is it put to the judge as held without a kind. `/status`
+session ends, or the line has waited `[chat] wait`, first is it put to the judge as held without a category. `/status`
 counts such lines (`held_unscored`). A model call that has run 10 seconds is logged as an error and staff are told
 (notice `slow_model`); `/status` shows how long the call in progress has run (`model_call_seconds`). The lines behind
 it wait in the queue, and Module-ECC holds each one it got no verdict for and asks again. A bundle switch comes between two lines: the new models take the lists of earlier lines
@@ -193,8 +193,8 @@ not scored and is no context for later lines, it gets the verdict of the line it
 held, and delivered with it if a ruling releases it; a copy of a line a ruling already released is delivered), the
 judge sees the line once with "(sent N times)", and it is no new held line for the checkpoints. A release lists the
 held lines and their repeats in the order they arrived.
-**Kinds.** On a line C scores, the fast model marks each kind whose logit is at or over its `thresholds.kinds` value.
-The judge sees the player's marked lines with the kinds' names from `judge.render.kinds`, and a marked line, held or
+**Categories.** On a line C scores, the fast model marks each category whose logit is at or over its `thresholds.categories` value.
+The judge sees the player's marked lines with the categories' names from `judge.render.categories`, and a marked line, held or
 not, is shown with the lines around it.
 
 **Sessions and checkpoints.** A session runs from a player's first scored line after they join until
@@ -244,7 +244,7 @@ acknowledged.
 
 **The record.** `<data>/record/YYYY-MM-DD.jsonl` (UTC days), one JSON line per event, each with `type` and `server`
 (the config's `server`): every `line` (stream, id, ref: Module-ECC's id for it, time, channel, conversation, account, name and the raw name,
-target, the prepared and the raw text, session, verdict, kinds, score), `rescored` (the verdict, kinds and scores of a
+target, the prepared and the raw text, session, verdict, categories, score), `rescored` (the verdict, categories and scores of a
 line answered hold at `max_wait`, once its models end), `unscored` (such a line put to the judge without a score), `repeat`,
 `session_start`, `checkpoint` (the
 held-line count it covers, why it was made, the prompt's size and SHA-256, whether it was sent), `judge_call` (each

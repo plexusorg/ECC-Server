@@ -28,7 +28,7 @@ bundle's models scoring the rest), and writes one record per line in the format 
   -out    one record per input record: {"stream", "id", "refused": "unknown channel", "verdict": "hold"},
           {"stream", "id", "dropped": true, "verdict": "deliver"}, {"stream", "id", "folded_into": "<id>"},
           {"stream", "id", "context_only": true}, or {"stream", "id", "passed", "c", "held_<threshold>"...,
-          "verdict", "kinds"}; -ids adds the prepared text, the text the models read, the author key and the repeat
+          "verdict", "categories"}; -ids adds the prepared text, the text the models read, the author key and the repeat
           key of every line kept, and the context's ids and C's input ids of a scored one
   -allow  a file of allowed links, one host or host/prefix a line (# comments)
 `
@@ -195,7 +195,7 @@ func scoreLines(args []string) error {
 			if d.Verdict.Hold {
 				verdict = "hold"
 			}
-			out["coverage"], out["passed"], out["verdict"], out["kinds"] = "c", d.Passed, verdict, nonNil(d.Verdict.Kinds)
+			out["coverage"], out["passed"], out["verdict"], out["categories"] = "c", d.Passed, verdict, nonNil(d.Verdict.Categories)
 			out["c"] = d.C
 			cRuns++
 			for k, v := range d.Held {

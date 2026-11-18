@@ -245,7 +245,7 @@ type LineRecord struct {
 	Session      string   `json:"session,omitempty"`
 	Context      bool     `json:"context,omitempty"`
 	Verdict      string   `json:"verdict"`
-	Kinds        []string `json:"kinds,omitempty"`
+	Categories   []string `json:"categories,omitempty"`
 	SH           *float64 `json:"sh,omitempty"`
 	C            *float64 `json:"c,omitempty"`
 	Why          string   `json:"why,omitempty"`
@@ -603,14 +603,14 @@ func (e *Engine) line(l Line, given *scored) Result {
 	v := given.v
 	later := errors.Is(given.err, ErrLater) && l.Ref != ""
 	if given.err != nil {
-		v.Hold, v.Kinds = true, nil
+		v.Hold, v.Categories = true, nil
 		rec.Why = "scorer: " + given.err.Error()
 	}
-	en.session, en.held, en.kinds = s.id, v.Hold && !later, v.Kinds
+	en.session, en.held, en.categories = s.id, v.Hold && !later, v.Categories
 	e.st.add(en)
 	s.mine = append(s.mine, en.pos)
 	s.last = l.Time
-	rec.Session, rec.Kinds, rec.SH, rec.C = s.id, v.Kinds, v.SH, v.C
+	rec.Session, rec.Categories, rec.SH, rec.C = s.id, v.Categories, v.SH, v.C
 	switch {
 	case later:
 		rec.Verdict = "hold"
@@ -645,21 +645,21 @@ func (e *Engine) Unscored(ref string) bool { return e.later[ref] != nil }
 
 // RescoredRecord is the verdict of a line held while it waited to be scored.
 type RescoredRecord struct {
-	Time    string   `json:"time"`
-	Stream  string   `json:"stream"`
-	Session string   `json:"session"`
-	ID      string   `json:"id"`
-	Ref     string   `json:"ref"`
-	Verdict string   `json:"verdict"`
-	Kinds   []string `json:"kinds,omitempty"`
-	SH      *float64 `json:"sh,omitempty"`
-	C       *float64 `json:"c,omitempty"`
-	Why     string   `json:"why,omitempty"`
+	Time       string   `json:"time"`
+	Stream     string   `json:"stream"`
+	Session    string   `json:"session"`
+	ID         string   `json:"id"`
+	Ref        string   `json:"ref"`
+	Verdict    string   `json:"verdict"`
+	Categories []string `json:"categories,omitempty"`
+	SH         *float64 `json:"sh,omitempty"`
+	C          *float64 `json:"c,omitempty"`
+	Why        string   `json:"why,omitempty"`
 }
 
 // Rescored takes the verdict (or the error) the driver got for a line held while it waited to be scored: a line to
-// hold becomes one of its session's held lines, with its kinds; a line to deliver, and its held repeats, are released.
-// A line its session already settled (Wait or the session's end came first) stays held unscored.
+// hold becomes one of its session's held lines, with its categories; a line to deliver, and its held repeats, are
+// released. A line its session already settled (Wait or the session's end came first) stays held unscored.
 func (e *Engine) Rescored(ref string, v Verdict, err error) Result {
 	en := e.later[ref]
 	if en == nil {
@@ -675,12 +675,12 @@ func (e *Engine) Rescored(ref string, v Verdict, err error) Result {
 	rec := RescoredRecord{Time: stamp(e.now), Stream: s.st.name, Session: s.id, ID: en.line.ID, Ref: ref,
 		Verdict: "hold", SH: v.SH, C: v.C}
 	if err != nil {
-		v.Hold, v.Kinds = true, nil
+		v.Hold, v.Categories = true, nil
 		rec.Why = "scorer: " + err.Error()
 	}
 	var r Result
 	if v.Hold || s.banned {
-		en.held, en.kinds, rec.Kinds = true, v.Kinds, v.Kinds
+		en.held, en.categories, rec.Categories = true, v.Categories, v.Categories
 		e.rec.Record("rescored", rec)
 		r = e.hold(s, en.pos)
 	} else {
@@ -705,8 +705,8 @@ func (e *Engine) Rescored(ref string, v Verdict, err error) Result {
 	return r
 }
 
-// settle makes the session's lines still waiting to be scored held lines without a kind, for a checkpoint that cannot
-// wait for them (the session waited Wait, or ends).
+// settle makes the session's lines still waiting to be scored held lines without a category, for a checkpoint that
+// cannot wait for them (the session waited Wait, or ends).
 func (e *Engine) settle(s *session) {
 	for _, p := range s.unscored {
 		en := s.st.get(p)

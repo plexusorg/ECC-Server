@@ -43,9 +43,9 @@ type Spec struct {
 		BOS *int64 `json:"bos"`
 		EOS *int64 `json:"eos"`
 	} `json:"special_tokens"`
-	Outputs  []string `json:"outputs"`
-	Kinds    []string `json:"kinds"`
-	OpenVINO struct {
+	Outputs    []string `json:"outputs"`
+	Categories []string `json:"categories"`
+	OpenVINO   struct {
 		Version string         `json:"version"`
 		Device  string         `json:"device"`
 		Compile map[string]any `json:"compile"`
@@ -68,8 +68,8 @@ type Spec struct {
 	Thresholds struct {
 		Hold    map[string]float32 `json:"hold"`
 		Default string             `json:"default"`
-		// Kinds, when the bundle sets them: C's logit for a kind at or over its threshold marks the line with it.
-		Kinds map[string]float32 `json:"kinds"`
+		// Categories, when the bundle sets them: C's logit for a category at or over its threshold marks the line with it.
+		Categories map[string]float32 `json:"categories"`
 	} `json:"thresholds"`
 }
 
@@ -190,7 +190,7 @@ func ReadSpec(dir string) (*Spec, error) {
 			}
 		}
 		if name == "thresholds" {
-			for _, group := range []string{"hold", "kinds"} {
+			for _, group := range []string{"hold", "categories"} {
 				if section[group] == nil {
 					continue
 				}
@@ -226,8 +226,8 @@ func ReadSpec(dir string) (*Spec, error) {
 		return nil, errors.New("bundle.json: special_tokens needs bos and eos")
 	case !slices.Equal(s.Outputs, []string{"ask_contact", "give_contact", "ask_personal", "give_personal", "off_server", "sexual", "romantic", "hold"}):
 		return nil, errors.New("bundle.json: outputs must contain the seven facts then hold in the supported order")
-	case !slices.Equal(s.Kinds, s.Outputs[:7]):
-		return nil, errors.New("bundle.json: kinds must contain the seven facts in the supported order")
+	case !slices.Equal(s.Categories, s.Outputs[:7]):
+		return nil, errors.New("bundle.json: categories must contain the seven facts in the supported order")
 	case s.OpenVINO.Device != "CPU" || s.OpenVINO.Batch != 1:
 		return nil, errors.New("bundle.json: openvino must name the CPU device and batch 1")
 	case s.Context.Lines < 1 || s.Context.Seconds < 1 || s.Context.Private == "":
@@ -240,9 +240,9 @@ func ReadSpec(dir string) (*Spec, error) {
 	if _, ok := t.Hold[t.Default]; !ok {
 		return nil, fmt.Errorf("bundle.json: thresholds.default %q is not one of thresholds.hold", t.Default)
 	}
-	for k := range t.Kinds {
-		if !slices.Contains(s.Kinds, k) {
-			return nil, fmt.Errorf("bundle.json: thresholds.kinds names %s, which is not one of kinds", k)
+	for k := range t.Categories {
+		if !slices.Contains(s.Categories, k) {
+			return nil, fmt.Errorf("bundle.json: thresholds.categories names %s, which is not one of categories", k)
 		}
 	}
 	return &s, nil
@@ -267,7 +267,7 @@ type Scorer struct {
 	threshold      string
 	hold           float32
 	holdAt         int
-	kinds          []kindMark
+	categories     []categoryMark
 	public, placed map[string]bool
 	bos, eos       int64
 
@@ -275,7 +275,7 @@ type Scorer struct {
 	st *stream
 }
 
-type kindMark struct {
+type categoryMark struct {
 	name string
 	at   int
 	min  float32
@@ -297,9 +297,9 @@ func Open(dir string, spec *Spec, opt Options) (*Scorer, error) {
 		return nil, fmt.Errorf("the bundle has no hold threshold %q (it has %v)", s.threshold, keys(spec.Thresholds.Hold))
 	}
 	s.hold = hold
-	for _, k := range spec.Kinds {
-		if v, ok := spec.Thresholds.Kinds[k]; ok {
-			s.kinds = append(s.kinds, kindMark{k, slices.Index(spec.Outputs, k), v})
+	for _, k := range spec.Categories {
+		if v, ok := spec.Thresholds.Categories[k]; ok {
+			s.categories = append(s.categories, categoryMark{k, slices.Index(spec.Outputs, k), v})
 		}
 	}
 	for _, c := range spec.Context.Public {
@@ -376,8 +376,8 @@ func (s *Scorer) Close() {
 // Threshold is the name of the hold threshold in use.
 func (s *Scorer) Threshold() string { return s.threshold }
 
-// MarksKinds tells whether the bundle sets kind thresholds.
-func (s *Scorer) MarksKinds() bool { return len(s.kinds) > 0 }
+// MarksCategories tells whether the bundle sets category thresholds.
+func (s *Scorer) MarksCategories() bool { return len(s.categories) > 0 }
 
 // ---------------------------------------------------------------- the context
 
@@ -632,9 +632,9 @@ func (s *Scorer) run(e *entry, ctx []*entry) (Detail, error) {
 		d.Held[k] = d.C[s.holdAt] >= v
 	}
 	d.Verdict.Hold = d.C[s.holdAt] >= s.hold
-	for _, k := range s.kinds {
+	for _, k := range s.categories {
 		if d.C[k.at] >= k.min {
-			d.Verdict.Kinds = append(d.Verdict.Kinds, k.name)
+			d.Verdict.Categories = append(d.Verdict.Categories, k.name)
 		}
 	}
 	return d, nil

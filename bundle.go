@@ -48,12 +48,12 @@ type Bundle struct {
 		} `json:"checkpoints"`
 		// Render: how a session is shown to the judge (core.Render).
 		Render struct {
-			Before    int               `json:"before"`
-			After     int               `json:"after"`
-			MaxChars  int               `json:"max_chars"`
-			CutBefore int               `json:"cut_before"`
-			CutAfter  int               `json:"cut_after"`
-			Kinds     map[string]string `json:"kinds"`
+			Before     int               `json:"before"`
+			After      int               `json:"after"`
+			MaxChars   int               `json:"max_chars"`
+			CutBefore  int               `json:"cut_before"`
+			CutAfter   int               `json:"cut_after"`
+			Categories map[string]string `json:"categories"`
 		} `json:"render"`
 	} `json:"judge"`
 	// Links: the canonical link that replaces each link on the plugin's allowlist in the text the fast model sees,
@@ -262,7 +262,7 @@ func coreConfig(cfg Config, b *Bundle) core.Config {
 	c := core.Config{Schedule: cp.Schedule, Every: cp.Every, Wait: sec(cp.WaitSeconds),
 		SessionEnd: sec(cp.SessionEndSeconds), ReviewHeld: cp.ReviewHeld,
 		Render: core.Render{Before: r.Before, After: r.After, MaxChars: r.MaxChars, CutBefore: r.CutBefore,
-			CutAfter: r.CutAfter, Kinds: r.Kinds},
+			CutAfter: r.CutAfter, Categories: r.Categories},
 		CanonicalLink: b.Links.Canonical, MaxPromptChars: cfg.Budget.MaxPromptChars,
 		MaxCallsPerDay: cfg.Budget.MaxCallsPerDay, Channels: b.Channels,
 		RetryAfter: orDefault(cfg.Test.JudgeRetryAfter, judgeRetryAfter)}
