@@ -5,13 +5,14 @@
 package main
 
 import (
+	"cmp"
+	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net"
 	"os"
-	"regexp"
-	"slices"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -22,76 +23,34 @@ var version = "dev"
 
 const defaultConfig = "/etc/ecc-server/config.toml"
 
-type Config struct {
-	Listen string `toml:"listen"`
-	Data   string `toml:"data"`
-	// This game server's name, written in every record line.
-	Server string `toml:"server"`
-	// How many days the daily records are kept.
-	RecordRetentionDays int `toml:"record_retention_days"`
-	// The W&B artifact whose `production` alias names the bundle to serve, and how often to check it.
-	WandbEntity   string        `toml:"wandb_entity"`
-	WandbProject  string        `toml:"wandb_project"`
-	WandbArtifact string        `toml:"wandb_artifact"`
-	CheckInterval time.Duration `toml:"check_interval"`
+// The data folder: the bundle store, state, actions, the judge's spend, the review queue and the records.
+const dataDir = "/var/lib/ecc-server"
 
+type Config struct {
+	Listen string       `toml:"listen"`
 	Model  ModelConfig  `toml:"model"`
-	Judge  JudgeConfig  `toml:"judge"`
 	Budget BudgetConfig `toml:"budget"`
-	Chat   ChatConfig   `toml:"chat"`
 	Test   TestConfig   `toml:"test"`
+
+	// Data is the data folder: dataDir, or the rig's [test] data.
+	Data string `toml:"-"`
 }
 
-// ModelConfig is how the bundle's models run on this host.
 type ModelConfig struct {
-	// Threads is each model's CPU threads.
-	Threads int `toml:"threads"`
-	// MaxWait: a line still waiting for its verdict this long after it arrived is answered hold (core.ErrLater). Its
-	// models run to their end, when the worker comes to it if they had not started, and their verdict is applied then.
-	MaxWait time.Duration `toml:"max_wait"`
-	// Threshold names the bundle's hold threshold to use; empty is the bundle's default.
+	// Threshold names the bundle's hold threshold to serve; empty is the bundle's default.
 	Threshold string `toml:"threshold"`
 }
 
-// JudgeConfig is the Bedrock model the judge calls.
-type JudgeConfig struct {
-	Region string `toml:"region"`
-	Model  string `toml:"model"`
-	// ServiceTier is Bedrock's service tier: flex, default or priority.
-	ServiceTier string `toml:"service_tier"`
-	// ReasoningEffort is the Responses API's reasoning.effort: none, low, medium, high, xhigh or max.
-	ReasoningEffort string        `toml:"reasoning_effort"`
-	MaxOutputTokens int           `toml:"max_output_tokens"`
-	Timeout         time.Duration `toml:"timeout"`
-}
-
-// BudgetConfig caps what the judge's calls cost.
+// BudgetConfig is what the judge may spend, in US dollars, per UTC day and per UTC month.
 type BudgetConfig struct {
 	DailyUSD   float64 `toml:"daily_usd"`
 	MonthlyUSD float64 `toml:"monthly_usd"`
-	// Standard-tier prices in dollars per million tokens; the server halves them on the flex tier.
-	InputPerMillion      float64 `toml:"input_per_million"`
-	OutputPerMillion     float64 `toml:"output_per_million"`
-	CacheReadPerMillion  float64 `toml:"cache_read_per_million"`
-	CacheWritePerMillion float64 `toml:"cache_write_per_million"`
-	// A prompt longer than this many characters is not sent; no more than MaxCallsPerDay calls are made in a UTC day.
-	MaxPromptChars int `toml:"max_prompt_chars"`
-	MaxCallsPerDay int `toml:"max_calls_per_day"`
-}
-
-// ChatConfig is the server's part of the decision settings; the bundle carries the rest, and the plugin sends which
-// players are trusted and the allowlist of links.
-type ChatConfig struct {
-	// Set, these replace the bundle's checkpoint schedule, its every-n-th held line and its waiting time.
-	Schedule []int         `toml:"schedule"`
-	Every    int           `toml:"every"`
-	Wait     time.Duration `toml:"wait"`
-
-	setSchedule, setEvery, setWait bool
 }
 
 // TestConfig is for the end-to-end rig only.
 type TestConfig struct {
+	// Data replaces the data folder.
+	Data string `toml:"data"`
 	// HoldWordsFile names a file of words, one a line: the rig's scorer holds a line that contains one of them.
 	HoldWordsFile string `toml:"hold_words_file"`
 	// BedrockEndpoint replaces the Bedrock runtime endpoint (a local stub of the Responses API).
@@ -110,92 +69,35 @@ type TestConfig struct {
 	SlowCall time.Duration `toml:"slow_call"`
 }
 
-var serverName = regexp.MustCompile(`^[a-z0-9_-]{1,32}$`)
-
-// The region becomes part of the Bedrock endpoint's host name.
-var regionName = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
-
+// loadConfig reads the config file; a missing file gives the defaults.
 func loadConfig(path string) (Config, error) {
-	cfg := Config{Listen: "127.0.0.1:8790", Data: "/var/lib/ecc-server", RecordRetentionDays: 180,
-		WandbEntity: "telesphoreo-telesphoreo", WandbProject: "ecc", WandbArtifact: "classifier-bundle",
-		CheckInterval: 10 * time.Minute,
-		Model:         ModelConfig{Threads: 6, MaxWait: 900 * time.Millisecond},
-		Judge: JudgeConfig{Region: "us-east-1", Model: "us.moonshotai.kimi-k3.1", ServiceTier: "flex",
-			ReasoningEffort: "medium", MaxOutputTokens: 16000, Timeout: 10 * time.Minute},
-		Budget: BudgetConfig{DailyUSD: 25, MonthlyUSD: 250, InputPerMillion: 4.40, OutputPerMillion: 22.00,
-			CacheReadPerMillion: 0.22, CacheWritePerMillion: 5.50, MaxPromptChars: 500000, MaxCallsPerDay: 2000}}
-	md, err := toml.DecodeFile(path, &cfg)
-	if err != nil {
-		return cfg, fmt.Errorf("config %s: %w", path, err)
-	}
-	if keys := md.Undecoded(); len(keys) > 0 {
-		return cfg, fmt.Errorf("config %s: unknown keys %v", path, keys)
-	}
-	cfg.Chat.setSchedule = md.IsDefined("chat", "schedule")
-	cfg.Chat.setEvery = md.IsDefined("chat", "every")
-	cfg.Chat.setWait = md.IsDefined("chat", "wait")
+	cfg := Config{Listen: "127.0.0.1:8790", Budget: BudgetConfig{DailyUSD: 25, MonthlyUSD: 250}}
 	bad := func(format string, args ...any) (Config, error) {
 		return cfg, fmt.Errorf("config %s: "+format, append([]any{path}, args...)...)
 	}
+	raw, err := os.ReadFile(path)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return cfg, fmt.Errorf("config: %w", err)
+	}
+	if err == nil {
+		md, err := toml.Decode(string(raw), &cfg)
+		if err != nil {
+			return bad("%w", err)
+		}
+		if keys := md.Undecoded(); len(keys) > 0 {
+			return bad("unknown keys %v", keys)
+		}
+	}
+	cfg.Data = cmp.Or(cfg.Test.Data, dataDir)
 	if _, _, err := net.SplitHostPort(cfg.Listen); err != nil {
 		return bad("listen: %w", err)
 	}
-	if cfg.Data == "" {
-		return bad("data is empty")
-	}
-	if cfg.WandbEntity == "" || cfg.WandbProject == "" || cfg.WandbArtifact == "" {
-		return bad("wandb_entity, wandb_project and wandb_artifact must not be empty")
-	}
-	if cfg.CheckInterval < time.Minute {
-		return bad("check_interval must be at least 1m")
-	}
-	if !serverName.MatchString(cfg.Server) {
-		return bad("server %q must be 1 to 32 lowercase letters, digits, - or _", cfg.Server)
-	}
-	if cfg.RecordRetentionDays < 3 {
-		return bad("record_retention_days must be at least 3")
-	}
-	if m := cfg.Model; m.Threads < 1 || m.MaxWait < 10*time.Millisecond {
-		return bad("model.threads must be at least 1, model.max_wait at least 10ms")
+	if b := cfg.Budget; b.DailyUSD < 0 || b.MonthlyUSD < 0 {
+		return bad("budget.daily_usd and budget.monthly_usd must not be negative")
 	}
 	if t := cfg.Test; (t.SlowWord != "") != (t.SlowFor > 0) || t.SlowWord != "" && t.HoldWordsFile == "" {
 		return bad("test.slow_word and test.slow_for are set together, with test.hold_words_file")
 	}
-	j := cfg.Judge
-	switch {
-	case !regionName.MatchString(j.Region):
-		return bad("judge.region %q is not an AWS region name", j.Region)
-	case j.Model == "":
-		return bad("judge.model is empty")
-	case j.ServiceTier != "flex" && j.ServiceTier != "default" && j.ServiceTier != "priority":
-		return bad("judge.service_tier must be flex, default or priority")
-	case !slices.Contains([]string{"none", "low", "medium", "high", "xhigh", "max"}, j.ReasoningEffort):
-		return bad("judge.reasoning_effort must be none, low, medium, high, xhigh or max")
-	case j.MaxOutputTokens < 16:
-		return bad("judge.max_output_tokens must be at least 16")
-	case j.Timeout < 10*time.Second:
-		return bad("judge.timeout must be at least 10s")
-	}
-	b := cfg.Budget
-	for _, p := range []float64{b.DailyUSD, b.MonthlyUSD, b.InputPerMillion, b.OutputPerMillion, b.CacheReadPerMillion,
-		b.CacheWritePerMillion} {
-		if p < 0 {
-			return bad("budget amounts and prices must not be negative")
-		}
-	}
-	if b.MaxPromptChars < 1 || b.MaxCallsPerDay < 1 {
-		return bad("budget.max_prompt_chars and budget.max_calls_per_day must be at least 1")
-	}
-	c := cfg.Chat
-	for _, n := range c.Schedule {
-		if n < 1 {
-			return bad("chat.schedule counts must be at least 1")
-		}
-	}
-	if c.Every < 0 || c.Wait < 0 {
-		return bad("chat.every and chat.wait must not be negative")
-	}
-
 	return cfg, nil
 }
 
@@ -215,7 +117,7 @@ const usage = `ecc-server <command> [-config FILE] [FOLDER]
   score ...        score a file of lines with a bundle's models, as the reference scorer does (ecc-server score -h)
   version          print the ecc-server version
 
-The config file defaults to ` + defaultConfig + `.
+The config file is ` + defaultConfig + ` unless -config names another; without one the defaults apply.
 `
 
 func main() {

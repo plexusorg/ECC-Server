@@ -107,7 +107,7 @@ func wandbLogin() error {
 	return restartService()
 }
 
-// bedrockLogin checks a Bedrock API key with a small Responses call to the configured model, which proves both the
+// bedrockLogin checks a Bedrock API key with a small Responses call to the judge's model, which proves both the
 // key and its access to the model, and stores it encrypted for the service.
 func bedrockLogin(cfg Config) error {
 	key, err := readKey("bedrock", "Amazon Bedrock API key: ")
@@ -117,13 +117,13 @@ func bedrockLogin(cfg Config) error {
 	b := newBedrock(key, cfg)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	if _, err := b.respond(ctx, "Hi", 0, loginCheckMaxTokens, "none", cfg.Judge.ServiceTier); err != nil {
-		return fmt.Errorf("checking the key with a call to %s in %s: %w", cfg.Judge.Model, cfg.Judge.Region, err)
+	if _, err := b.respond(ctx, "Hi", 0, loginCheckMaxTokens, "none", judgeServiceTier); err != nil {
+		return fmt.Errorf("checking the key with a call to %s in %s: %w", judgeModel, judgeRegion, err)
 	}
 	if err := storeCredential(bedrockCredential, key); err != nil {
 		return err
 	}
-	fmt.Printf("the key can call %s in %s; stored it, encrypted, in %s\n", cfg.Judge.Model, cfg.Judge.Region, credFile(bedrockCredential))
+	fmt.Printf("the key can call %s in %s; stored it, encrypted, in %s\n", judgeModel, judgeRegion, credFile(bedrockCredential))
 	return restartService()
 }
 

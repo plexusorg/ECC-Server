@@ -23,8 +23,6 @@ const loginCheckMaxTokens = 16
 // (POST <endpoint>/openai/v1/responses) with the Bedrock API key, a bearer token. Each call is one attempt.
 type bedrock struct {
 	key      string
-	region   string
-	model    string
 	endpoint string // https://bedrock-runtime.<region>.amazonaws.com, or the rig's stub
 	client   *http.Client
 
@@ -55,16 +53,14 @@ type callTotals struct {
 func newBedrock(key string, cfg Config) *bedrock {
 	endpoint := cfg.Test.BedrockEndpoint
 	if endpoint == "" {
-		endpoint = "https://bedrock-runtime." + cfg.Judge.Region + ".amazonaws.com"
+		endpoint = "https://bedrock-runtime." + judgeRegion + ".amazonaws.com"
 	}
 	return &bedrock{
 		key:      key,
-		region:   cfg.Judge.Region,
-		model:    cfg.Judge.Model,
 		endpoint: strings.TrimSuffix(endpoint, "/"),
 		client:   &http.Client{},
-		st: bedrockStatus{KeySet: key != "", Region: cfg.Judge.Region, Model: cfg.Judge.Model,
-			Tier: cfg.Judge.ServiceTier, Effort: cfg.Judge.ReasoningEffort},
+		st: bedrockStatus{KeySet: key != "", Region: judgeRegion, Model: judgeModel, Tier: judgeServiceTier,
+			Effort: judgeReasoningEffort},
 	}
 }
 
@@ -181,7 +177,7 @@ func (e *bedrockError) passing() bool {
 // not cached): the first part carries an explicit cache breakpoint. effort "" leaves the model's default reasoning,
 // tier "" the account's default tier.
 func (b *bedrock) respond(ctx context.Context, prompt string, split, maxTokens int, effort, tier string) (*judgeAnswer, error) {
-	body := responsesRequest{Model: b.model, MaxOutputTokens: maxTokens, ServiceTier: tier}
+	body := responsesRequest{Model: judgeModel, MaxOutputTokens: maxTokens, ServiceTier: tier}
 	msg := responsesInput{Type: "message", Role: "user"}
 	if split > 0 && split < len(prompt) {
 		body.PromptCacheOptions = &cacheMode{"explicit"}
@@ -323,7 +319,7 @@ func (b *bedrock) record(err error, promptBytes int, res *judgeAnswer, cost floa
 	if errors.As(err, &be) && be.auth() {
 		if !b.authFailing {
 			slog.Error("Bedrock refused the key for the judge; set a valid key with access to the model with sudo ecc-server bedrock login",
-				"status", be.Status, "type", be.Type, "model", b.model)
+				"status", be.Status, "type", be.Type, "model", judgeModel)
 			b.authFailing = true
 		}
 		return

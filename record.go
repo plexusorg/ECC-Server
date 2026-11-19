@@ -21,15 +21,20 @@ import (
 // is compressed to YYYY-MM-DD.jsonl.zst and compressed files past retention are deleted. Lines are written in the order they are
 // appended, each flushed at once, so a crash loses at most the line being written.
 type recordLog struct {
-	dir       string
-	server    string
-	retention int
+	dir string
 
 	mu  sync.Mutex
 	day string // the open file's day, "" when none is open
 	f   *os.File
 	w   *bufio.Writer
 }
+
+const (
+	// This game server's name, written in every record line.
+	serverName = "tf"
+	// How many days the compressed daily records are kept.
+	recordRetentionDays = 180
+)
 
 var recordFile = regexp.MustCompile(`^(\d{4}-\d{2}-\d{2})\.jsonl(\.zst)?$`)
 
@@ -41,7 +46,7 @@ func stamp(t time.Time) string {
 // openRecord compresses the files an earlier run left, applies retention, and rotates at each midnight until ctx
 // ends.
 func openRecord(ctx context.Context, cfg Config) (*recordLog, error) {
-	r := &recordLog{dir: filepath.Join(cfg.Data, "record"), server: cfg.Server, retention: cfg.RecordRetentionDays}
+	r := &recordLog{dir: filepath.Join(cfg.Data, "record")}
 	if err := os.MkdirAll(r.dir, 0o750); err != nil {
 		return nil, err
 	}
@@ -75,7 +80,7 @@ func (r *recordLog) append(typ string, v any) {
 	head, _ := json.Marshal(struct {
 		Type   string `json:"type"`
 		Server string `json:"server"`
-	}{typ, r.server})
+	}{typ, serverName})
 	line := head[:len(head)-1]
 	if len(body) > 2 {
 		line = append(append(line, ','), body[1:]...)
@@ -130,7 +135,7 @@ func (r *recordLog) rotate() {
 	if r.day != "" && r.day != today {
 		r.closeFile()
 	}
-	oldest := time.Date(now.Year(), now.Month(), now.Day()-r.retention, 0, 0, 0, 0, time.UTC).Format(time.DateOnly)
+	oldest := time.Date(now.Year(), now.Month(), now.Day()-recordRetentionDays, 0, 0, 0, 0, time.UTC).Format(time.DateOnly)
 	entries, err := os.ReadDir(r.dir)
 	if err != nil {
 		slog.Error("could not list the records", "dir", r.dir, "err", err)

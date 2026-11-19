@@ -5,68 +5,14 @@
 # for example the bridge gateway, "172.17.0.1:8790". Do not expose it beyond the networks that need it.
 listen = "127.0.0.1:8790"
 
-# Bundle store, state, actions, the judge's spend, the review queue and the records.
-data = "/var/lib/ecc-server"
-
-# This game server's name, written in every record line: 1 to 32 of a-z, 0-9, - and _.
-server = "tf"
-
-# How many days the daily records in <data>/record are kept (at least 3).
-record_retention_days = 180
-
-# The W&B artifact whose `production` alias names the bundle to serve. The API key is not set here:
-# `sudo ecc-server wandb login` stores it encrypted for the service.
-wandb_entity = "telesphoreo-telesphoreo"
-wandb_project = "ecc"
-wandb_artifact = "classifier-bundle"
-
-# How often the host checks W&B's production alias (at least 1m).
-check_interval = "10m"
-
-# The bundle's models run on this host's CPU: threads per model call (one call runs at a time, always to its end), and
-# how long a line may wait for its verdict before it is answered hold. Its models still run: their verdict is applied
-# when they end, and a line they would deliver is released. Keep max_wait a little under Module-ECC's
-# chat_safety.verdict_timeout_ms (1000 ms by default): a line the plugin has stopped waiting for is held by the plugin
-# anyway. threshold names the bundle's hold threshold to use; empty is the bundle's default.
+# The name of the bundle's hold threshold to serve, such as "2pct" or "1pct", to change how much the fast model holds
+# without a new bundle. Empty serves the bundle's default; a name the bundle does not have keeps it from loading.
 [model]
-threads = 6
-max_wait = "900ms"
 threshold = ""
 
-# The judge: the Amazon Bedrock region and model (a model or inference profile ID) it calls through the Responses API,
-# the service tier (flex, default or priority), the reasoning effort (none, low, medium, high, xhigh or max; every
-# judge measurement used medium), the most output tokens a call may produce, reasoning included, and how long a call
-# may take. A failed call (throttling, a server error, a timeout) is tried again from 5 s, doubling, for up to 5
-# minutes; its checkpoint is then put again every 5 minutes until the sitting ends. The API key is not set here:
-# `sudo ecc-server bedrock login` stores it encrypted for the service.
-[judge]
-region = "us-east-1"
-model = "us.moonshotai.kimi-k3.1"
-service_tier = "flex"
-reasoning_effort = "medium"
-max_output_tokens = 16000
-timeout = "10m"
-
-# What the judge may spend, in US dollars, per UTC day and per UTC month. Prices are the standard tier's, per million
-# tokens; on the flex tier the server halves them. Before each call the server checks the day's and the month's totals
-# plus the call's worst case (every byte of the prompt a token at the dearest input price, and max_output_tokens of
-# output); a call that does not fit is not made, its lines stay held, its sitting goes to the review queue, and staff
-# with the alert permission are told once a day (or month). A prompt longer than max_prompt_chars is not sent, and no
-# more than max_calls_per_day calls are made in a UTC day.
+# What the judge may spend, in US dollars, per UTC day and per UTC month. A call that would pass either budget is not
+# made: its lines stay held, its session goes to the review queue, and staff with the alert permission are told once
+# a day (or month).
 [budget]
 daily_usd = 25.0
 monthly_usd = 250.0
-input_per_million = 4.40
-output_per_million = 22.00
-cache_read_per_million = 0.22
-cache_write_per_million = 5.50
-max_prompt_chars = 500000
-max_calls_per_day = 2000
-
-[chat]
-# The bundle sets when the judge is called. Set these to replace its schedule (the held-line counts of a sitting that
-# bring a checkpoint), its every-n-th held line after the schedule (0: none) and how long a held line waits for a
-# ruling before it brings a checkpoint, for example:
-# schedule = [1, 4]
-# every = 10
-# wait = "5m"

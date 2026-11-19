@@ -73,9 +73,9 @@ reads:
   host checks the path list and digest, then hashes the values as `rules.how` states; a bundle whose rules hash
   differently from the ones this host implements is refused, and so is one whose text limits, marks, whitespace or
   link pattern differ;
-- `thresholds`: `hold` (by name), `default` and optional `categories`. Leave the configured threshold empty to use
-  the bundle's default. Set an explicit hold key to select another operating point. Category thresholds add hints;
-  they do not clear a hold;
+- `thresholds`: `hold` (by name), `default` and optional `categories`. The host serves the hold threshold that
+  `[model] threshold` names, or `default` when it is empty (see Configuration). Category thresholds add hints; they do
+  not clear a hold;
 - `judge.question`: `question.md`, whose `json` block holds the prompt's fixed strings (`QUESTION`, `ADDED`, `FORMAT`
   and the separators, which must be the ones the host lays the prompt out with, or the bundle is refused);
 - `judge.examples`: `examples.json`, the owner's ruled cases (`examples`: `id`, `ruling`, `date`, `text`) in the
@@ -87,13 +87,11 @@ reads:
 - `links`: `canonical`, the link the models were trained with in place of an allowed link, and the link `pattern` and
   `rule` (see A line).
 
-The config replaces only the checkpoint schedule, `every` and the wait when it sets them (see Configuration).
-
 ## Updates from W&B
 
-The pipeline uploads each bundle to W&B as a version of the `classifier-bundle` artifact. Promoting a bundle is moving
-the artifact's `production` alias to it in W&B; the host picks it up within `check_interval` (10 minutes by default),
-or at once on `sudo ecc-server update`.
+The pipeline uploads each bundle to W&B as a version of the `classifier-bundle` artifact in the
+`telesphoreo-telesphoreo/ecc` project. Promoting a bundle is moving the artifact's `production` alias to it in W&B; the
+host checks the alias every 10 minutes, and at once on `sudo ecc-server update`.
 
 **The key.** `sudo ecc-server wandb login` reads the API key from a hidden prompt (or from standard input when
 piped), checks it with W&B, encrypts it with `systemd-creds encrypt` into
@@ -148,13 +146,13 @@ session. A private message is a `msg` line; its conversation is the pair of the 
 scored by the fast model with the lines before it that the bundle's `context` names (the public lines, a private
 message's earlier messages between the same two players, a placed line's author's earlier placed lines: the last 30
 within 30 minutes); a line the scorer cannot score is held. Lines are scored one at a time, in the order they arrive,
-and a model call always runs to its end. A line still waiting for its verdict `[model] max_wait` after it arrived is
-answered hold, so neither a burst nor a slow call keeps Module-ECC waiting past its own timeout, and is context for
+and a model call always runs to its end. A line still waiting for its verdict 900 ms after it arrived is answered
+hold, so neither a burst nor a slow call keeps Module-ECC waiting past its own 1000 ms timeout, and is context for
 later lines at once. If its models are running then, their verdict is applied when they end; if they had not started,
 the line is scored, with the context it had, as soon as no line is waiting. Either way a line the models would hold
 becomes one of its session's held lines, with its categories, and a line they would deliver is released with its repeats
 (`release`). Until then its session's checkpoints wait for it, so the judge never sees it unscored; only when the
-session ends, or the line has waited `[chat] wait`, first is it put to the judge as held without a category. `/status`
+session ends, or the line has waited the bundle's `wait_seconds`, first is it put to the judge as held without a category. `/status`
 counts such lines (`held_unscored`). A model call that has run 10 seconds is logged as an error and staff are told
 (notice `slow_model`); `/status` shows how long the call in progress has run (`model_call_seconds`). The lines behind
 it wait in the queue, and Module-ECC holds each one it got no verdict for and asks again. A bundle switch comes between two lines: the new models take the lists of earlier lines
@@ -221,8 +219,8 @@ line from the player. One cached answer cannot supply both confirmations. An unc
 release a line, ban or kick a player, or write an IP ban. A previously released line remains evidence in later cases,
 but the render marks it as previously cleared.
 
-A checkpoint the judge does not rule (three invalid answers, a refusal by Bedrock, a prompt over `max_prompt_chars`,
-the day's calls or a budget used up, no Bedrock key, or a judge it could not reach before the session ended) leaves
+A checkpoint the judge does not rule (three invalid answers, a refusal by Bedrock, a prompt over 500,000 characters,
+the day's 2,000 calls or a budget used up, no Bedrock key, or a judge it could not reach before the session ended) leaves
 its lines held.
 
 **The review queue.** The host adds a session to `<data>/review/queue.jsonl` at once after an uncertain answer or
@@ -244,9 +242,9 @@ after `ok: false` the action stays and is served again. A restart of either prog
 acknowledged.
 
 **The record.** `<data>/record/YYYY-MM-DD.jsonl` (UTC days), one JSON line per event, each with `type` and `server`
-(the config's `server`): every `line` (stream, id, ref: Module-ECC's id for it, time, channel, conversation, account, name and the raw name,
+(the game server's name, `tf`): every `line` (stream, id, ref: Module-ECC's id for it, time, channel, conversation, account, name and the raw name,
 target, the prepared and the raw text, session, verdict, categories, `classifier`: the hold logit), `rescored` (the
-verdict, categories and hold logit of a line answered hold at `max_wait`, once its models end), `unscored` (such a line put to the judge without a score), `repeat`,
+verdict, categories and hold logit of a line answered hold at 900 ms, once its models end), `unscored` (such a line put to the judge without a score), `repeat`,
 `session_start`, `checkpoint` (the
 held-line count it covers, why it was made, the prompt's size and SHA-256, whether it was sent), `judge_call` (each
 call: attempt, status, the usage's input, cached, cache-write, output and reasoning tokens, cost, duration, or the
@@ -254,7 +252,7 @@ error, request/response identifiers and raw answer), `ruling` (the raw answer, c
 effective ruling and review reason, the error, or `pending` with the time it is put again), `checkpoint_again`,
 `action` (the core's, by line id), `action_sent` (as Module-ECC gets it), `ack`, `presence`, `session_end` (outcome, held, released and unruled
 lines, the checkpoints) and `review`. Lines are flushed one at a time. Just after midnight UTC the day's file is
-compressed to `YYYY-MM-DD.jsonl.zst`; compressed files older than `record_retention_days` are deleted.
+compressed to `YYYY-MM-DD.jsonl.zst`; compressed files older than 180 days are deleted.
 
 **The journal.** Run `journalctl -u ecc-server -f` to watch rulings and actions as they are made, and each judge
 call's size, token counts, cost and duration. The journal never holds player text, prompts or the judge's answers; the
@@ -263,9 +261,8 @@ record has the text and the rulings.
 ## The judge on Amazon Bedrock
 
 **The key.** `sudo ecc-server bedrock login` reads an Amazon Bedrock API key from a hidden prompt (or from standard
-input when piped) and checks it with a small Responses call (16 output tokens, no reasoning) to `judge.model` in
-`judge.region`,
-which proves both the key and its access to the model. A key Bedrock rejects, or any failed check, is not stored. A
+input when piped) and checks it with a small Responses call (16 output tokens, no reasoning) to the judge's model,
+`us.moonshotai.kimi-k3.1` in `us-east-1`, which proves both the key and its access to the model. A key Bedrock rejects, or any failed check, is not stored. A
 key that passes is stored the way the W&B key is: encrypted with `systemd-creds` into
 `/etc/credstore.encrypted/ecc-server.bedrock-api-key`, loaded by the unit's
 `LoadCredentialEncrypted=ecc-server.bedrock-api-key`, and the service is restarted if it is running. Without a stored
@@ -275,7 +272,9 @@ fix, until a call succeeds again.
 
 **The call.** A checkpoint starts with a Responses request. A firm ban requires another independent response to
 the same frozen prompt. Each request uses `POST
-https://bedrock-runtime.<region>.amazonaws.com/openai/v1/responses` with `Authorization: Bearer <key>`:
+https://bedrock-runtime.us-east-1.amazonaws.com/openai/v1/responses` with `Authorization: Bearer <key>`, on the flex
+service tier with medium reasoning effort (the settings the judge was measured with), at most 16,000 output tokens,
+reasoning included, and a 10-minute timeout:
 
 ```json
 {"model": "us.moonshotai.kimi-k3.1", "max_output_tokens": 16000, "reasoning": {"effort": "medium"},
@@ -289,28 +288,28 @@ The two parts, joined, are the prompt: the question, the owner's cases, the sess
 `[held]` and previously cleared lines marked separately, and the answer format. The first part is the same in every call and ends at an explicit cache breakpoint, so
 Bedrock serves it from its prompt cache (at least 30 minutes; a hit resets the time, and a request another server takes
 writes a new entry). `store` is false: Bedrock keeps no copy of the prompt or the answer. The answer is the output
-message's text; an answer whose `status` is `incomplete` (its output cut at `max_output_tokens`) is invalid. A valid
+message's text; an answer whose `status` is `incomplete` (its output cut at 16,000 tokens) is invalid. A valid
 answer is one JSON object (a Markdown code fence around it is accepted) whose `rulings` list holds one entry for the
 case `N1`: `ruling` `nothing`, `hold` or `ban` (`not ban`, a ruling of the owner's cases, is taken as `hold`); for
 `hold` or `ban`, `by` one of the player's lines the case shows; `like` a list of at most three of the owner's case
 ids; `sure` true or false. The host records both requests and responses when it seeks ban confirmation.
 An invalid answer is asked for again, up to three invalid answers per confirmation stage. A call that fails (`429`, a
-`5xx`, an answer whose `status` is `failed` or `cancelled`, the `timeout`, the network) is made again after 5 seconds, then 10, 20, ..., while the failures have lasted
+`5xx`, an answer whose `status` is `failed` or `cancelled`, the timeout, the network) is made again after 5 seconds, then 10, 20, ..., while the failures have lasted
 less than 5 minutes; then the checkpoint is pending: it is put again 5 minutes later, and so on until the session ends
 (`/status` counts the pending ones). A confirmation failure leaves the lines held. The host keeps the first firm
 ban with that pending job and seeks a separate valid confirmation when it retries. It applies no partial ban.
 A call refused by the budget, or by Bedrock for the key (`401`, `403`) or as a
 bad request, is not made again. Each of these stops, three invalid answers on one checkpoint and a missing key send
 staff a `notice` naming the cause, a notice of one cause at most once an hour (see HTTP interface).
-**The budget.** The host adds up each call's cost from the usage Bedrock returns at the configured prices, halved on
-the flex tier: the input tokens neither read from nor written to the cache at the input price, `cached_tokens` at the
-cache-read price, `cache_write_tokens` at the cache-write price (Bedrock documents that field for its OpenAI models; when
+**The budget.** The host adds up each call's cost from the usage Bedrock returns at the model's standard-tier prices
+per million tokens ($4.40 input, $22.00 output, $0.22 cache read, $5.50 cache write), halved on the flex tier: the
+input tokens neither read from nor written to the cache at the input price, `cached_tokens` at the cache-read price, `cache_write_tokens` at the cache-write price (Bedrock documents that field for its OpenAI models; when
 an answer does not state it, those tokens count at the input price), and the output, reasoning included, into the UTC day's and the UTC month's totals in
 `<data>/spend.json`, which a restart keeps. Before each call it reserves the call's worst case: every byte of the
-prompt a token at the dearest input price, plus `max_output_tokens` at the output price. The reservation counts as
+prompt a token at the dearest input price, plus 16,000 output tokens at the output price. The reservation counts as
 spent at once and is saved, so a call cut off by a crash or a restart stays charged its worst case; when the call
 returns, its cost replaces the reservation (nothing when Bedrock refused the request). A call whose worst case would
-take the day's or the month's total past its budget waits while other calls are in flight, and is not made once none
+take the day's or the month's total past its budget (`[budget]`, see Configuration) waits while other calls are in flight, and is not made once none
 is: its lines stay held, its session goes to the review queue, and the first refusal in a day (or month) sends a
 `notice` that staff with the alert permission see. `sudo ecc-server status` shows the totals.
 
@@ -330,38 +329,25 @@ release. Telesphorepo's CI pipeline trusts this workflow file on master, so no s
 
 ## Configuration
 
-A TOML file, `/etc/ecc-server/config.toml` unless `-config` names another. Unknown keys are rejected.
+A TOML file, `/etc/ecc-server/config.toml` unless `-config` names another. Without the file the defaults apply.
+Unknown keys are rejected.
 
 | key | default | meaning |
 | --- | --- | --- |
 | `listen` | `127.0.0.1:8790` | HTTP address, `host:port`; see Connecting Module-ECC |
-| `data` | `/var/lib/ecc-server` | bundle store, state, actions, spend, review queue (`review/`) and records (`record/`) |
-| `server` | (required) | this game server's name in every record line: 1 to 32 of `a-z`, `0-9`, `-` and `_` |
-| `record_retention_days` | `180` | days the compressed daily records are kept, at least 3 |
-| `wandb_entity` | `telesphoreo-telesphoreo` | W&B entity of the project |
-| `wandb_project` | `ecc` | W&B project holding the bundle artifact |
-| `wandb_artifact` | `classifier-bundle` | the artifact whose `production` alias names the bundle to serve |
-| `check_interval` | `"10m"` | time between W&B checks, at least `1m` |
-| `model.threads` | `6` | CPU threads of each model call (one runs at a time) |
-| `model.max_wait` | `"900ms"` | a line still waiting this long after it arrived is answered hold, and its verdict applied when its models end; keep it under Module-ECC's `verdict_timeout_ms` |
-| `model.threshold` | the bundle's default | the name of the bundle's hold threshold to use (`thresholds.hold`) |
-| `judge.region` | `us-east-1` | AWS region of the Bedrock endpoint |
-| `judge.model` | `us.moonshotai.kimi-k3.1` | Bedrock model or inference profile ID |
-| `judge.service_tier` | `flex` | Bedrock service tier: `flex`, `default` or `priority` |
-| `judge.reasoning_effort` | `medium` | `reasoning.effort`: `none`, `low`, `medium`, `high`, `xhigh` or `max` (the model's own default is `max`) |
-| `judge.max_output_tokens` | `16000` | the most output tokens a call may produce, reasoning included |
-| `judge.timeout` | `"10m"` | how long a call may take |
-| `budget.daily_usd`, `budget.monthly_usd` | `25`, `250` | what the judge may spend in a UTC day and a UTC month |
-| `budget.input_per_million`, `output_per_million`, `cache_read_per_million`, `cache_write_per_million` | `4.40`, `22.00`, `0.22`, `5.50` | standard-tier prices in dollars per million tokens; halved on `flex` |
-| `budget.max_prompt_chars` | `500000` | a longer prompt is not sent |
-| `budget.max_calls_per_day` | `2000` | the most calls in a UTC day |
-| `chat.schedule`, `chat.every`, `chat.wait` | the bundle's | set, they replace the bundle's checkpoint schedule, every-n-th held line and wait |
+| `model.threshold` | `""` | the name of the bundle's hold threshold to serve (`thresholds.hold`), such as `2pct` or `1pct`, to change how much the fast model holds without a new bundle; empty serves the bundle's `default`, and a name the bundle does not have keeps the bundle from loading |
+| `budget.daily_usd`, `budget.monthly_usd` | `25`, `250` | what the judge may spend in a UTC day and a UTC month (see The budget) |
+| `test.data` | (none) | for the rig: replaces the data folder |
 | `test.hold_words_file` | (none) | the test rig's scorer: a file of words, one a line; a line containing one is held |
 | `test.bedrock_endpoint` | (none) | replaces the Bedrock runtime endpoint, for the rig's stub |
 | `test.judge_backoff`, `test.judge_retry_for`, `test.judge_retry_after` | `5s`, `5m`, `5m` | for the rig: the first wait after a failed call, how long failures are retried, when a pending checkpoint is put again |
 | `test.notice_every` | `1h` | for the rig: how often a notice of one cause may be sent |
 | `test.slow_word`, `test.slow_for` | (none) | for the rig: its scorer takes `slow_for` to score a line containing `slow_word`, as a slow model call |
 | `test.slow_call` | `10s` | for the rig: how long a model call runs before it is logged and staff are told |
+
+The host keeps its bundle store, state, actions, spend, review queue (`review/`) and records (`record/`) in the data
+folder, `/var/lib/ecc-server` (`<data>` in this README). Each model call runs on 6 CPU threads, or the host's CPU
+count when it has fewer; one call runs at a time.
 
 The API keys are not config keys; see Updates from W&B and The judge on Amazon Bedrock. On a machine without systemd
 (development), the host reads them from the files `ecc-server.wandb-api-key` and `ecc-server.bedrock-api-key` in the
@@ -389,7 +375,7 @@ networks that need it. The token is sent in plain HTTP, so keep it on a network 
 
 ## Commands
 
-Every command except `version` and `replay` takes `-config FILE` before its arguments (default
+Every command except `version`, `replay` and `score` takes `-config FILE` before its arguments (default
 `/etc/ecc-server/config.toml`).
 
 - `ecc-server run`: serve the current bundle. With none installed, or one this build cannot load (a bundle an earlier

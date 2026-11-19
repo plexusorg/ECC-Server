@@ -54,14 +54,22 @@ func bad(format string, args ...any) error { return errBad{fmt.Errorf(format, ar
 // A later operator rollback takes precedence over an update whose download started earlier.
 var errRolledBackDuringDownload = errors.New("production was rolled back during download")
 
+// The W&B artifact whose production alias names the bundle to serve, and how often the host checks it.
+const (
+	wandbEntity   = "telesphoreo-telesphoreo"
+	wandbProject  = "ecc"
+	wandbArtifact = "classifier-bundle"
+	checkInterval = 10 * time.Minute
+)
+
 func newUpdater(s *server, key string) *updater {
-	u := &updater{s: s, wb: newWandb(key, s.cfg.WandbEntity, s.cfg.WandbProject)}
+	u := &updater{s: s, wb: newWandb(key, wandbEntity, wandbProject)}
 	u.st.Artifact = u.name()
 	return u
 }
 
 func (u *updater) name() string {
-	return fmt.Sprintf("%s/%s/%s:production", u.s.cfg.WandbEntity, u.s.cfg.WandbProject, u.s.cfg.WandbArtifact)
+	return fmt.Sprintf("%s/%s/%s:production", wandbEntity, wandbProject, wandbArtifact)
 }
 
 func (u *updater) loop(ctx context.Context) {
@@ -70,7 +78,7 @@ func (u *updater) loop(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(u.s.cfg.CheckInterval):
+		case <-time.After(checkInterval):
 		}
 	}
 }
@@ -100,7 +108,8 @@ func (u *updater) check(ctx context.Context, force bool) (string, error) {
 	switch {
 	case ctx.Err() != nil:
 	case unreachable && !u.failing:
-		slog.Warn("W&B check failed; serving the bundle on disk and retrying every check_interval", "err", err)
+		slog.Warn("W&B check failed; serving the bundle on disk and retrying at each check", "every", checkInterval.String(),
+			"err", err)
 		u.failing = true
 	case !unreachable && u.failing:
 		slog.Info("W&B is reachable again")
@@ -118,7 +127,7 @@ func (u *updater) check(ctx context.Context, force bool) (string, error) {
 }
 
 func (u *updater) update(ctx context.Context, force bool) (string, error) {
-	a, err := u.wb.artifact(ctx, u.s.cfg.WandbArtifact+":production")
+	a, err := u.wb.artifact(ctx, wandbArtifact+":production")
 	if err == nil && a == nil {
 		err = fmt.Errorf("W&B has no %s", u.name())
 	}
@@ -268,7 +277,7 @@ func (u *updater) download(ctx context.Context, digest, name, dir string) error 
 	if _, err := os.Stat(filepath.Join(dir, filepath.FromSlash(name))); err == nil {
 		return nil
 	}
-	a, err := u.wb.artifact(ctx, u.s.cfg.WandbArtifact+":production")
+	a, err := u.wb.artifact(ctx, wandbArtifact+":production")
 	if err != nil {
 		return err
 	}

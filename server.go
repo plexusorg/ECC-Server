@@ -116,9 +116,7 @@ func run(cfg Config) error {
 	if s.acts, err = openActions(cfg, s.rec); err != nil {
 		return err
 	}
-	s.judge = &bedrockJudge{ctx: ctx, br: s.br, spend: s.spend, tier: cfg.Judge.ServiceTier,
-		effort: cfg.Judge.ReasoningEffort, maxOut: cfg.Judge.MaxOutputTokens, timeout: cfg.Judge.Timeout,
-		stopped: s.notify, record: s.rec.append, backoff: orDefault(cfg.Test.JudgeBackoff, judgeBackoff),
+	s.judge = &bedrockJudge{ctx: ctx, br: s.br, spend: s.spend, stopped: s.notify, record: s.rec.append, backoff: orDefault(cfg.Test.JudgeBackoff, judgeBackoff),
 		retryFor: orDefault(cfg.Test.JudgeRetryFor, judgeRetryFor)}
 	st, err := readState(cfg)
 	if err != nil {
@@ -160,7 +158,7 @@ func run(cfg Config) error {
 	mux.HandleFunc("POST /update", s.handleUpdate)
 	srv := &http.Server{Addr: cfg.Listen, Handler: requireToken(token, mux)}
 	if s.upd != nil {
-		slog.Info("checking W&B for the production bundle", "artifact", s.upd.name(), "every", cfg.CheckInterval.String())
+		slog.Info("checking W&B for the production bundle", "artifact", s.upd.name(), "every", checkInterval.String())
 		go s.upd.loop(ctx)
 	} else {
 		slog.Info("no W&B key is set; serving the bundle on disk (set one with sudo ecc-server wandb login)")
@@ -168,8 +166,8 @@ func run(cfg Config) error {
 	if brKey == "" {
 		slog.Warn("no Bedrock key is set; checkpoints are not judged until one is set with sudo ecc-server bedrock login")
 	} else {
-		slog.Info("the judge calls Bedrock's Responses API", "model", cfg.Judge.Model, "region", cfg.Judge.Region,
-			"service_tier", cfg.Judge.ServiceTier, "reasoning_effort", cfg.Judge.ReasoningEffort, "endpoint", s.br.endpoint)
+		slog.Info("the judge calls Bedrock's Responses API", "model", judgeModel, "region", judgeRegion,
+			"service_tier", judgeServiceTier, "reasoning_effort", judgeReasoningEffort, "endpoint", s.br.endpoint)
 	}
 	go s.tick()
 	go s.scoreLines()
@@ -205,6 +203,9 @@ func orDefault(d, def time.Duration) time.Duration {
 	return def
 }
 
+// Each model call's CPU threads, at most the host's CPU count; one call runs at a time.
+const modelThreads = 6
+
 // scorerFor loads the bundle's models, or gives the rig's scorer when one is set.
 func (s *server) scorerFor(b *Bundle) (core.Scorer, error) {
 	if s.words != nil {
@@ -213,14 +214,14 @@ func (s *server) scorerFor(b *Bundle) (core.Scorer, error) {
 	if b.specErr != nil {
 		return nil, fmt.Errorf("bundle %s: %w", b.Version, b.specErr)
 	}
-	m := s.cfg.Model
+	threads := min(modelThreads, goruntime.NumCPU())
 	t0 := time.Now()
-	sc, err := model.Open(b.dir, b.spec, model.Options{Threads: m.Threads, Threshold: m.Threshold})
+	sc, err := model.Open(b.dir, b.spec, model.Options{Threads: threads, Threshold: s.cfg.Model.Threshold})
 	if err != nil {
 		return nil, fmt.Errorf("bundle %s: the models: %w", b.Version, err)
 	}
 	slog.Info("models loaded", "bundle", b.Version, "seconds", fmt.Sprintf("%.1f", time.Since(t0).Seconds()),
-		"threads", m.Threads, "threshold", sc.Threshold())
+		"threads", threads, "threshold", sc.Threshold())
 	if !sc.MarksCategories() {
 		slog.Warn("the bundle sets no category thresholds; no line is marked with a category", "bundle", b.Version)
 	}
@@ -430,7 +431,7 @@ func (s *server) handleLine(w http.ResponseWriter, r *http.Request) {
 
 // scoreLines is the scoring worker: it takes the queued lines in arrival order, one at a time, so that each line's
 // context is the lines before it and one model call runs at a time. A model call always runs to its end. A line still
-// waiting for its verdict [model] max_wait after it arrived is answered hold and is context for later lines at once:
+// waiting for its verdict maxWait after it arrived is answered hold and is context for later lines at once:
 // when its models are running then, their verdict is applied when they end; when the worker comes to it later than
 // that, it is scored, with the context it had, when no line is waiting (rescore). The engine's lock is not held while
 // the models run.
@@ -477,9 +478,14 @@ type laterError string
 func (e laterError) Error() string        { return string(e) }
 func (e laterError) Is(target error) bool { return target == core.ErrLater }
 
+// A line still waiting for its verdict this long after it arrived is answered hold (core.ErrLater), a little under
+// Module-ECC's 1000 ms wait for a verdict. Its models run to their end, when the worker comes to it if they had not
+// started, and their verdict is applied then.
+const maxWait = 900 * time.Millisecond
+
 const (
-	errQueued  laterError = "max_wait passed before its models ran; scored when no line is waiting"
-	errRunning laterError = "max_wait passed while its models ran; scored when they end"
+	errQueued  laterError = "the verdict's wait passed before its models ran; scored when no line is waiting"
+	errRunning laterError = "the verdict's wait passed while its models ran; scored when they end"
 )
 
 // A model call that runs this long is logged and staff are told, since every line behind it waits; it is not cut.
@@ -515,7 +521,7 @@ func (s *server) scoreLine(j *lineJob) (later laterLine, ok bool) {
 	s.scoreMu.Lock()
 	defer s.scoreMu.Unlock()
 	l := j.req.coreLine(j.arrived)
-	deadline := j.arrived.Add(s.cfg.Model.MaxWait)
+	deadline := j.arrived.Add(maxWait)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.eng.Known(l.Channel) {

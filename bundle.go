@@ -254,28 +254,23 @@ func readJudgeTexts(questionPath, examplesPath string) (core.Texts, error) {
 	return t, nil
 }
 
-// coreConfig is the decision core's configuration: the bundle's settings, with the config's caps and any checkpoint
-// settings it sets.
+// The judge's caps: a prompt longer than maxPromptChars is not sent, and no more than maxCallsPerDay calls are made in
+// a UTC day.
+const (
+	maxPromptChars = 500000
+	maxCallsPerDay = 2000
+)
+
+// coreConfig is the decision core's configuration: the bundle's settings, with the judge's caps.
 func coreConfig(cfg Config, b *Bundle) core.Config {
 	cp, r := b.Judge.Checkpoints, b.Judge.Render
 	sec := func(n int) time.Duration { return time.Duration(n) * time.Second }
-	c := core.Config{Schedule: cp.Schedule, Every: cp.Every, Wait: sec(cp.WaitSeconds),
+	return core.Config{Schedule: cp.Schedule, Every: cp.Every, Wait: sec(cp.WaitSeconds),
 		SessionEnd: sec(cp.SessionEndSeconds), ReviewHeld: cp.ReviewHeld,
 		Render: core.Render{Before: r.Before, After: r.After, MaxChars: r.MaxChars, CutBefore: r.CutBefore,
 			CutAfter: r.CutAfter, Categories: r.Categories},
-		CanonicalLink: b.Links.Canonical, MaxPromptChars: cfg.Budget.MaxPromptChars,
-		MaxCallsPerDay: cfg.Budget.MaxCallsPerDay, Channels: b.Channels,
-		RetryAfter: orDefault(cfg.Test.JudgeRetryAfter, judgeRetryAfter)}
-	if cfg.Chat.setSchedule {
-		c.Schedule = cfg.Chat.Schedule
-	}
-	if cfg.Chat.setEvery {
-		c.Every = cfg.Chat.Every
-	}
-	if cfg.Chat.setWait {
-		c.Wait = cfg.Chat.Wait
-	}
-	return c
+		CanonicalLink: b.Links.Canonical, MaxPromptChars: maxPromptChars, MaxCallsPerDay: maxCallsPerDay,
+		Channels: b.Channels, RetryAfter: orDefault(cfg.Test.JudgeRetryAfter, judgeRetryAfter)}
 }
 
 // ---------------------------------------------------------------- the bundle store

@@ -27,17 +27,24 @@ const (
 	judgeRetryAfter = 5 * time.Minute
 )
 
+// The judge's model on Amazon Bedrock and how each call is made; the judge was measured with these. A call may produce
+// judgeMaxOutputTokens, reasoning included, and take judgeTimeout.
+const (
+	judgeRegion          = "us-east-1"
+	judgeModel           = "us.moonshotai.kimi-k3.1"
+	judgeServiceTier     = "flex"
+	judgeReasoningEffort = "medium"
+	judgeMaxOutputTokens = 16000
+	judgeTimeout         = 10 * time.Minute
+)
+
 // bedrockJudge rules a checkpoint with a Responses call: the prompt as one user message, the question and the owner's
 // cases in a first part that ends at an explicit cache breakpoint, so Bedrock caches the part every prompt shares.
 // Each call is charged to the spend budget first.
 type bedrockJudge struct {
-	ctx     context.Context
-	br      *bedrock
-	spend   *spend
-	tier    string
-	effort  string
-	maxOut  int
-	timeout time.Duration
+	ctx   context.Context
+	br    *bedrock
+	spend *spend
 	// stopped tells staff that judging stopped: kind names the cause (the README's notice kinds), text says it.
 	stopped func(kind, text string)
 	// record writes a line of the record.
@@ -170,7 +177,7 @@ func (j *bedrockJudge) call(job *core.Job, attempt int) (*judgeAnswer, error) {
 	if j.br.key == "" {
 		return nil, fmt.Errorf("%w: %w", core.ErrNotSent, errNoKey)
 	}
-	r, told, err := j.spend.reserve(j.spend.worst(len(job.Prompt), j.maxOut))
+	r, told, err := j.spend.reserve(j.spend.worst(len(job.Prompt), judgeMaxOutputTokens))
 	var over *errOverBudget
 	if errors.As(err, &over) {
 		if told {
@@ -185,10 +192,10 @@ func (j *bedrockJudge) call(job *core.Job, attempt int) (*judgeAnswer, error) {
 		}
 		return nil, fmt.Errorf("%w: %w", core.ErrNotSent, err)
 	}
-	ctx, cancel := context.WithTimeout(j.ctx, j.timeout)
+	ctx, cancel := context.WithTimeout(j.ctx, judgeTimeout)
 	defer cancel()
 	start := time.Now()
-	res, err := j.br.respond(ctx, job.Prompt, job.Split, j.maxOut, j.effort, j.tier)
+	res, err := j.br.respond(ctx, job.Prompt, job.Split, judgeMaxOutputTokens, judgeReasoningEffort, judgeServiceTier)
 	cost := r.usd // no answer: the call may have run
 	var be *bedrockError
 	switch {

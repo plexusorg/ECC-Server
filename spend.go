@@ -52,15 +52,22 @@ func (e *errOverBudget) Error() string {
 	return fmt.Sprintf("the judge's %s budget of $%.2f is used up", e.period, e.budget)
 }
 
+// The judge model's standard-tier prices on Bedrock in dollars per million tokens; the flex tier costs half.
+const (
+	inputPerMillion      = 4.40
+	outputPerMillion     = 22.00
+	cacheReadPerMillion  = 0.22
+	cacheWritePerMillion = 5.50
+)
+
 func openSpend(cfg Config) (*spend, error) {
 	b := cfg.Budget
 	f := 1e-6
-	if cfg.Judge.ServiceTier == "flex" {
+	if judgeServiceTier == "flex" {
 		f /= 2
 	}
 	s := &spend{path: filepath.Join(cfg.Data, "spend.json"), daily: b.DailyUSD, monthly: b.MonthlyUSD,
-		in: b.InputPerMillion * f, out: b.OutputPerMillion * f, cr: b.CacheReadPerMillion * f,
-		cw: b.CacheWritePerMillion * f}
+		in: inputPerMillion * f, out: outputPerMillion * f, cr: cacheReadPerMillion * f, cw: cacheWritePerMillion * f}
 	s.settled = sync.NewCond(&s.mu)
 	if err := readJSON(s.path, &s.st); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("spend: %w", err)
