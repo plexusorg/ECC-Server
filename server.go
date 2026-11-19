@@ -128,15 +128,22 @@ func run(cfg Config) error {
 		return err
 	}
 	if st.Current != "" {
+		// A bundle this build cannot load (one an earlier build installed under another bundle contract, or a damaged
+		// one) leaves the server running without a bundle, so the W&B check or `ecc-server use` can replace it.
 		b, err := loadInstalledBundle(cfg, st.Current)
-		if err != nil {
-			return err
+		var sc core.Scorer
+		if err == nil {
+			sc, err = s.scorerFor(b)
 		}
-		sc, err := s.scorerFor(b)
-		if err != nil {
-			return err
+		if err == nil {
+			s.use(b, sc)
+		} else if s.upd != nil {
+			slog.Error("the installed bundle does not load; not ready until production is fetched from W&B",
+				"bundle", st.Current, "err", err)
+		} else {
+			slog.Error("the installed bundle does not load; not ready until `ecc-server use` installs one",
+				"bundle", st.Current, "err", err)
 		}
-		s.use(b, sc)
 	} else if s.upd != nil {
 		slog.Warn("no bundle installed; not ready until one is fetched from W&B")
 	} else {

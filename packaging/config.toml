@@ -37,7 +37,7 @@ threshold = ""
 # the service tier (flex, default or priority), the reasoning effort (none, low, medium, high, xhigh or max; every
 # judge measurement used medium), the most output tokens a call may produce, reasoning included, and how long a call
 # may take. A failed call (throttling, a server error, a timeout) is tried again from 5 s, doubling, for up to 5
-# minutes; its checkpoint is then put again every 5 minutes until the session ends. The API key is not set here:
+# minutes; its checkpoint is then put again every 5 minutes until the sitting ends. The API key is not set here:
 # `sudo ecc-server bedrock login` stores it encrypted for the service.
 [judge]
 region = "us-east-1"
@@ -50,7 +50,7 @@ timeout = "10m"
 # What the judge may spend, in US dollars, per UTC day and per UTC month. Prices are the standard tier's, per million
 # tokens; on the flex tier the server halves them. Before each call the server checks the day's and the month's totals
 # plus the call's worst case (every byte of the prompt a token at the dearest input price, and max_output_tokens of
-# output); a call that does not fit is not made, its lines stay held, its session goes to the review queue, and staff
+# output); a call that does not fit is not made, its lines stay held, its sitting goes to the review queue, and staff
 # with the alert permission are told once a day (or month). A prompt longer than max_prompt_chars is not sent, and no
 # more than max_calls_per_day calls are made in a UTC day.
 [budget]
@@ -64,7 +64,7 @@ max_prompt_chars = 500000
 max_calls_per_day = 2000
 
 [chat]
-# The bundle sets when the judge is called. Set these to replace its schedule (the held-line counts of a session that
+# The bundle sets when the judge is called. Set these to replace its schedule (the held-line counts of a sitting that
 # bring a checkpoint), its every-n-th held line after the schedule (0: none) and how long a held line waits for a
 # ruling before it brings a checkpoint, for example:
 # schedule = [1, 4]

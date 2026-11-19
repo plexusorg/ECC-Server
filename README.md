@@ -392,7 +392,9 @@ networks that need it. The token is sent in plain HTTP, so keep it on a network 
 Every command except `version` and `replay` takes `-config FILE` before its arguments (default
 `/etc/ecc-server/config.toml`).
 
-- `ecc-server run`: serve the current bundle. With none installed it answers `503` to lines until `use` installs one.
+- `ecc-server run`: serve the current bundle. With none installed, or one this build cannot load (a bundle an earlier
+  build installed under another bundle contract), it logs why and answers `503` to lines until the W&B check or `use`
+  installs one.
 - `ecc-server use FOLDER`: install a bundle folder into the store and switch to it. Every file is checked against the
   manifest's SHA-256 and size, and `bundle.json` and the judge's files are read as the host reads them; files are
   hardlinked when the folder is on the same volume, otherwise copied. With the host running, it takes the new
