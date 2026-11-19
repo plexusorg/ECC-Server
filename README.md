@@ -353,13 +353,13 @@ it. To replace it, delete the file and restart the service, then paste the new o
 
 In Module-ECC's `config.yml`, under `chat_safety`:
 
-- `model_host`: ECC-Server's address as the game server reaches it, `http://host:port`.
+- `ecc_server`: ECC-Server's address as the game server reaches it, `http://host:port`.
 - `token`: the output of `sudo ecc-server token`. Chat safety stays off while it is empty.
 
 On the same machine, the default `listen` (`127.0.0.1:8790`) and `http://127.0.0.1:8790` work. When the Minecraft
 server runs in a Docker container, the container reaches the host on the Docker network: set `listen` in
 `/etc/ecc-server/config.toml` to the host's address on that network, for example the bridge gateway
-`172.17.0.1:8790`, set `model_host` to `http://172.17.0.1:8790`, and restart the service (`sudo systemctl restart
+`172.17.0.1:8790`, set `ecc_server` to `http://172.17.0.1:8790`, and restart the service (`sudo systemctl restart
 ecc-server`). The unit is ordered after `docker.service` so the bridge exists when the host binds. A wildcard address
 (`0.0.0.0` or `[::]`) listens on every interface; prefer the one address, and do not expose the port beyond the
 networks that need it. The token is sent in plain HTTP, so keep it on a network you trust.
