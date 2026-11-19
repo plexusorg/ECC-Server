@@ -111,8 +111,11 @@ func run(cfg Config) error {
 	if s.acts, err = openActions(cfg, s.rec); err != nil {
 		return err
 	}
-	s.judge = &bedrockJudge{ctx: ctx, br: s.br, spend: s.spend, stopped: s.notify, record: s.rec.append, backoff: judgeBackoff,
+	judge := &bedrockJudge{ctx: ctx, br: s.br, spend: s.spend, stopped: s.notify, record: s.rec.append, backoff: judgeBackoff,
 		retryFor: judgeRetryFor}
+	judge.warm = newWarmer(judge)
+	go judge.warm.loop(ctx)
+	s.judge = judge
 	st, err := readState(cfg)
 	if err != nil {
 		return err

@@ -148,6 +148,25 @@ func (s *spend) reserve(usd float64) (r reservation, told bool, err error) {
 	return reservation{s.st.Day, s.st.Month, usd}, false, nil
 }
 
+// reserveQuiet charges a warming call's worst case when it fits both budgets now, without waiting for calls in flight,
+// counting it among the day's calls or telling staff when it does not fit.
+func (s *spend) reserveQuiet(usd float64) (reservation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.roll(time.Now())
+	switch {
+	case s.st.DayUSD+usd > s.daily:
+		return reservation{}, &errOverBudget{"daily", s.daily}
+	case s.st.MonthUSD+usd > s.monthly:
+		return reservation{}, &errOverBudget{"monthly", s.monthly}
+	}
+	s.st.DayUSD += usd
+	s.st.MonthUSD += usd
+	s.st.ReservedUSD += usd
+	s.save()
+	return reservation{s.st.Day, s.st.Month, usd}, nil
+}
+
 // tokenUsage is the Responses API's token counts for one call. Input counts every input token, the ones read from
 // and written to the cache among them; CacheWrite is nil when the answer does not state it (Bedrock documents
 // cache_write_tokens for its OpenAI models only).

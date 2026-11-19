@@ -51,6 +51,8 @@ type bedrockJudge struct {
 	record func(kind string, v any)
 	// backoff and retryFor: judgeBackoff and judgeRetryFor.
 	backoff, retryFor time.Duration
+	// warm keeps the cached prompt part warm between calls; nil makes no warming calls.
+	warm *warmer
 }
 
 func (j *bedrockJudge) Rule(job *core.Job) (core.Answer, error) {
@@ -205,6 +207,9 @@ func (j *bedrockJudge) call(job *core.Job, attempt int) (*judgeAnswer, error) {
 		cost = 0 // Bedrock refused the request
 	}
 	j.spend.settle(r, cost)
+	if res != nil && j.warm != nil && job.Split > 0 {
+		j.warm.used(job.Prompt[:job.Split], res.Usage)
+	}
 	took := time.Since(start)
 	j.br.record(err, len(job.Prompt), res, cost, took)
 	rec := judgeCall{Time: stamp(time.Now()), Session: job.Session, K: job.K, Hash: job.Hash, Attempt: attempt,

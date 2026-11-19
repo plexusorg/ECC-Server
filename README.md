@@ -246,7 +246,8 @@ verdict, categories and hold logit of a line answered hold at 900 ms, once its m
 `session_start`, `checkpoint` (the
 held-line count it covers, why it was made, the prompt's size and SHA-256, whether it was sent), `judge_call` (each
 call: attempt, status, the usage's input, cached, cache-write, output and reasoning tokens, cost, duration, or the
-error, request/response identifiers and raw answer), `ruling` (the raw answer, confidence, confirmation evidence,
+error, request/response identifiers and raw answer), `judge_warm` (each warming call: status, usage, cost, duration
+or the error), `ruling` (the raw answer, confidence, confirmation evidence,
 effective ruling and review reason, the error, or `pending` with the time it is put again), `checkpoint_again`,
 `action` (the core's, by line id), `action_sent` (as Module-ECC gets it), `ack`, `presence`, `session_end` (outcome, held, released and unruled
 lines, the checkpoints) and `review`. Lines are flushed one at a time. Just after midnight UTC the day's file is
@@ -310,6 +311,14 @@ returns, its cost replaces the reservation (nothing when Bedrock refused the req
 take the day's or the month's total past its budget (`[budget]`, see Configuration) waits while other calls are in flight, and is not made once none
 is: its lines stay held, its session goes to the review queue, and the first refusal in a day (or month) sends a
 `notice` that staff with the alert permission see. `sudo ecc-server status` shows the totals.
+
+**Keeping the cache warm.** Bedrock keeps the prompt's cached part (the question and the owner's cases) for at least
+30 minutes after its last use; a call that finds it gone pays the input price for all of it. After each answered
+judge call the host makes a warming call every 20 minutes: the cached part, a one-line ask and 16 output tokens, about
+$0.015 against about $0.30 more for a call that finds the cache gone. Warming stops once its calls since the last
+judge call have cost what one such call pays over a cached one (about 6 hours of quiet) and starts again with the next
+judge call. Warming calls are charged to the budget but do not count among the day's calls, and one that does not fit
+the budget is not made, without a notice. Each is a `judge_warm` line in the record.
 
 ## Building the package
 
