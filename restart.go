@@ -68,8 +68,7 @@ type restartEnd struct {
 }
 
 // scanRestart ends the sessions the previous run left open. It recovers host outcomes and review reasons from the
-// last two days' record. Historical rulings without an effective outcome need durable action evidence; otherwise
-// their lines stay held for review. The scan records each end and sends no actions.
+// last two days' record. The scan records each end and sends no actions.
 func scanRestart(r *recorder, dir string, now time.Time) error {
 	type open struct {
 		start                    map[string]any
@@ -77,10 +76,8 @@ func scanRestart(r *recorder, dir string, now time.Time) error {
 		held, ruled, kept, freed int
 		banned                   bool
 		review                   []string
-		// Only a durable host action can establish an old ruling's missing effect.
-		legacyPending, legacyUnknown int
-		heldLines                    map[string]string
-		released                     map[string]bool
+		heldLines                map[string]string
+		released                 map[string]bool
 	}
 	sessions := map[string]*open{}
 	var order []string
@@ -120,7 +117,6 @@ func scanRestart(r *recorder, dir string, now time.Time) error {
 					covers, _ := l["covers"].(float64)
 					n := int(covers)
 					s.ruled += n
-					s.legacyPending = 0
 					if why, _ := l["review"].(string); why != "" && !slices.Contains(s.review, why) {
 						s.review = append(s.review, why)
 					}
@@ -131,11 +127,6 @@ func scanRestart(r *recorder, dir string, now time.Time) error {
 						s.freed += n
 					case core.RulingBan:
 						s.banned = true
-					default:
-						// A diagnostic answer does not prove that a line was released or a ban applied.
-						s.kept += n
-						s.legacyPending = n
-						s.legacyUnknown += n
 					}
 				}
 			case "action":
@@ -145,7 +136,6 @@ func scanRestart(r *recorder, dir string, now time.Time) error {
 						s.banned = true
 					case core.ActionRelease:
 						lines, _ := l["lines"].([]any)
-						n := 0
 						for _, value := range lines {
 							line, ok := value.(string)
 							if !ok || line == "" || s.released[line] {
@@ -157,18 +147,8 @@ func scanRestart(r *recorder, dir string, now time.Time) error {
 								delete(s.heldLines, line)
 								s.held--
 								s.freed++
-							} else {
-								n++
 							}
 						}
-						n = min(n, s.legacyPending)
-						s.kept -= n
-						s.freed += n
-						s.legacyPending -= n
-						s.legacyUnknown -= n
-					case core.ActionWarn:
-						s.legacyUnknown -= s.legacyPending
-						s.legacyPending = 0
 					}
 				}
 			}
@@ -200,9 +180,6 @@ func scanRestart(r *recorder, dir string, now time.Time) error {
 		} else {
 			if e.Unruled > 0 {
 				why = append(why, "the server restarted with "+strconv.Itoa(e.Unruled)+" held lines no ruling covered")
-			}
-			if s.legacyUnknown > 0 {
-				why = append(why, "the historical record has no host outcome for "+strconv.Itoa(s.legacyUnknown)+" held lines")
 			}
 		}
 		e.Review = strings.Join(why, "; ")

@@ -177,7 +177,7 @@ prefix (punctuation after the link counts as path). The record and the judge see
 allowlist in `<data>/links.json` for its next start; before any `start`, no link is replaced.
 
 **Complete target coverage.** Every bundle must declare `coverage.rule: "complete_target_v1"` and
-`model_text.rule: "v3_meaning_v1"`. For model input only, the host applies the deployed v3 Unicode normalization,
+`model_text.rule: "v3_meaning_v1"`. For model input only, the host applies the classifier's Unicode normalization,
 base64 word decoding and address redaction before allowed-link replacement. The record, judge text and repeat key
 keep their prepared text. For a line to score, the host rejects raw text that needs a channel-length cut or URL
 shortening. It also rejects a target whose complete rendered classifier input, with its three special tokens, does not

@@ -149,7 +149,7 @@ var modelBase64Run = regexp.MustCompile(`[A-Za-z0-9+/]+={0,2}`)
 
 const modelBase64Min = 8
 
-// modelDecodeBase64 preserves printable-word decoding from the deployed v3 classifier.
+// modelDecodeBase64 decodes base64 words that hold printable text, as the classifier's training input did.
 func modelDecodeBase64(s string) string {
 	return modelBase64Run.ReplaceAllStringFunc(s, func(token string) string {
 		body := strings.TrimRight(token, "=")
@@ -179,5 +179,6 @@ func modelDecodeBase64(s string) string {
 // ModelTextRule identifies the model-read transformation shared with training.
 const ModelTextRule = "v3_meaning_v1"
 
-// ModelText restores the deployed v3 meaning transforms without changing the recorded or judged text.
+// ModelText is the text the classifier reads: normalized, base64 words decoded and addresses redacted. The recorded
+// and judged text keep their prepared form.
 func ModelText(text string) string { return Redact(modelDecodeBase64(modelClean(text))) }
