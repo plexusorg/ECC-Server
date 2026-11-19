@@ -49,7 +49,6 @@ type replayEvent struct {
 	Name          string  `json:"name"`
 	Day           string  `json:"day"`
 	CoverageRule  string  `json:"coverage_rule"`
-	ScoringMode   string  `json:"scoring_mode"`
 	ModelTextRule string  `json:"model_text_rule"`
 	CanonicalLink *string `json:"canonical_link"`
 	ID            string  `json:"id"`
@@ -229,8 +228,9 @@ func readReplayEvents(path string) ([]replayEvent, error) {
 			return nil, fmt.Errorf("%s:%d: %w", path, n, err)
 		}
 		if ev.Type == "stream" {
-			if ev.ScoringMode != model.ScoringMode || ev.CoverageRule != model.CoverageRule || ev.CanonicalLink == nil || ev.ModelTextRule != core.ModelTextRule {
-				return nil, fmt.Errorf("%s:%d: stream requires scoring_mode c_only, model_text_rule v3_meaning_v1, canonical_link and coverage_rule %q", path, n, model.CoverageRule)
+			if ev.CoverageRule != model.CoverageRule || ev.CanonicalLink == nil || ev.ModelTextRule != core.ModelTextRule {
+				return nil, fmt.Errorf("%s:%d: stream requires model_text_rule %s, canonical_link and coverage_rule %s",
+					path, n, core.ModelTextRule, model.CoverageRule)
 			}
 			stream = true
 		}
@@ -239,11 +239,11 @@ func readReplayEvents(path string) ([]replayEvent, error) {
 				return nil, fmt.Errorf("%s:%d: line requires a coverage stream and raw_text", path, n)
 			}
 			switch ev.Coverage {
-			case "c", "reject", "context", "fold", "dropped":
+			case model.CoverageScored, model.CoverageRejected, "context", "fold", "dropped":
 			default:
 				return nil, fmt.Errorf("%s:%d: line has invalid coverage %q", path, n, ev.Coverage)
 			}
-			if (ev.Verdict == "reject") != (ev.Coverage == "reject") {
+			if (ev.Verdict == "reject") != (ev.Coverage == model.CoverageRejected) {
 				return nil, fmt.Errorf("%s:%d: reject verdict and coverage disagree", path, n)
 			}
 			if ev.Verdict != "" && ev.Verdict != "deliver" && ev.Verdict != "hold" && ev.Verdict != "reject" {
@@ -253,7 +253,7 @@ func readReplayEvents(path string) ([]replayEvent, error) {
 			if context && ev.Coverage != "context" && ev.Coverage != "fold" && ev.Coverage != "dropped" {
 				return nil, fmt.Errorf("%s:%d: context line has scoring coverage", path, n)
 			}
-			if !context && (ev.Coverage == "context" || (ev.Coverage == "c" && ev.Verdict == "")) {
+			if !context && (ev.Coverage == "context" || (ev.Coverage == model.CoverageScored && ev.Verdict == "")) {
 				return nil, fmt.Errorf("%s:%d: scoring line has no recorded verdict", path, n)
 			}
 			ev.Shown, ev.Name = ev.Name, ""
@@ -499,7 +499,7 @@ func replay(args []string) error {
 			}
 			result := eng.Line(line)
 			if *bundle == "" {
-				if (result.Verdict == "reject") != (ev.Coverage == "reject") {
+				if (result.Verdict == "reject") != (ev.Coverage == model.CoverageRejected) {
 					return fmt.Errorf("line %s: actual and recorded rejection disagree", ev.ref())
 				}
 				_, folded := rec.folded[ev.ref()]
@@ -628,7 +628,7 @@ func checkCopies(events []replayEvent, folded map[string]string) *copyCheck {
 		c.InInput++
 		named[ev.ref()] = true
 		switch of, ok := folded[ev.ref()]; {
-		case ev.Coverage == "reject":
+		case ev.Coverage == model.CoverageRejected:
 			c.Rejected++
 		case !ok:
 			c.NotFolded++

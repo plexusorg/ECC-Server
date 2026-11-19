@@ -26,10 +26,12 @@ bundle's models scoring the rest), and writes one record per line in the format 
           give it: {"stream", "time" (whole seconds), "id", "channel", "speaker_uuid", "speaker", "shown",
           "target_uuid", "target", "text", "trusted"}
   -out    one record per input record: {"stream", "id", "refused": "unknown channel", "verdict": "hold"},
-          {"stream", "id", "dropped": true, "verdict": "deliver"}, {"stream", "id", "folded_into": "<id>"},
-          {"stream", "id", "context_only": true}, or {"stream", "id", "passed", "c", "held_<threshold>"...,
-          "verdict", "categories"}; -ids adds the prepared text, the text the models read, the author key and the repeat
-          key of every line kept, and the context's ids and C's input ids of a scored one
+          {"stream", "id", "dropped": true, "verdict": "deliver"}, {"stream", "id", "coverage": "rejected",
+          "verdict": "reject"}, {"stream", "id", "folded_into": "<id>"}, {"stream", "id", "context_only": true}, or
+          {"stream", "id", "coverage": "scored", "classifier": [the logits], "held_<threshold>"..., "verdict",
+          "categories"}; -ids adds the prepared text, the text the models read, the author key and the repeat key of
+          every line kept, and the context's ids (context_ids) and the classifier's input ids (classifier_input_ids) of
+          a scored one
   -allow  a file of allowed links, one host or host/prefix a line (# comments)
 `
 
@@ -123,7 +125,7 @@ func scoreLines(args []string) error {
 	r := bufio.NewScanner(f)
 	r.Buffer(make([]byte, 1<<20), 1<<24)
 	var times []float64
-	n, cRuns := 0, 0
+	n := 0
 	start := time.Now()
 	// a stream's times are whole seconds of its own; each stream is moved after the last one, since the core's clock
 	// only goes forward
@@ -171,7 +173,7 @@ func scoreLines(args []string) error {
 			keep()
 			switch {
 			case result.Verdict == "reject":
-				out["verdict"], out["coverage"] = "reject", "reject"
+				out["verdict"], out["coverage"] = "reject", model.CoverageRejected
 			case rec.of != "":
 				out["folded_into"] = rec.of
 			case l.Context:
@@ -195,15 +197,14 @@ func scoreLines(args []string) error {
 			if d.Verdict.Hold {
 				verdict = "hold"
 			}
-			out["coverage"], out["passed"], out["verdict"], out["categories"] = "c", d.Passed, verdict, nonNil(d.Verdict.Categories)
-			out["c"] = d.C
-			cRuns++
+			out["coverage"], out["verdict"], out["categories"] = model.CoverageScored, verdict, nonNil(d.Verdict.Categories)
+			out["classifier"] = d.Logits
 			for k, v := range d.Held {
 				out["held_"+k] = v
 			}
 			if *ids {
 				out["context_ids"] = nonNil(d.ContextIDs)
-				out["c_input_ids"] = d.CIDs
+				out["classifier_input_ids"] = d.InputIDs
 			}
 		}
 		b, _ := json.Marshal(out)
@@ -222,8 +223,8 @@ func scoreLines(args []string) error {
 		}
 		return times[min(len(times)-1, int(p*float64(len(times))))]
 	}
-	fmt.Fprintf(os.Stderr, "%d lines (%d scored, C on %d) in %.1f s; a scored line: median %.1f ms, p95 %.1f, p99 %.1f\n",
-		n, len(times), cRuns, time.Since(start).Seconds(), q(0.5), q(0.95), q(0.99))
+	fmt.Fprintf(os.Stderr, "%d lines (%d scored) in %.1f s; a scored line: median %.1f ms, p95 %.1f, p99 %.1f\n",
+		n, len(times), time.Since(start).Seconds(), q(0.5), q(0.95), q(0.99))
 	return nil
 }
 

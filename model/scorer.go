@@ -1,4 +1,4 @@
-// Package model scores every covered target with the C classifier. It preserves the bundle's context, input
+// Package model scores every covered target with the bundle's classifier. It preserves the bundle's context, input
 // strings, token ids and thresholds. OpenVINO runs the graph on the CPU through its C API on Linux.
 package model
 
@@ -21,9 +21,6 @@ import (
 
 // Spec is what bundle.json states about scoring a line.
 type Spec struct {
-	Scoring struct {
-		Mode string `json:"mode"`
-	} `json:"scoring"`
 	ModelText struct {
 		Rule string `json:"rule"`
 	} `json:"model_text"`
@@ -59,16 +56,17 @@ type Spec struct {
 		Private string   `json:"private_channel"`
 		Rule    string   `json:"rule"`
 	} `json:"context"`
-	C struct {
+	Classifier struct {
 		MaxTokens  int    `json:"max_tokens"`
 		Roles      string `json:"roles"`
 		LineString string `json:"line_string"`
 		InputIDs   string `json:"input_ids"`
-	} `json:"c"`
+	} `json:"classifier"`
 	Thresholds struct {
 		Hold    map[string]float32 `json:"hold"`
 		Default string             `json:"default"`
-		// Categories, when the bundle sets them: C's logit for a category at or over its threshold marks the line with it.
+		// Categories, when the bundle sets them: the classifier's logit for a category at or over its threshold marks
+		// the line with it.
 		Categories map[string]float32 `json:"categories"`
 	} `json:"thresholds"`
 }
@@ -79,14 +77,11 @@ type Spec struct {
 const RulesSHA256 = "57a28e87a6addbd62c6d73301037ee9fbb4e01233be673a407510e25e65568ad"
 
 // Rules is the paths in bundle.json of the rules RulesSHA256 covers, in order.
-var Rules = []string{"context.rule", "c.roles",
-	"c.line_string", "c.input_ids", "channels", "text.rule", "text.whitespace", "text.patterns.section",
-	"text.patterns.codes", "text.patterns.url", "text.patterns.ipv4", "text.patterns.ipv6", "text.patterns.not_secure",
-	"text.patterns.icons", "text.patterns.discord_tags", "text.shown", "text.discord_name", "text.names", "text.repeat",
-	"links.pattern", "links.rule", "coverage.rule", "model_text.rule", "scoring.mode"}
-
-// ScoringMode is the explicit single-classifier serving contract.
-const ScoringMode = "c_only"
+var Rules = []string{"context.rule", "classifier.roles", "classifier.line_string", "classifier.input_ids", "channels",
+	"text.rule", "text.whitespace", "text.patterns.section", "text.patterns.codes", "text.patterns.url",
+	"text.patterns.ipv4", "text.patterns.ipv6", "text.patterns.not_secure", "text.patterns.icons",
+	"text.patterns.discord_tags", "text.shown", "text.discord_name", "text.names", "text.repeat", "links.pattern",
+	"links.rule", "coverage.rule", "model_text.rule"}
 
 // RulesHash is the sha256 of the UTF-8 of the values at the paths of Rules in bundle.json, joined by U+0000; a list
 // is its items joined by one space, numbers in decimal (bundle.json rules.how).
@@ -172,52 +167,35 @@ func ReadSpec(dir string) (*Spec, error) {
 	if err := CheckRules(raw); err != nil {
 		return nil, err
 	}
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &fields); err != nil {
-		return nil, err
+	// A threshold given as null would read as 0.
+	var given struct {
+		Thresholds struct {
+			Hold       map[string]*float32 `json:"hold"`
+			Categories map[string]*float32 `json:"categories"`
+		} `json:"thresholds"`
 	}
-	if _, ok := fields["sh"]; ok {
-		return nil, errors.New("bundle.json: sh metadata is not allowed in c_only mode")
+	if err := json.Unmarshal(raw, &given); err != nil {
+		return nil, fmt.Errorf("bundle.json: %w", err)
 	}
-	for _, name := range []string{"models", "thresholds"} {
-		var section map[string]json.RawMessage
-		if err := json.Unmarshal(fields[name], &section); err != nil && fields[name] != nil {
-			return nil, fmt.Errorf("bundle.json %s: %w", name, err)
-		}
-		for key := range section {
-			if key == "sh" || strings.HasPrefix(key, "sh_") {
-				return nil, fmt.Errorf("bundle.json: %s.%s is not allowed in c_only mode", name, key)
-			}
-		}
-		if name == "thresholds" {
-			for _, group := range []string{"hold", "categories"} {
-				if section[group] == nil {
-					continue
-				}
-				var values map[string]*float32
-				if err := json.Unmarshal(section[group], &values); err != nil {
-					return nil, fmt.Errorf("bundle.json thresholds.%s: %w", group, err)
-				}
-				for key, value := range values {
-					if value == nil {
-						return nil, fmt.Errorf("bundle.json: thresholds.%s.%s must be a number", group, key)
-					}
-				}
+	for group, values := range map[string]map[string]*float32{"hold": given.Thresholds.Hold,
+		"categories": given.Thresholds.Categories} {
+		for key, value := range values {
+			if value == nil {
+				return nil, fmt.Errorf("bundle.json: thresholds.%s.%s must be a number", group, key)
 			}
 		}
 	}
-	g, ok := s.Graphs["c"]
+	g, ok := s.Graphs["classifier"]
 	if len(s.Graphs) != 1 || !ok || !filepath.IsLocal(g.XML) || len(g.Inputs) != 2 ||
 		g.Inputs[0].Name != "input_ids" || g.Inputs[1].Name != "attention_mask" {
-		return nil, errors.New("bundle.json: graphs must contain only c with local xml and input_ids, attention_mask")
+		return nil, errors.New("bundle.json: graphs must hold only classifier, with a local xml and the inputs " +
+			"input_ids and attention_mask")
 	}
-	if len(s.Tokenizers) != 1 || !filepath.IsLocal(s.Tokenizers["c"].File) {
-		return nil, errors.New("bundle.json: tokenizers must contain only c with a local file")
+	if len(s.Tokenizers) != 1 || !filepath.IsLocal(s.Tokenizers["classifier"].File) {
+		return nil, errors.New("bundle.json: tokenizers must hold only classifier, with a local file")
 	}
 	t := s.Thresholds
 	switch {
-	case s.Scoring.Mode != ScoringMode:
-		return nil, errors.New("bundle.json needs scoring.mode c_only")
 	case s.ModelText.Rule != core.ModelTextRule:
 		return nil, errors.New("bundle.json needs model_text.rule v3_meaning_v1")
 	case s.Coverage.Rule != CoverageRule:
@@ -232,8 +210,8 @@ func ReadSpec(dir string) (*Spec, error) {
 		return nil, errors.New("bundle.json: openvino must name the CPU device and batch 1")
 	case s.Context.Lines < 1 || s.Context.Seconds < 1 || s.Context.Private == "":
 		return nil, errors.New("bundle.json: context needs lines, seconds and private_channel")
-	case s.C.MaxTokens < 3:
-		return nil, errors.New("bundle.json: c.max_tokens must be at least 3")
+	case s.Classifier.MaxTokens < 3:
+		return nil, errors.New("bundle.json: classifier.max_tokens must be at least 3")
 	case len(t.Hold) == 0:
 		return nil, errors.New("bundle.json: thresholds need hold")
 	}
@@ -262,8 +240,8 @@ type Scorer struct {
 	spec           *Spec
 	opt            Options
 	core           *ovCore
-	c              *graph
-	cTok           *Tokenizer
+	classifier     *graph
+	tok            *Tokenizer
 	threshold      string
 	hold           float32
 	holdAt         int
@@ -281,7 +259,7 @@ type categoryMark struct {
 	min  float32
 }
 
-// Open loads the bundle's C graph and tokenizer.
+// Open loads the bundle's classifier graph and tokenizer.
 func Open(dir string, spec *Spec, opt Options) (*Scorer, error) {
 	if opt.Threads < 1 {
 		return nil, errors.New("threads must be at least 1")
@@ -309,7 +287,7 @@ func Open(dir string, spec *Spec, opt Options) (*Scorer, error) {
 		s.placed[c] = true
 	}
 	var err error
-	if s.cTok, err = LoadTokenizer(filepath.Join(dir, spec.Tokenizers["c"].File)); err != nil {
+	if s.tok, err = LoadTokenizer(filepath.Join(dir, spec.Tokenizers["classifier"].File)); err != nil {
 		return nil, err
 	}
 	if s.core, err = newCore(); err != nil {
@@ -329,12 +307,12 @@ func Open(dir string, spec *Spec, opt Options) (*Scorer, error) {
 		props[k] = fmt.Sprint(v)
 	}
 	props["INFERENCE_NUM_THREADS"] = fmt.Sprint(opt.Threads)
-	g := spec.Graphs["c"]
+	g := spec.Graphs["classifier"]
 	inputs := make([]string, 0, len(g.Inputs))
 	for _, in := range g.Inputs {
 		inputs = append(inputs, in.Name)
 	}
-	if s.c, err = s.core.load("c", filepath.Join(dir, g.XML), inputs, props); err != nil {
+	if s.classifier, err = s.core.load("classifier", filepath.Join(dir, g.XML), inputs, props); err != nil {
 		s.Close()
 		return nil, err
 	}
@@ -363,10 +341,10 @@ func keys[V any](m map[string]V) []string {
 func (s *Scorer) Close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.c != nil {
-		s.c.close()
+	if s.classifier != nil {
+		s.classifier.close()
 	}
-	s.c = nil
+	s.classifier = nil
 	if s.core != nil {
 		s.core.close()
 		s.core = nil
@@ -484,8 +462,8 @@ func AuthorKey(speaker string) string {
 	return core.Lower(speaker)
 }
 
-// entryData is the line as C sees it: author and partner keys and whole seconds. A line's author
-// key is Line.Speaker lowercased as Python's str.lower() does: the speaker's account name, or for a Discord relay "discord:"
+// entryData is the line as the classifier sees it: author and partner keys and whole seconds. A line's author key is
+// Line.Speaker lowercased as Python's str.lower() does: the speaker's account name, or for a Discord relay "discord:"
 // and its prepared name.
 func (s *Scorer) entryData(l core.Line) *entry {
 	e := &entry{id: l.ID, time: l.Time.Unix(), channel: l.Channel, author: AuthorKey(l.Speaker), text: l.Text}
@@ -532,12 +510,13 @@ func (s *Scorer) streamFor(name string) *stream {
 
 // Detail is everything about one line's score.
 type Detail struct {
-	Verdict    core.Verdict
-	Passed     bool
-	C          []float32 // nil when C did not run
+	Verdict core.Verdict
+	// Logits is the classifier's output, one logit per bundle.json outputs entry.
+	Logits []float32
+	// Held tells, by the name of each hold threshold, whether the line is held at it.
 	Held       map[string]bool
 	ContextIDs []string
-	CIDs       []int64
+	InputIDs   []int64
 }
 
 // See keeps a context-only line for later targets without scoring it.
@@ -584,7 +563,7 @@ func (s *Scorer) Take(l core.Line) (*Call, error) {
 
 // take is Take. The caller holds mu.
 func (s *Scorer) take(l core.Line) (*Call, error) {
-	if s.c == nil {
+	if s.classifier == nil {
 		return nil, errClosed
 	}
 	st := s.streamFor(l.Stream)
@@ -598,7 +577,7 @@ func (s *Scorer) take(l core.Line) (*Call, error) {
 func (c *Call) Run() (Detail, error) {
 	c.s.mu.Lock()
 	defer c.s.mu.Unlock()
-	if c.s.c == nil {
+	if c.s.classifier == nil {
 		return Detail{}, errClosed
 	}
 	return c.s.run(c.e, c.ctx)
@@ -607,45 +586,45 @@ func (c *Call) Run() (Detail, error) {
 // run runs the models on the line e with its context ctx. The caller holds mu.
 func (s *Scorer) run(e *entry, ctx []*entry) (Detail, error) {
 	var d Detail
-	d.Passed = true
 	for _, c := range ctx {
 		d.ContextIDs = append(d.ContextIDs, c.id)
 	}
 	d.Held = map[string]bool{}
 	var err error
-	d.CIDs = s.cIDs(e, ctx)
-	shape := []int64{1, int64(len(d.CIDs))}
-	if d.C, err = s.c.run([]tensor{{i64: d.CIDs, shape: shape}, {i64: ones(len(d.CIDs)), shape: shape}}); err != nil {
+	d.InputIDs = s.inputIDs(e, ctx)
+	shape := []int64{1, int64(len(d.InputIDs))}
+	inputs := []tensor{{i64: d.InputIDs, shape: shape}, {i64: ones(len(d.InputIDs)), shape: shape}}
+	if d.Logits, err = s.classifier.run(inputs); err != nil {
 		return d, err
 	}
-	if len(d.C) != len(s.spec.Outputs) {
-		return d, fmt.Errorf("C returned %d logits, expected %d", len(d.C), len(s.spec.Outputs))
+	if len(d.Logits) != len(s.spec.Outputs) {
+		return d, fmt.Errorf("the classifier returned %d logits, expected %d", len(d.Logits), len(s.spec.Outputs))
 	}
-	for _, v := range d.C {
+	for _, v := range d.Logits {
 		if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
-			return d, errors.New("C returned nonfinite logits")
+			return d, errors.New("the classifier returned nonfinite logits")
 		}
 	}
-	c := float64(d.C[s.holdAt])
-	d.Verdict.C = &c
+	hold := float64(d.Logits[s.holdAt])
+	d.Verdict.Classifier = &hold
 	for k, v := range s.spec.Thresholds.Hold {
-		d.Held[k] = d.C[s.holdAt] >= v
+		d.Held[k] = d.Logits[s.holdAt] >= v
 	}
-	d.Verdict.Hold = d.C[s.holdAt] >= s.hold
+	d.Verdict.Hold = d.Logits[s.holdAt] >= s.hold
 	for _, k := range s.categories {
-		if d.C[k.at] >= k.min {
+		if d.Logits[k.at] >= k.min {
 			d.Verdict.Categories = append(d.Verdict.Categories, k.name)
 		}
 	}
 	return d, nil
 }
 
-// cIDs builds the same complete context/target input used in inference.
-func (s *Scorer) cIDs(e *entry, ctx []*entry) []int64 {
+// inputIDs builds the same complete context/target input used in inference.
+func (s *Scorer) inputIDs(e *entry, ctx []*entry) []int64 {
 	var body []int64
-	texts := s.cStrings(e, ctx)
+	texts := s.inputStrings(e, ctx)
 	for k, text := range texts {
-		ids := s.cTok.Encode(text)
+		ids := s.tok.Encode(text)
 		if k == len(texts)-1 {
 			body = append(body, s.eos)
 		}
@@ -654,14 +633,14 @@ func (s *Scorer) cIDs(e *entry, ctx []*entry) []int64 {
 		}
 		body = append(body, s.eos)
 	}
-	if max := s.spec.C.MaxTokens - 1; len(body) > max {
+	if max := s.spec.Classifier.MaxTokens - 1; len(body) > max {
 		body = body[len(body)-max:]
 	}
 	return append([]int64{s.bos}, body...)
 }
 
-// cStrings renders the exact context role walk and final target used by C.
-func (s *Scorer) cStrings(e *entry, ctx []*entry) []string {
+// inputStrings renders the exact context role walk and final target the classifier reads.
+func (s *Scorer) inputStrings(e *entry, ctx []*entry) []string {
 	seq := append(slices.Clip(ctx), e)
 	roles := map[string]string{e.author: "t"}
 	role := func(a string) string {

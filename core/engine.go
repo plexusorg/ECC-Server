@@ -246,8 +246,7 @@ type LineRecord struct {
 	Context      bool     `json:"context,omitempty"`
 	Verdict      string   `json:"verdict"`
 	Categories   []string `json:"categories,omitempty"`
-	SH           *float64 `json:"sh,omitempty"`
-	C            *float64 `json:"c,omitempty"`
+	Classifier   *float64 `json:"classifier,omitempty"`
 	Why          string   `json:"why,omitempty"`
 }
 
@@ -610,7 +609,7 @@ func (e *Engine) line(l Line, given *scored) Result {
 	e.st.add(en)
 	s.mine = append(s.mine, en.pos)
 	s.last = l.Time
-	rec.Session, rec.Categories, rec.SH, rec.C = s.id, v.Categories, v.SH, v.C
+	rec.Session, rec.Categories, rec.Classifier = s.id, v.Categories, v.Classifier
 	switch {
 	case later:
 		rec.Verdict = "hold"
@@ -652,8 +651,7 @@ type RescoredRecord struct {
 	Ref        string   `json:"ref"`
 	Verdict    string   `json:"verdict"`
 	Categories []string `json:"categories,omitempty"`
-	SH         *float64 `json:"sh,omitempty"`
-	C          *float64 `json:"c,omitempty"`
+	Classifier *float64 `json:"classifier,omitempty"`
 	Why        string   `json:"why,omitempty"`
 }
 
@@ -673,7 +671,7 @@ func (e *Engine) Rescored(ref string, v Verdict, err error) Result {
 	en.unscored = false
 	s.unscored = slices.DeleteFunc(s.unscored, func(p int) bool { return p == en.pos })
 	rec := RescoredRecord{Time: stamp(e.now), Stream: s.st.name, Session: s.id, ID: en.line.ID, Ref: ref,
-		Verdict: "hold", SH: v.SH, C: v.C}
+		Verdict: "hold", Classifier: v.Classifier}
 	if err != nil {
 		v.Hold, v.Categories = true, nil
 		rec.Why = "scorer: " + err.Error()

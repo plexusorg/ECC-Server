@@ -13,8 +13,8 @@ bundle the Module-ECC training pipeline writes; with a W&B API key, the host fet
 The decisions are made by the package `core/`, which has no clock, network or file of its own: the HTTP server drives
 it on the host's clock, and `ecc-server replay` drives it on a virtual clock over recorded lines.
 
-**The fast model.** C scores every covered target on the host's CPU. Its hold score decides `hold` or `deliver`.
-C runs in the server's process through OpenVINO's C API, on Linux only. The binary is built without cgo and loads
+**The fast model.** A classifier scores every covered target on the host's CPU. Its hold logit decides `hold` or
+`deliver`. It runs in the server's process through OpenVINO's C API, on Linux only. The binary is built without cgo and loads
 `/usr/lib/ecc-server/openvino` through purego at start. The pinned OpenVINO runtime needs glibc 2.38+ and the `libstdc++6` package 12.1.0+.
 Use a Debian or Ubuntu system with those versions. On another system, start `ecc-server run` only with the test rig's scorer (`[test] hold_words_file`, see Configuration), which holds a line that contains
 one of a file's words and logs a warning at every start that the server filters nothing; it exists for the end-to-end
@@ -60,19 +60,19 @@ W&B and Bedrock keys, and the `ecc-server` user.
 ## The bundle
 
 A bundle is a folder: `bundle.json`, `manifest.json` (every file's SHA-256 and size, by its path in the folder, such
-as `models/c.bin`) and the files `bundle.json` names: the fast model's graphs and tokenizers, the judge's
+as `models/classifier.bin`) and the files `bundle.json` names: the classifier's graph and tokenizer, the judge's
 `question.md` and `examples.json`. A manifest name that would leave the folder is refused. From `bundle.json` the host
 reads:
 
-- `graphs`, `tokenizers`, `special_tokens`, `outputs`, `categories`, `openvino` (the release and the compile
-  settings), `context` (the lists of earlier lines a line is scored with) and `c` (the classifier input);
-- `scoring.mode`: must be `c_only`. The bundle must contain exactly graph `c` and tokenizer `c`. SH metadata and
-  old cascade bundles are refused;
+- `graphs` and `tokenizers`, each holding only `classifier`; `special_tokens`, `outputs`, `categories`, `openvino`
+  (the release and the compile settings), `context` (the lists of earlier lines a line is scored with) and
+  `classifier` (the classifier's input: `max_tokens`, `roles`, `line_string`, `input_ids`);
 - `channels`: the channels a line may have;
 - `text`: how a line's raw text and names are prepared (see A line), with its limits, marks, whitespace and patterns;
-- `rules`: the paths of every rule the host implements in code, from `context.rule` through `model_text.rule` and
-  `scoring.mode`. The host checks the path list and digest, then hashes the values as `rules.how` states; a bundle whose rules hash differently from the ones this host
-  implements is refused, and so is one whose text limits, marks, whitespace or link pattern differ;
+- `rules`: the paths of every rule the host implements in code, from `context.rule` through `model_text.rule`. The
+  host checks the path list and digest, then hashes the values as `rules.how` states; a bundle whose rules hash
+  differently from the ones this host implements is refused, and so is one whose text limits, marks, whitespace or
+  link pattern differ;
 - `thresholds`: `hold` (by name), `default` and optional `categories`. Leave the configured threshold empty to use
   the bundle's default. Set an explicit hold key to select another operating point. Category thresholds add hints;
   they do not clear a hold;
@@ -179,10 +179,10 @@ allowlist in `<data>/links.json` for its next start; before any `start`, no link
 **Complete target coverage.** Every bundle must declare `coverage.rule: "complete_target_v1"` and
 `model_text.rule: "v3_meaning_v1"`. For model input only, the host applies the deployed v3 Unicode normalization,
 base64 word decoding and address redaction before allowed-link replacement. The record, judge text and repeat key
-keep their prepared text. For a line to score,
-the host rejects raw text that needs a channel-length cut or URL shortening. It also rejects a target whose complete
-rendered C input cannot fit the bundle's C token budget with its three special tokens. Every covered target runs C.
-The host checks coverage before it folds a repeat or remembers a line. Trusted lines and context-only lines keep their existing exemption.
+keep their prepared text. For a line to score, the host rejects raw text that needs a channel-length cut or URL
+shortening. It also rejects a target whose complete rendered classifier input, with its three special tokens, does not
+fit `classifier.max_tokens`. The classifier scores every covered target. The host checks coverage before it folds a
+repeat or remembers a line. A context-only line (trusted, or a Discord relay) is never rejected.
 
 **Repeats.** A line is a repeat of an earlier line of the stream with the same name, channel and text within 60
 seconds (whole seconds) of that line's last copy, whatever lines came between, as the training pipeline folded
@@ -193,9 +193,10 @@ not scored and is no context for later lines, it gets the verdict of the line it
 held, and delivered with it if a ruling releases it; a copy of a line a ruling already released is delivered), the
 judge sees the line once with "(sent N times)", and it is no new held line for the checkpoints. A release lists the
 held lines and their repeats in the order they arrived.
-**Categories.** On a line C scores, the fast model marks each category whose logit is at or over its `thresholds.categories` value.
-The judge sees the player's marked lines with the categories' names from `judge.render.categories`, and a marked line, held or
-not, is shown with the lines around it.
+
+**Categories.** On a line the classifier scores, it marks each category whose logit is at or over its
+`thresholds.categories` value. The judge sees the player's marked lines with the categories' names from
+`judge.render.categories`, and a marked line, held or not, is shown with the lines around it.
 
 **Sessions and checkpoints.** A session runs from a player's first scored line after they join until
 `session_end_seconds` after they leave (with no leave known, after their last line); a game server start ends every
@@ -244,8 +245,8 @@ acknowledged.
 
 **The record.** `<data>/record/YYYY-MM-DD.jsonl` (UTC days), one JSON line per event, each with `type` and `server`
 (the config's `server`): every `line` (stream, id, ref: Module-ECC's id for it, time, channel, conversation, account, name and the raw name,
-target, the prepared and the raw text, session, verdict, categories, score), `rescored` (the verdict, categories and scores of a
-line answered hold at `max_wait`, once its models end), `unscored` (such a line put to the judge without a score), `repeat`,
+target, the prepared and the raw text, session, verdict, categories, `classifier`: the hold logit), `rescored` (the
+verdict, categories and hold logit of a line answered hold at `max_wait`, once its models end), `unscored` (such a line put to the judge without a score), `repeat`,
 `session_start`, `checkpoint` (the
 held-line count it covers, why it was made, the prompt's size and SHA-256, whether it was sent), `judge_call` (each
 call: attempt, status, the usage's input, cached, cache-write, output and reasoning tokens, cost, duration, or the
@@ -504,22 +505,23 @@ without a key; `update` calls it.
 `ecc-server replay -config FILE -lines FILE -fold DIR -out DIR [-mode parity|live] [-judge-delay 15s] [-keep-going]
 [-dump FILE]` feeds recorded
 lines (prepared already, with presence events) through the decision core on a virtual clock, with the fast model's
-recorded verdicts and the judge's saved answers (by the SHA-256 of the prompt), and writes the record, one line per
-session and a summary to `DIR`. `-config` is a TOML file with the core's settings in a `[core]` table. The core's
-timers run at their time, and a ruling arrives `-judge-delay` after its checkpoint, as an event of its own: the lines
-before then are handled first. Parity mode takes the sessions from the lines, rules at once, and checks every prompt
-and every session's outcome against the measured run (a prompt with no saved answer stops it, or with `-keep-going`
-is counted); live mode makes sessions from presence and silence and uses the
-waiting-time checkpoint. With `-bundle DIR` (`-threads`, `-threshold`) the bundle's models score every line in place
-of the recorded verdicts (Linux only). `ecc-server replay -h` describes the inputs.
+recorded verdicts and the judge's saved answers (by the SHA-256 of the prompt), and writes the record
+(`record.jsonl`), one line per session (`sessions.jsonl`) and a summary (`summary.json`) to `DIR`. `-config` is a TOML
+file with the core's settings in a `[core]` table. The core's timers run at their time, and a ruling arrives
+`-judge-delay` after its checkpoint, as an event of its own: the lines before then are handled first. Parity mode
+takes the sessions from the lines, rules at once, and checks every prompt and every session's outcome against the
+measured run (a prompt with no saved answer stops it, or with `-keep-going` is counted); live mode makes sessions from
+presence and silence and uses the waiting-time checkpoint. With `-bundle DIR` (`-threads`, `-threshold`) the bundle's
+models score every line in place of the recorded verdicts (Linux only). `ecc-server replay -h` describes the inputs.
+
+Each input stream declares `coverage_rule: "complete_target_v1"`, `model_text_rule: "v3_meaning_v1"` and
+`canonical_link`, equal to the replay config's. The judge folder holds the producer's `allowlist.txt`. Every line
+carries `raw_text` and its `coverage` route: `scored`, `rejected`, `context`, `fold` or `dropped`. A `rejected` line
+carries `verdict: "reject"`, and the replay rejects it before it opens a session. Each copy carries its own coverage
+route: a copy can be rejected before it is folded even when the line it repeats fit.
 
 `ecc-server score -bundle DIR -in FILE -out FILE [-ids] [-allow FILE]` takes lines as Module-ECC sends them, handles
 each as the host does (prepared, refused, dropped, folded, links replaced, scored) and writes the format of the
-training pipeline's reference scorer (`ecc.reference`), the prepared texts, keys, C token ids and context IDs included with
-`-ids`, to check the host against it (Linux only). `ecc-server score -h` describes the formats.
-Replay input streams must declare `scoring_mode: "c_only"` and `coverage_rule: "complete_target_v1"`.
-Each stream must also declare `model_text_rule: "v3_meaning_v1"` and `canonical_link`, equal to the replay config.
-The judge folder must contain the producer's `allowlist.txt`. Every line must include `raw_text` and its
-`coverage` route (`c`, `reject`, `context`, `fold` or `dropped`). A reject must carry `verdict: "reject"`.
-Recorded replay preserves that final decision before it opens a session. Copies need their own coverage result;
-they can reject before folding even when the original line fit.
+training pipeline's reference scorer (`ecc.reference`), with the prepared texts, keys, context ids and the
+classifier's input ids included with `-ids`, to check the host against it (Linux only). `ecc-server score -h`
+describes the formats.

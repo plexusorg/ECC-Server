@@ -50,13 +50,12 @@ type Line struct {
 	Ref string
 }
 
-// Verdict is the fast model's verdict on one line, the categories it marks (in the order the judge sees them), and its
-// scores when it gives them: SH's and, for a line SH passed, C's hold logit.
+// Verdict is the fast model's verdict on one line, the categories it marks (in the order the judge sees them), and,
+// when the classifier ran, its hold logit.
 type Verdict struct {
 	Hold       bool
 	Categories []string
-	SH         *float64
-	C          *float64
+	Classifier *float64
 }
 
 // Scorer is the fast model. It takes every line of the stream that is not a repeat, in the order the engine takes
