@@ -29,7 +29,7 @@ session and a summary to DIR. The core's timers run at their time; a ruling arri
 (after the call is put, for a call that waited for another), as an event of its own, the lines before it handled
 first.
 
-  -config  the core's settings (TOML: the [core] table of the server's config)
+  -config  the core's settings (TOML: a [core] table, with the keys of core.Config)
   -lines   the lines, one JSON event a line: {"type":"stream", "name", "day"}, {"type":"line",...} or
            {"type":"presence", "kind": "join"|"leave", "account", "time"}; text and names prepared
   -fold    question.md, format.md, allowlist.txt, cases.json, answers.json (sha256 of the prompt -> answer), expected.json
@@ -37,9 +37,9 @@ first.
            checkpoint, rulings at once (as the measured replay ruled); checkpoints of sessions not in
            expected.json's judged_sessions are built and not sent, and a prompt with no saved answer stops the replay
            (with -keep-going it is counted and its lines stay held).
-  -dump    writes every judge call's session, held count, sha256 and the prompt from the new case on, one JSON a line
            live: sessions from presence and silence, the waiting-time checkpoint; a prompt with no saved answer is
            counted and its lines stay held.
+  -dump    writes every judge call's session, held count, sha256 and the prompt from the new case on, one JSON a line
 `
 
 // replayEvent is one line of the replay's input.
