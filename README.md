@@ -313,11 +313,11 @@ is: its lines stay held, its session goes to the review queue, and the first ref
 `notice` that staff with the alert permission see. `sudo ecc-server status` shows the totals.
 
 **Keeping the cache warm.** Bedrock keeps the prompt's cached part (the question and the owner's cases) for at least
-30 minutes after its last use; a call that finds it gone pays the input price for all of it. After each answered
-judge call the host makes a warming call every 20 minutes: the cached part, a one-line ask and 16 output tokens, about
-$0.015 against about $0.30 more for a call that finds the cache gone. Warming stops once its calls since the last
-judge call have cost what one such call pays over a cached one (about 6 hours of quiet) and starts again with the next
-judge call. Warming calls are charged to the budget but do not count among the day's calls, and one that does not fit
+30 minutes after its last use; a call that finds it gone writes all of it to the cache again at the cache-write price.
+After each answered judge call the host makes a warming call every 25 minutes: the cached part, a one-line ask and
+16 output tokens, about $0.015 against about $0.36 more for a call that finds the cache gone. Warming stops once its
+calls since the last judge call have cost what one such call pays over a cached one (about 10 hours of quiet) and
+starts again with the next judge call. Warming calls are charged to the budget but do not count among the day's calls, and one that does not fit
 the budget is not made, without a notice. Each is a `judge_warm` line in the record.
 
 ## Building the package

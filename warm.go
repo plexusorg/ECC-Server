@@ -9,14 +9,14 @@ import (
 )
 
 // Bedrock keeps the judge's cached prompt part (the question and the owner's cases) for at least 30 minutes after it
-// was last used, and a call that finds it gone pays the input price for all of it instead of the cache-read price:
-// about $0.30 more for 138,000 tokens on the flex tier. So after a judge call the host keeps that part cached with a
-// warming call every warmEvery: the cached part, a one-line ask, and warmMaxTokens of output, about $0.015. Warming
-// stops once the warming calls since the last judge call have cost what one call that finds the cache gone pays over
-// a cached one, and starts again with the next judge call, so a quiet stretch costs at most twice what knowing its
-// length in advance would.
+// was last used, and a call that finds it gone writes all of it to the cache again at the cache-write price instead of
+// reading it: about $0.36 more for 138,000 tokens on the flex tier. So after a judge call the host keeps that part
+// cached with a warming call every warmEvery: the cached part, a one-line ask, and warmMaxTokens of output, about
+// $0.015. Warming stops once the warming calls since the last judge call have cost what one call that finds the cache
+// gone pays over a cached one, and starts again with the next judge call, so a quiet stretch costs at most twice what
+// knowing its length in advance would.
 const (
-	warmEvery     = 20 * time.Minute
+	warmEvery     = 25 * time.Minute
 	warmMaxTokens = 16
 	warmAsk       = "\n\nNo new case. Answer OK."
 )
@@ -46,7 +46,7 @@ func (w *warmer) used(prefix string, u tokenUsage) {
 		tokens = u.Input
 	}
 	w.prefix, w.next, w.spent = prefix, time.Now().Add(warmEvery), 0
-	w.worth = float64(tokens) * (s.in - s.cr)
+	w.worth = float64(tokens) * (max(s.in, s.cw) - s.cr)
 	w.mu.Unlock()
 	select {
 	case w.wake <- struct{}{}:
