@@ -5,7 +5,6 @@
 package main
 
 import (
-	"cmp"
 	"errors"
 	"flag"
 	"fmt"
@@ -13,7 +12,6 @@ import (
 	"log/slog"
 	"net"
 	"os"
-	"time"
 
 	"github.com/BurntSushi/toml"
 )
@@ -30,9 +28,8 @@ type Config struct {
 	Listen string       `toml:"listen"`
 	Model  ModelConfig  `toml:"model"`
 	Budget BudgetConfig `toml:"budget"`
-	Test   TestConfig   `toml:"test"`
 
-	// Data is the data folder: dataDir, or the rig's [test] data.
+	// Data is the data folder, dataDir.
 	Data string `toml:"-"`
 }
 
@@ -47,31 +44,9 @@ type BudgetConfig struct {
 	MonthlyUSD float64 `toml:"monthly_usd"`
 }
 
-// TestConfig is for the end-to-end rig only.
-type TestConfig struct {
-	// Data replaces the data folder.
-	Data string `toml:"data"`
-	// HoldWordsFile names a file of words, one a line: the rig's scorer holds a line that contains one of them.
-	HoldWordsFile string `toml:"hold_words_file"`
-	// BedrockEndpoint replaces the Bedrock runtime endpoint (a local stub of the Responses API).
-	BedrockEndpoint string `toml:"bedrock_endpoint"`
-	// Set, these replace the judge's first wait after a failed call (5s), how long failures are retried (5m) and when
-	// a pending checkpoint is put again (5m).
-	JudgeBackoff    time.Duration `toml:"judge_backoff"`
-	JudgeRetryFor   time.Duration `toml:"judge_retry_for"`
-	JudgeRetryAfter time.Duration `toml:"judge_retry_after"`
-	// NoticeEvery, set, replaces how often a notice of one cause may be sent (1h).
-	NoticeEvery time.Duration `toml:"notice_every"`
-	// SlowWord and SlowFor: the rig's scorer takes SlowFor to score a line that contains SlowWord, as a slow model call.
-	SlowWord string        `toml:"slow_word"`
-	SlowFor  time.Duration `toml:"slow_for"`
-	// SlowCall, set, replaces how long a model call runs before it is logged and staff are told (10s).
-	SlowCall time.Duration `toml:"slow_call"`
-}
-
 // loadConfig reads the config file; a missing file gives the defaults.
 func loadConfig(path string) (Config, error) {
-	cfg := Config{Listen: "127.0.0.1:8790", Budget: BudgetConfig{DailyUSD: 25, MonthlyUSD: 250}}
+	cfg := Config{Listen: "127.0.0.1:8790", Budget: BudgetConfig{DailyUSD: 25, MonthlyUSD: 250}, Data: dataDir}
 	bad := func(format string, args ...any) (Config, error) {
 		return cfg, fmt.Errorf("config %s: "+format, append([]any{path}, args...)...)
 	}
@@ -88,15 +63,11 @@ func loadConfig(path string) (Config, error) {
 			return bad("unknown keys %v", keys)
 		}
 	}
-	cfg.Data = cmp.Or(cfg.Test.Data, dataDir)
 	if _, _, err := net.SplitHostPort(cfg.Listen); err != nil {
 		return bad("listen: %w", err)
 	}
 	if b := cfg.Budget; b.DailyUSD < 0 || b.MonthlyUSD < 0 {
 		return bad("budget.daily_usd and budget.monthly_usd must not be negative")
-	}
-	if t := cfg.Test; (t.SlowWord != "") != (t.SlowFor > 0) || t.SlowWord != "" && t.HoldWordsFile == "" {
-		return bad("test.slow_word and test.slow_for are set together, with test.hold_words_file")
 	}
 	return cfg, nil
 }

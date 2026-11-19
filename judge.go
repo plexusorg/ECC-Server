@@ -19,7 +19,7 @@ import (
 // a server error, a response whose status is failed or cancelled, a timeout, the network) is made again after judgeBackoff, doubling each time, while the failures
 // have lasted less than judgeRetryFor; then the checkpoint is pending and the core puts it again judgeRetryAfter
 // later, until the session ends. A call the budget refuses, or one Bedrock refuses for the key (401, 403) or as a bad
-// request, is not made again. The rig sets shorter times ([test]).
+// request, is not made again.
 const (
 	judgeAttempts   = 3
 	judgeBackoff    = 5 * time.Second
@@ -49,7 +49,7 @@ type bedrockJudge struct {
 	stopped func(kind, text string)
 	// record writes a line of the record.
 	record func(kind string, v any)
-	// backoff and retryFor: judgeBackoff and judgeRetryFor, or the rig's.
+	// backoff and retryFor: judgeBackoff and judgeRetryFor.
 	backoff, retryFor time.Duration
 }
 

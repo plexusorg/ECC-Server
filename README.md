@@ -16,9 +16,7 @@ it on the host's clock, and `ecc-server replay` drives it on a virtual clock ove
 **The fast model.** A classifier scores every covered target on the host's CPU. Its hold logit decides `hold` or
 `deliver`. It runs in the server's process through OpenVINO's C API, on Linux only. The binary is built without cgo and loads
 `/usr/lib/ecc-server/openvino` through purego at start. The pinned OpenVINO runtime needs glibc 2.38+ and the `libstdc++6` package 12.1.0+.
-Use a Debian or Ubuntu system with those versions. On another system, start `ecc-server run` only with the test rig's scorer (`[test] hold_words_file`, see Configuration), which holds a line that contains
-one of a file's words and logs a warning at every start that the server filters nothing; it exists for the end-to-end
-rig, never for a game server with players.
+Use a Debian or Ubuntu system with those versions. Other systems cannot run cc-server run.
 
 ## Install (Debian, Ubuntu)
 
@@ -337,13 +335,6 @@ Unknown keys are rejected.
 | `listen` | `127.0.0.1:8790` | HTTP address, `host:port`; see Connecting Module-ECC |
 | `model.threshold` | `""` | the name of the bundle's hold threshold to serve (`thresholds.hold`), such as `2pct` or `1pct`, to change how much the fast model holds without a new bundle; empty serves the bundle's `default`, and a name the bundle does not have keeps the bundle from loading |
 | `budget.daily_usd`, `budget.monthly_usd` | `25`, `250` | what the judge may spend in a UTC day and a UTC month (see The budget) |
-| `test.data` | (none) | for the rig: replaces the data folder |
-| `test.hold_words_file` | (none) | the test rig's scorer: a file of words, one a line; a line containing one is held |
-| `test.bedrock_endpoint` | (none) | replaces the Bedrock runtime endpoint, for the rig's stub |
-| `test.judge_backoff`, `test.judge_retry_for`, `test.judge_retry_after` | `5s`, `5m`, `5m` | for the rig: the first wait after a failed call, how long failures are retried, when a pending checkpoint is put again |
-| `test.notice_every` | `1h` | for the rig: how often a notice of one cause may be sent |
-| `test.slow_word`, `test.slow_for` | (none) | for the rig: its scorer takes `slow_for` to score a line containing `slow_word`, as a slow model call |
-| `test.slow_call` | `10s` | for the rig: how long a model call runs before it is logged and staff are told |
 
 The host keeps its bundle store, state, actions, spend, review queue (`review/`) and records (`record/`) in the data
 folder, `/var/lib/ecc-server` (`<data>` in this README). Each model call runs on 6 CPU threads, or the host's CPU

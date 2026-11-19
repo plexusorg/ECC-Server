@@ -36,8 +36,7 @@ type server struct {
 	spend    *spend
 	br       *bedrock
 	judge    core.Judge
-	words    *wordScorer // the rig's scorer, in place of the bundle's models
-	upd      *updater    // nil without a W&B key
+	upd      *updater // nil without a W&B key
 	switchMu sync.Mutex
 	// scoreMu is held while the scoring worker takes a line, so a bundle switch comes between two lines.
 	scoreMu sync.Mutex
@@ -57,7 +56,7 @@ type server struct {
 	eng      *core.Engine // nil until a bundle is served
 	bundle   *Bundle
 	scorer   core.Scorer
-	models   *model.Scorer // the bundle's models; nil with the rig's scorer
+	models   *model.Scorer // the bundle's models; nil without a bundle
 	scorerIs string
 	last     time.Time
 	seen     map[string]string
@@ -74,12 +73,8 @@ func run(cfg Config) error {
 	s := &server{cfg: cfg, ctx: ctx, boot: newUUID(), noticed: map[string]time.Time{}, seen: map[string]string{}, pending: map[string]*lineJob{},
 		queue: make(chan *lineJob, queueCap)}
 	var err error
-	if cfg.Test.HoldWordsFile != "" {
-		if s.words, err = newWordScorer(cfg.Test); err != nil {
-			return err
-		}
-	} else if goruntime.GOOS != "linux" {
-		return errors.New("the models run on Linux hosts only; on this system only the end-to-end rig's scorer runs ([test] hold_words_file)")
+	if goruntime.GOOS != "linux" {
+		return errors.New("the models run on Linux hosts only")
 	}
 	token, err := loadOrCreateToken(cfg)
 	if err != nil {
@@ -89,7 +84,7 @@ func run(cfg Config) error {
 	if err != nil {
 		return fmt.Errorf("reading the Bedrock key credential: %w", err)
 	}
-	s.br = newBedrock(brKey, cfg)
+	s.br = newBedrock(brKey)
 	key, err := credential(wandbCredential)
 	if err != nil {
 		return fmt.Errorf("reading the W&B key credential: %w", err)
@@ -116,8 +111,8 @@ func run(cfg Config) error {
 	if s.acts, err = openActions(cfg, s.rec); err != nil {
 		return err
 	}
-	s.judge = &bedrockJudge{ctx: ctx, br: s.br, spend: s.spend, stopped: s.notify, record: s.rec.append, backoff: orDefault(cfg.Test.JudgeBackoff, judgeBackoff),
-		retryFor: orDefault(cfg.Test.JudgeRetryFor, judgeRetryFor)}
+	s.judge = &bedrockJudge{ctx: ctx, br: s.br, spend: s.spend, stopped: s.notify, record: s.rec.append, backoff: judgeBackoff,
+		retryFor: judgeRetryFor}
 	st, err := readState(cfg)
 	if err != nil {
 		return err
@@ -196,21 +191,11 @@ func run(cfg Config) error {
 	return err
 }
 
-func orDefault(d, def time.Duration) time.Duration {
-	if d > 0 {
-		return d
-	}
-	return def
-}
-
 // Each model call's CPU threads, at most the host's CPU count; one call runs at a time.
 const modelThreads = 6
 
-// scorerFor loads the bundle's models, or gives the rig's scorer when one is set.
+// scorerFor loads the bundle's models.
 func (s *server) scorerFor(b *Bundle) (core.Scorer, error) {
-	if s.words != nil {
-		return s.words, nil
-	}
 	if b.specErr != nil {
 		return nil, fmt.Errorf("bundle %s: %w", b.Version, b.specErr)
 	}
@@ -239,7 +224,6 @@ func (s *server) use(b *Bundle, sc core.Scorer) {
 	defer s.mu.Unlock()
 	old := s.models
 	s.scorer, s.models = sc, nil
-	s.scorerIs = "the test rig's word list (not a model)"
 	if m, ok := sc.(*model.Scorer); ok {
 		s.models = m
 		s.scorerIs = "the bundle's models, hold threshold " + m.Threshold()
@@ -328,13 +312,13 @@ func (s *server) runJob(j *core.Job) {
 const noticeEvery = time.Hour
 
 // notify tells staff with the alert permission that judging stopped, and why, or that a model call is slow: a notice
-// of each kind at most once per [test] notice_every (an hour). The budget's notice comes once per UTC day or month
+// of each kind at most once an hour. The budget's notice comes once per UTC day or month
 // (spend), within that.
 func (s *server) notify(kind, text string) {
 	now := time.Now()
 	s.noticeMu.Lock()
 	last, ok := s.noticed[kind]
-	send := !ok || now.Sub(last) >= orDefault(s.cfg.Test.NoticeEvery, noticeEvery)
+	send := !ok || now.Sub(last) >= noticeEvery
 	if send {
 		s.noticed[kind] = now
 	}
@@ -462,7 +446,7 @@ func (s *server) scoreLines() {
 }
 
 // laterLine is a line answered hold before its models ran, to score when no line is waiting: its call, and the models
-// that took it (nil for the rig's scorer).
+// that took it (nil without models).
 type laterLine struct {
 	ref  string
 	call scoreCall
@@ -560,9 +544,6 @@ func (s *server) scoreLine(j *lineJob) (later laterLine, ok bool) {
 
 // take makes a line the engine scores context for later lines and gives the call that scores it. The caller holds mu.
 func (s *server) take(l core.Line) scoreCall {
-	if s.words != nil {
-		return func() (core.Verdict, error) { return s.words.Score(l) }
-	}
 	if s.models == nil {
 		return nil
 	}
@@ -577,7 +558,7 @@ func (s *server) take(l core.Line) scoreCall {
 }
 
 // call runs one model call to its end and gives its verdict. When late is set and the call has not ended at the time
-// at, late runs then, while the call goes on. A call that has run slowCall ([test] slow_call) is logged as an error
+// at, late runs then, while the call goes on. A call that has run slowCall is logged as an error
 // and staff are told (notice slow_model), at most once an hour; it is not cut, and the lines behind it wait.
 func (s *server) call(ref string, f scoreCall, at time.Time, late func()) (core.Verdict, error) {
 	type result struct {
@@ -598,8 +579,7 @@ func (s *server) call(ref string, f scoreCall, at time.Time, late func()) (core.
 		defer t.Stop()
 		lateC = t.C
 	}
-	slowAfter := orDefault(s.cfg.Test.SlowCall, slowCall)
-	slow := time.NewTimer(slowAfter)
+	slow := time.NewTimer(slowCall)
 	defer slow.Stop()
 	reported := false
 	for {
@@ -618,7 +598,7 @@ func (s *server) call(ref string, f scoreCall, at time.Time, late func()) (core.
 			slog.Error("a model call has run without ending; it is not cut, and the lines behind it wait", "id", ref,
 				"seconds", fmt.Sprintf("%.1f", time.Since(start).Seconds()), "lines_waiting", len(s.queue))
 			s.notify(noticeSlowModel, fmt.Sprintf("ECC: one line's model call has run for %s without ending, so every "+
-				"chat line waits behind it and is held. Check the ECC-Server host's CPU and memory.", slowAfter))
+				"chat line waits behind it and is held. Check the ECC-Server host's CPU and memory.", slowCall))
 		}
 	}
 }

@@ -23,7 +23,7 @@ const loginCheckMaxTokens = 16
 // (POST <endpoint>/openai/v1/responses) with the Bedrock API key, a bearer token. Each call is one attempt.
 type bedrock struct {
 	key      string
-	endpoint string // https://bedrock-runtime.<region>.amazonaws.com, or the rig's stub
+	endpoint string // https://bedrock-runtime.<region>.amazonaws.com
 	client   *http.Client
 
 	mu          sync.Mutex
@@ -50,11 +50,8 @@ type callTotals struct {
 	tokenUsage
 }
 
-func newBedrock(key string, cfg Config) *bedrock {
-	endpoint := cfg.Test.BedrockEndpoint
-	if endpoint == "" {
-		endpoint = "https://bedrock-runtime." + judgeRegion + ".amazonaws.com"
-	}
+func newBedrock(key string) *bedrock {
+	endpoint := "https://bedrock-runtime." + judgeRegion + ".amazonaws.com"
 	return &bedrock{
 		key:      key,
 		endpoint: strings.TrimSuffix(endpoint, "/"),

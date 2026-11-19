@@ -114,7 +114,7 @@ func bedrockLogin(cfg Config) error {
 	if err != nil {
 		return err
 	}
-	b := newBedrock(key, cfg)
+	b := newBedrock(key)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	if _, err := b.respond(ctx, "Hi", 0, loginCheckMaxTokens, "none", judgeServiceTier); err != nil {

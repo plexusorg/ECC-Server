@@ -81,7 +81,7 @@ type Bundle struct {
 	dir   string
 	texts core.Texts
 	// spec is the scoring part of bundle.json, as the fast model reads it; specErr why it cannot be read. A bundle
-	// without one serves only with the test rig's scorer.
+	// without one is not served.
 	spec    *model.Spec
 	specErr error
 }
@@ -270,7 +270,7 @@ func coreConfig(cfg Config, b *Bundle) core.Config {
 		Render: core.Render{Before: r.Before, After: r.After, MaxChars: r.MaxChars, CutBefore: r.CutBefore,
 			CutAfter: r.CutAfter, Categories: r.Categories},
 		CanonicalLink: b.Links.Canonical, MaxPromptChars: maxPromptChars, MaxCallsPerDay: maxCallsPerDay,
-		Channels: b.Channels, RetryAfter: orDefault(cfg.Test.JudgeRetryAfter, judgeRetryAfter)}
+		Channels: b.Channels, RetryAfter: judgeRetryAfter}
 }
 
 // ---------------------------------------------------------------- the bundle store
