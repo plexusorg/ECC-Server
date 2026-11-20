@@ -292,7 +292,11 @@ answer is one JSON object (a Markdown code fence around it is accepted) whose `r
 case `N1`: `ruling` `nothing`, `hold` or `ban` (`not ban`, a ruling of the owner's cases, is taken as `hold`); for
 `hold` or `ban`, `by` one of the player's lines the case shows; `like` a list of at most three of the owner's case
 ids; `sure` true or false. The host records both requests and responses when it seeks ban confirmation.
-An invalid answer is asked for again, up to three invalid answers per confirmation stage. A call that fails (`429`, a
+An invalid answer is asked for again, up to three invalid answers per confirmation stage, and the checkpoint's later
+calls send the prompt whole, as one part without the cache breakpoint, so Bedrock reads none of it from its cache:
+Bedrock can serve a cached part from which every answer is unreadable text, while the same prompt sent whole is
+answered. A whole call pays every input token at the input price, about 15 times a cached call; its `judge_call` line
+has `"whole": true`. A call that fails (`429`, a
 `5xx`, an answer whose `status` is `failed` or `cancelled`, the timeout, the network) is made again after 5 seconds, then 10, 20, ..., while the failures have lasted
 less than 5 minutes; then the checkpoint is pending: it is put again 5 minutes later, and so on until the session ends
 (`/status` counts the pending ones). A confirmation failure leaves the lines held. The host keeps the first firm
@@ -456,8 +460,8 @@ holds without a verdict again.
 | `notice` | `kind`, `text` | show `text` to staff with the alert permission |
 
 `uuid` and `account` are the session's player as Module-ECC sent them, `speaker_uuid` and `speaker`: the UUID and the
-account name, never the shown name. A notice tells staff that judging stopped, and why, or that a model call is slow
-(`kind`):
+account name, never the shown name. A notice tells staff that judging stopped, and why, that a model call is slow, or
+that judge calls cost more because Bedrock reads the cached prompt part wrong (`kind`):
 
 | kind | cause | sent |
 | --- | --- | --- |
@@ -465,6 +469,7 @@ account name, never the shown name. A notice tells staff that judging stopped, a
 | `bedrock_key` | Bedrock refused the key (`401`, `403`) | at most once an hour |
 | `bad_request` | Bedrock refused the request (`400` or another `4xx` but `429`) | at most once an hour |
 | `invalid_answers` | the judge's answer was invalid three times on one checkpoint | at most once an hour |
+| `cache_read` | three checkpoints in a row got an invalid answer from the cached prompt part, then a valid one sent whole | at most once an hour |
 | `no_key` | no Bedrock key is set | at most once an hour |
 | `slow_model` | a model call has run 10 seconds without ending; every line behind it waits | at most once an hour |
 

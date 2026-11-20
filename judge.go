@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"ecc-server/core"
@@ -26,6 +27,11 @@ const (
 	judgeRetryFor   = 5 * time.Minute
 	judgeRetryAfter = 5 * time.Minute
 )
+
+// After an invalid answer a checkpoint's later calls send the prompt whole, without the cache breakpoint, so Bedrock
+// reads none of it from its cache: Bedrock can serve a cached part from which every answer is unreadable text, while
+// the same prompt sent whole is answered. judgeWholeNotice checkpoints in a row that needed a whole call tell staff.
+const judgeWholeNotice = 3
 
 // The judge's model on Amazon Bedrock and how each call is made; the judge was measured with these. A call may produce
 // judgeMaxOutputTokens, reasoning included, and take judgeTimeout.
@@ -53,6 +59,28 @@ type bedrockJudge struct {
 	backoff, retryFor time.Duration
 	// warm keeps the cached prompt part warm between calls; nil makes no warming calls.
 	warm *warmer
+
+	mu sync.Mutex
+	// whole counts the checkpoints in a row whose valid answer came from a whole call after an invalid one.
+	whole int
+}
+
+// answered counts a checkpoint's valid answer: from a whole call (after an invalid answer), or from a cached one.
+func (j *bedrockJudge) answered(whole bool) {
+	j.mu.Lock()
+	n := 0
+	if whole {
+		j.whole++
+		n = j.whole
+	} else {
+		j.whole = 0
+	}
+	j.mu.Unlock()
+	if n == judgeWholeNotice {
+		j.stopped("cache_read", fmt.Sprintf("ECC: the judge's last %d checkpoints each got an invalid answer from "+
+			"Bedrock's cached prompt part and were asked again with the whole prompt, which costs about 15 times a "+
+			"cached call. Bedrock may be reading this bundle's cached part wrong.", n))
+	}
 }
 
 func (j *bedrockJudge) Rule(job *core.Job) (core.Answer, error) {
@@ -66,11 +94,11 @@ func (j *bedrockJudge) Rule(job *core.Job) (core.Answer, error) {
 		}
 		return core.Answer{}
 	}
-	invalid := 0
+	invalid, whole := 0, false
 	var failing time.Time
 	delay := j.backoff
 	for attempt := 1; ; attempt++ {
-		res, err := j.call(job, attempt)
+		res, err := j.call(job, attempt, whole)
 		if err != nil {
 			if !passing(err) {
 				j.stop(err)
@@ -95,6 +123,7 @@ func (j *bedrockJudge) Rule(job *core.Job) (core.Answer, error) {
 		failing, delay = time.Time{}, j.backoff
 		a, err := checkAnswer(res, job.Mine, job.Cases)
 		if err == nil {
+			j.answered(whole)
 			a.RequestID, a.ResponseID, a.PromptHash, a.Raw = res.RequestID, res.ResponseID, job.Hash, res.Text
 			if first != nil {
 				first.Confirmation = &a
@@ -109,7 +138,9 @@ func (j *bedrockJudge) Rule(job *core.Job) (core.Answer, error) {
 			continue
 		}
 		invalid++
-		slog.Warn("the judge's answer is invalid", "session", job.Session, "k", job.K, "answer", invalid, "why", err.Error())
+		whole = true
+		slog.Warn("the judge's answer is invalid; asking again with the whole prompt", "session", job.Session, "k",
+			job.K, "answer", invalid, "why", err.Error())
 		if invalid == judgeAttempts {
 			j.stopped("invalid_answers", fmt.Sprintf("ECC: the judge's answer was invalid %d times on one checkpoint "+
 				"(the last: %s). Its held lines stay held and its session goes to the review queue.", invalid,
@@ -168,14 +199,15 @@ type judgeCall struct {
 	Status      string      `json:"status,omitempty"`
 	Incomplete  string      `json:"incomplete,omitempty"`
 	Tier        string      `json:"service_tier,omitempty"`
+	Whole       bool        `json:"whole,omitempty"` // sent without the cache breakpoint
 	Usage       *tokenUsage `json:"usage,omitempty"`
 	USD         float64     `json:"usd"`
 	Seconds     float64     `json:"seconds"`
 	Error       string      `json:"error,omitempty"`
 }
 
-// call makes one Responses call within the budget.
-func (j *bedrockJudge) call(job *core.Job, attempt int) (*judgeAnswer, error) {
+// call makes one Responses call within the budget; whole sends the prompt without the cache breakpoint.
+func (j *bedrockJudge) call(job *core.Job, attempt int, whole bool) (*judgeAnswer, error) {
 	if j.br.key == "" {
 		return nil, fmt.Errorf("%w: %w", core.ErrNotSent, errNoKey)
 	}
@@ -197,7 +229,11 @@ func (j *bedrockJudge) call(job *core.Job, attempt int) (*judgeAnswer, error) {
 	ctx, cancel := context.WithTimeout(j.ctx, judgeTimeout)
 	defer cancel()
 	start := time.Now()
-	res, err := j.br.respond(ctx, job.Prompt, job.Split, judgeMaxOutputTokens, judgeReasoningEffort, judgeServiceTier)
+	split := job.Split
+	if whole {
+		split = 0
+	}
+	res, err := j.br.respond(ctx, job.Prompt, split, judgeMaxOutputTokens, judgeReasoningEffort, judgeServiceTier)
 	cost := r.usd // no answer: the call may have run
 	var be *bedrockError
 	switch {
@@ -207,13 +243,13 @@ func (j *bedrockJudge) call(job *core.Job, attempt int) (*judgeAnswer, error) {
 		cost = 0 // Bedrock refused the request
 	}
 	j.spend.settle(r, cost)
-	if res != nil && j.warm != nil && job.Split > 0 {
-		j.warm.used(job.Prompt[:job.Split], res.Usage)
+	if res != nil && j.warm != nil && split > 0 {
+		j.warm.used(job.Prompt[:split], res.Usage)
 	}
 	took := time.Since(start)
 	j.br.record(err, len(job.Prompt), res, cost, took)
 	rec := judgeCall{Time: stamp(time.Now()), Session: job.Session, K: job.K, Hash: job.Hash, Attempt: attempt,
-		PromptBytes: len(job.Prompt), USD: cost, Seconds: took.Seconds()}
+		PromptBytes: len(job.Prompt), Whole: whole, USD: cost, Seconds: took.Seconds()}
 	if res != nil {
 		rec.Status, rec.Incomplete, rec.Tier, rec.Usage = res.Status, res.Incomplete, res.Tier, &res.Usage
 		rec.RequestID, rec.ResponseID, rec.Raw = res.RequestID, res.ResponseID, res.Text
